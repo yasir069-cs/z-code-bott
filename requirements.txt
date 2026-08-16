@@ -50,7 +50,6 @@ typing_extensions==4.16.0
 tzdata==2026.3
 tzlocal==5.4.4
 urllib3==2.7.0
-winloop==0.6.3
 yarl==1.24.5
 zlib-ng==1.0.0
 # Exact working set (Python 3.12). pandas-ta 0.4.71b0 works with pandas 3.x / numpy 2.x.
