@@ -143,13 +143,28 @@ def main() -> None:
 
     config.setup_logging()
     if args.offline_csv:
-        frame = pd.read_csv(args.offline_csv,
-                            names=["timestamp", "open", "high", "low", "close", "volume"])
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="ms", utc=True)
-        frame = frame.set_index("timestamp")
+        # Support CSVs with or without a 'symbol' column
+        raw = pd.read_csv(args.offline_csv)
+        cols = [c.lower().strip() for c in raw.columns]
+        has_symbol = "symbol" in cols
+        if has_symbol:
+            frame = pd.read_csv(args.offline_csv)
+            frame.columns = [c.lower().strip() for c in frame.columns]
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="ms", utc=True)
+            frame = frame.set_index("timestamp")
+        else:
+            frame = pd.read_csv(args.offline_csv,
+                                names=["timestamp", "open", "high", "low", "close", "volume"])
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="ms", utc=True)
+            frame = frame.set_index("timestamp")
+            log.warning("Offline CSV has no 'symbol' column — all coins will use the same candle data")
 
         def fetcher(symbol, start, end):
-            window = frame[(frame.index >= pd.Timestamp(start)) & (frame.index < pd.Timestamp(end))]
+            if has_symbol:
+                coin_data = frame[frame["symbol"] == symbol]
+            else:
+                coin_data = frame
+            window = coin_data[(coin_data.index >= pd.Timestamp(start)) & (coin_data.index < pd.Timestamp(end))]
             return None if window.empty else window
     else:
         exchange = scanner.make_exchange()

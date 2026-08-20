@@ -1,9 +1,9 @@
-"""Phase 8 — Python-only fallback when Claude is unavailable/fails.
+"""Phase 8 — Python-only fallback when AI (OpenRouter/Nemotron) is unavailable/fails.
 
 Uses the Python filter direction, SL at the recent swing low (BUY) /
 swing high (SELL), TP = 2x SL distance -> fixed 1:2 RR (rules.md).
 The alert must be tagged 'AI Unavailable - Indicator based signal'
-(never pretend the signal came from Claude).
+(never pretend the signal came from the AI model).
 """
 import logging
 

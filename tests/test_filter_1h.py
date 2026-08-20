@@ -1,5 +1,7 @@
 """Phase 4 tests — 1H context classification (monkeypatched indicator
-snapshot so the filter logic itself is under test; sweep uses real candles)."""
+snapshot so the filter logic itself is under test; sweep uses real candles).
+
+3 Core Pillars: RSI + EMA21 + VWAP (plus volume and BB), sweep optional."""
 import pytest
 
 import filter_1h
@@ -15,7 +17,7 @@ def _snap(**over):
         ema21=99.0, vwap=99.5,
         bb_lower=99.2, bb_mid=100.0, bb_upper=101.5,
         atr=1.0,
-        range_high=110.0, range_low=99.0, range_pos=0.14,  # bottom 30%
+        range_high=110.0, range_low=99.0, range_pos=0.14,
         swing_low_20=99.0, swing_high_20=110.0,
     )
     base.update(over)
@@ -49,32 +51,39 @@ def test_buy_context_passes(patch_ind):
     ctx = filter_1h.analyze_1h(_frame_with_bullish_sweep())
     assert ctx is not None
     assert ctx["direction"] == "BUY"
-    assert ctx["sweep"]["direction"] == "BUY"
     assert all(ctx["checks"].values())
 
 
-def test_context_fails_without_zone(patch_ind):
-    patch_ind(_snap(range_pos=0.55))  # not in bottom 30%
+def test_buy_context_passes_with_sweep(patch_ind):
+    patch_ind(_snap())
+    ctx = filter_1h.analyze_1h(_frame_with_bullish_sweep())
+    assert ctx is not None
+    assert ctx["sweep"] is not None
+    assert ctx["sweep"]["direction"] == "BUY"
+
+
+def test_context_fails_when_rsi_below_min(patch_ind):
+    patch_ind(_snap(rsi=38.0))  # below 40
     assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
 
 
-def test_context_fails_when_rsi_out_of_range(patch_ind):
-    patch_ind(_snap(rsi=45.0))  # below 50
+def test_context_fails_when_rsi_above_max(patch_ind):
+    patch_ind(_snap(rsi=78.0, rsi_prev=72.0))  # above 75
     assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
 
 
 def test_context_fails_when_rsi_falling(patch_ind):
-    patch_ind(_snap(rsi=55.0, rsi_prev=60.0))  # in range but dropping
+    patch_ind(_snap(rsi=55.0, rsi_prev=60.0))  # dropping
     assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
 
 
 def test_context_fails_below_ema(patch_ind):
-    patch_ind(_snap(ema21=101.0))
+    patch_ind(_snap(ema21=101.0))  # price 100.5 < ema21 101.0
     assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
 
 
 def test_context_fails_below_vwap(patch_ind):
-    patch_ind(_snap(vwap=101.0))
+    patch_ind(_snap(vwap=101.0))  # price 100.5 < vwap 101.0
     assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
 
 
@@ -88,14 +97,18 @@ def test_context_fails_when_far_from_lower_bb(patch_ind):
     assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
 
 
-def test_context_fails_without_sweep(patch_ind):
+def test_context_passes_without_sweep(patch_ind):
+    """Sweep is optional — context passes and sweep is None."""
     import numpy as np
     n = 40
     closes = 100 + np.sin(np.arange(n) * 0.7) * 0.5
     frame_no_sweep = make_candles(closes, vol_base=1000.0, vol_spread=0.0, seed=1,
                                   volumes=np.full(n, 1000.0))
     patch_ind(_snap())
-    assert filter_1h.analyze_1h(frame_no_sweep) is None
+    ctx = filter_1h.analyze_1h(frame_no_sweep)
+    assert ctx is not None
+    assert ctx["direction"] == "BUY"
+    assert ctx["sweep"] is None
 
 
 def test_sell_context_passes(patch_ind, monkeypatch):
@@ -117,4 +130,3 @@ def test_sell_context_passes(patch_ind, monkeypatch):
     ctx = filter_1h.analyze_1h(frame)
     assert ctx is not None
     assert ctx["direction"] == "SELL"
-    assert ctx["sweep"]["direction"] == "SELL"

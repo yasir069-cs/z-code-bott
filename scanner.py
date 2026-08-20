@@ -31,13 +31,20 @@ def make_exchange() -> ccxt.Exchange:
     return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
 
 
-def get_active_usdt_symbols(exchange: ccxt.Exchange) -> dict[str, float]:
+def get_active_usdt_symbols(exchange: ccxt.Exchange,
+                             prefetched_tickers: dict | None = None) -> dict[str, float]:
     """Return {symbol: 24h quote volume} for every active, spot USDT pair
-    whose 24h volume >= VOLUME_MIN_USDT, ordered by volume (desc)."""
+    whose 24h volume >= VOLUME_MIN_USDT, ordered by volume (desc).
+
+    When *prefetched_tickers* is provided (the raw dict from
+    exchange.fetch_tickers()), we skip the redundant API call.
+    """
     exchange.load_markets(reload=True)
     markets = exchange.markets
 
-    tickers = exchange.fetch_tickers()
+    # Reuse pre-fetched tickers when available to avoid a second API call
+    tickers = prefetched_tickers if prefetched_tickers else exchange.fetch_tickers()
+
     result: dict[str, float] = {}
     for symbol, ticker in tickers.items():
         market = markets.get(symbol)
@@ -48,7 +55,7 @@ def get_active_usdt_symbols(exchange: ccxt.Exchange) -> dict[str, float]:
         base = market.get("base", "")
         if any(base.endswith(suffix) and len(base) > len(suffix) for suffix in _LEVERAGED_SUFFIXES):
             continue
-        quote_volume = ticker.get("quoteVolume")
+        quote_volume = ticker.get("quoteVolume") if isinstance(ticker, dict) else None
         if quote_volume is None:
             continue
         quote_volume = float(quote_volume)

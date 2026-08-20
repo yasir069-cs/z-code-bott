@@ -42,8 +42,8 @@ VWAP_ANCHOR = "D"               # daily VWAP
 
 # ------------------------------------------------------------------ 1H filter
 ZONE_PCT = 0.30                 # bottom 30% / top 30% of 50-candle range
-RSI_BUY_MIN, RSI_BUY_MAX = 50.0, 70.0    # bullish range
-RSI_SELL_MIN, RSI_SELL_MAX = 35.0, 50.0  # bearish range
+RSI_BUY_MIN, RSI_BUY_MAX = 40.0, 75.0    # bullish range (widened for early entries)
+RSI_SELL_MIN, RSI_SELL_MAX = 28.0, 55.0  # bearish range (widened for strong trends)
 
 # ------------------------------------------------------------------ liquidation sweep
 SWEEP_SEARCH_CANDLES = 10       # look for the sweep candle among last N closed candles
@@ -53,9 +53,10 @@ SWEEP_VOL_RATIO = 1.5           # volume > 1.5x avg volume of last 20 candles
 
 # ------------------------------------------------------------------ 15M filter
 CONFIRM_MIN_SCORE = 4           # need 4/5 conditions
+ENTRY_MIN_SCORE = 5             # 5M: need 5/7 conditions (scoring system)
 
 # ------------------------------------------------------------------ shared tolerances
-BB_NEAR_PCT = 0.0025            # 15M/5M: "touch/near" = within 0.25% of the band
+BB_NEAR_PCT = 0.005             # 15M/5M: "touch/near" = within 0.5% of the band
 BB_NEAR_PCT_1H = 0.005          # 1H context uses a slightly wider near-band tolerance
 
 # ------------------------------------------------------------------ AI (OpenRouter / Nemotron)
@@ -71,11 +72,11 @@ AI_REASONING_ENABLED = False
 
 # ------------------------------------------------------------------ duplicate guard
 DUPLICATE_COOLDOWN_MIN = 20     # same coin within 20 min -> skip silently
-GUARD_RESET_TIME = "21:30"      # tracker resets at 9:30 PM IST
+GUARD_RESET_TIME = "23:00"      # tracker resets at 11:00 PM IST
 
 # ------------------------------------------------------------------ scheduler
-SESSION_START = "18:30"         # 6:30 PM IST (NY session open)
-SESSION_END = "21:30"           # 9:30 PM IST (London-NY overlap end)
+SESSION_START = "18:00"         # 6:00 PM IST
+SESSION_END = "23:00"           # 11:00 PM IST
 SCAN_INTERVAL_MIN = 5           # every 5 minutes
 SCHEDULER_TZ = "Asia/Kolkata"
 

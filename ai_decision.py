@@ -78,6 +78,13 @@ def build_prompt(bundle: dict) -> str:
     trend = "UP (higher lows)" if bundle["direction"] == "BUY" else "DOWN (lower highs)"
     zone = "bottom 30% (BUY zone)" if bundle["direction"] == "BUY" else "top 30% (SELL zone)"
 
+    if sweep is not None:
+        sweep_line = (f"Liquidation sweep: {sweep['direction']} side, {sweep['age_candles']} candles ago, "
+                      f"swept level={sweep['level']:.6g}, wick={sweep['wick']:.6g} "
+                      f"({sweep['wick_body_ratio']:.1f}x body), volume={sweep['volume_ratio']:.1f}x avg20")
+    else:
+        sweep_line = "Liquidation sweep: NONE detected (no recent sweep — weigh other factors more heavily)"
+
     return f"""Analyze the following crypto market setup and return the JSON decision.
 
 Coin: {bundle['symbol']}
@@ -87,7 +94,7 @@ Entry price (last closed 5M candle): {bundle['entry_price']:.6g}
 
 1H CONTEXT: {zone}, range_pos={bundle['ind_1h']['range_pos']:.3f} (0=low, 1=high)
 1H indicators: {_fmt_snap(bundle['ind_1h'])}
-Liquidation sweep: {sweep['direction']} side, {sweep['age_candles']} candles ago, swept level={sweep['level']:.6g}, wick={sweep['wick']:.6g} ({sweep['wick_body_ratio']:.1f}x body), volume={sweep['volume_ratio']:.1f}x avg20
+{sweep_line}
 Recent swing low (1H, 20 candles): {bundle['ind_1h']['swing_low_20']:.6g}
 Recent swing high (1H, 20 candles): {bundle['ind_1h']['swing_high_20']:.6g}
 ATR (1H, 14): {bundle['ind_1h']['atr']:.6g}

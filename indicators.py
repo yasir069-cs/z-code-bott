@@ -28,21 +28,26 @@ def rsi_trend_up(history: list[float]) -> bool:
 
     Example from the spec: 50 -> 55 -> 51 -> 56 is bullish because the
     dip to 51 holds above the prior low of 50 and RSI turns up again.
+    Requires at least 6 data points for a meaningful comparison.
     """
     h = history[-10:]
-    if len(h) < 4:
+    if len(h) < 6:
         return False
     rising = h[-1] > h[-2]
+    # Compare the min of the recent 3 values against the min of the prior 3
     higher_low = min(h[-3:]) > min(h[-6:-3])
     return rising and higher_low
 
 
 def rsi_trend_down(history: list[float]) -> bool:
-    """RSI trend DOWN = currently falling AND forming a lower high."""
+    """RSI trend DOWN = currently falling AND forming a lower high.
+    Requires at least 6 data points for a meaningful comparison.
+    """
     h = history[-10:]
-    if len(h) < 4:
+    if len(h) < 6:
         return False
     falling = h[-1] < h[-2]
+    # Compare the max of the recent 3 values against the max of the prior 3
     lower_high = max(h[-3:]) < max(h[-6:-3])
     return falling and lower_high
 
@@ -69,6 +74,9 @@ def compute_indicators(df: pd.DataFrame) -> Optional[dict]:
     except (TypeError, ValueError) as exc:  # non-datetime index etc.
         log.warning("VWAP failed: %s", exc)
         return None
+    # ta.vwap() may return a DataFrame in some pandas-ta versions; extract the Series
+    if isinstance(vwap, pd.DataFrame):
+        vwap = vwap.iloc[:, 0]
 
     bbl_col = _col_starting_with(bb, "BBL_")
     bbm_col = _col_starting_with(bb, "BBM_")

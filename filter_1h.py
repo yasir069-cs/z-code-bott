@@ -90,15 +90,19 @@ def _near_upper_band(snap: dict, near_pct: float) -> bool:
 
 def analyze_1h(df: pd.DataFrame) -> Optional[dict]:
     """Classify 1H context. Returns a context dict when the coin passes
-    (direction BUY or SELL), otherwise None (skip the coin entirely)."""
+    (direction BUY or SELL), otherwise None (skip the coin entirely).
+
+    3 Core Pillars: RSI + EMA21 + VWAP (plus volume and BB context).
+    Sweep detection is OPTIONAL — when found it adds high confidence for the AI,
+    and all sweep metrics are collected and forwarded to the AI decision bundle.
+    """
     snap = compute_indicators(df)
     if snap is None:
         return None
 
     checks = {
         "BUY": {
-            "zone_bottom30": snap["range_pos"] <= config.ZONE_PCT,
-            "rsi_50_70_rising": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX
+            "rsi_40_75_rising": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX
                                 and snap["rsi"] > snap["rsi_prev"],
             "price_above_ema21": snap["close"] > snap["ema21"],
             "price_above_vwap": snap["close"] > snap["vwap"],
@@ -106,8 +110,7 @@ def analyze_1h(df: pd.DataFrame) -> Optional[dict]:
             "near_lower_bb": _near_lower_band(snap, config.BB_NEAR_PCT_1H),
         },
         "SELL": {
-            "zone_top30": snap["range_pos"] >= 1.0 - config.ZONE_PCT,
-            "rsi_35_50_falling": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX
+            "rsi_28_55_falling": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX
                                  and snap["rsi"] < snap["rsi_prev"],
             "price_below_ema21": snap["close"] < snap["ema21"],
             "price_below_vwap": snap["close"] < snap["vwap"],
@@ -117,16 +120,24 @@ def analyze_1h(df: pd.DataFrame) -> Optional[dict]:
     }
 
     for direction in ("BUY", "SELL"):
+        if not all(checks[direction].values()):
+            if any(checks[direction].values()):
+                log.debug("1H %s context failed: %s",
+                          direction, {k: v for k, v in checks[direction].items() if not v})
+            continue
+
+        # Sweep is optional for passing 1H, but ALWAYS collected for AI decision
         sweep = detect_sweep(df, direction)
-        passed = all(checks[direction].values()) and sweep is not None
-        if passed:
-            return {
-                "direction": direction,
-                "indicators": snap,
-                "sweep": sweep,
-                "checks": checks[direction],
-            }
         if sweep is not None:
-            log.debug("1H %s sweep found but context failed: %s",
-                      direction, {k: v for k, v in checks[direction].items() if not v})
+            log.info("1H %s sweep detected (age=%d candles, wick_ratio=%.1f, vol_ratio=%.1f) — extra AI confidence",
+                     direction, sweep["age_candles"], sweep["wick_body_ratio"], sweep["volume_ratio"])
+        else:
+            log.debug("1H %s context passed (no recent sweep detected) — signal forwarded to AI", direction)
+
+        return {
+            "direction": direction,
+            "indicators": snap,
+            "sweep": sweep,  # Collected and passed to AI bundle (None if no sweep)
+            "checks": checks[direction],
+        }
     return None

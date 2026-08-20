@@ -127,17 +127,17 @@ def test_rsi_trend_up_recognizes_higher_low():
 
 
 def test_rsi_trend_up_rejects_lower_low():
-    hist = [60, 55, 51, 48]  # falling with lower lows
+    hist = [62, 60, 55, 51, 48, 45]  # falling with lower lows
     assert rsi_trend_up(hist) is False
 
 
 def test_rsi_trend_down_recognizes_lower_high():
-    hist = [56, 51, 55, 50]  # 55 lower than 56, then turns down
+    hist = [48, 52, 56, 51, 55, 50]  # 55 lower than 56, then turns down
     assert rsi_trend_down(hist) is True
 
 
 def test_rsi_trend_requires_rising_last_step():
-    hist = [50, 55, 51, 52, 49]  # last step down kills the "up" trend
+    hist = [44, 47, 50, 55, 51, 52, 49]  # last step down kills the "up" trend
     assert rsi_trend_up(hist) is False
 
 

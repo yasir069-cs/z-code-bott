@@ -35,6 +35,7 @@ import filter_1h
 import filter_5m
 import logger
 import scanner
+import telegram_bot
 from ai_decision import AIDecisionError, nemotron_decision
 from fallback import fallback_decision
 
@@ -59,17 +60,25 @@ def _decide(bundle: dict) -> dict:
 
 
 def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
-             tickers_last: dict[str, float] | None = None,
+             tickers: dict | None = None,
              force: bool = False) -> dict:
     """One full scan cycle. `force=True` runs it regardless of the session
     window (DEMO/TEST mode) — production scans are only ever scheduled
-    inside 18:30-21:30 IST."""
+    inside 18:30-21:30 IST.
+
+    *tickers* is the raw dict from exchange.fetch_tickers(); when provided
+    it is forwarded to the scanner so fetch_tickers() is called only once
+    per scan cycle."""
     now_ist = datetime.now(config.TZ)
     if not force and not _in_session(now_ist):
         log.info("Outside active session (now %s IST) - zero activity", now_ist.strftime("%H:%M"))
         return {"scanned": 0}
 
-    symbols = scanner.get_active_usdt_symbols(exchange)
+    symbols = scanner.get_active_usdt_symbols(exchange, tickers)
+    # Derive {symbol: last_price} for current_price fallback
+    tickers_last = {}
+    if tickers:
+        tickers_last = {s: t.get("last") for s, t in tickers.items() if isinstance(t, dict) and t.get("last")}
     summary = {"scanned": len(symbols), "pass_1h": 0, "pass_15m": 0, "pass_5m": 0,
                "duplicates": 0, "signals": 0, "holds": 0}
 
@@ -128,7 +137,7 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
         }
 
         if decision["signal"] == "HOLD":
-            # HOLD: no Telegram alert, still logged
+            # HOLD: no Telegram alert, still logged, NO cooldown recorded
             logger.log_signal(sig)
             summary["holds"] += 1
         else:
@@ -137,15 +146,15 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
             summary["signals"] += 1
             log.info("%s %s alert_sent=%s entry=%.6g sl=%.6g tp=%.6g rr=%.2f",
                      symbol, sig["signal"], sent, sig["entry"], sig["SL"], sig["TP"], sig["RR"])
-        guard.record(symbol, now_ist)
+            guard.record(symbol, now_ist)  # cooldown only for BUY/SELL, not HOLD
 
     log.info("Scan complete: %s", summary)
     return summary
 
 
 def build_scheduler() -> BlockingScheduler:
-    """Production schedule: 36 scans between 18:30 and 21:25 IST, duplicate
-    tracker reset at 21:30, session markers. Complete silence outside."""
+    """Production schedule: 60 scans between 18:00 and 22:55 IST, duplicate
+    tracker reset at 23:00, session markers. Complete silence outside."""
     exchange = scanner.make_exchange()
     guard = duplicate_guard.DuplicateGuard()
     scheduler = BlockingScheduler(timezone=config.SCHEDULER_TZ)
@@ -153,28 +162,27 @@ def build_scheduler() -> BlockingScheduler:
     def scan_job() -> None:
         try:
             tickers = exchange.fetch_tickers()
-            tickers_last = {s: t.get("last") for s, t in tickers.items() if t.get("last")}
-            run_scan(exchange, guard, tickers_last)
+            run_scan(exchange, guard, tickers)
         except Exception as exc:  # scheduler jobs must never kill the loop
             log.error("Scan job failed: %s", exc)
 
-    # 18:30, 18:35 ... 18:55  (6)
-    scheduler.add_job(scan_job, CronTrigger(hour=18, minute="30-59/5", timezone=config.SCHEDULER_TZ),
-                      id="scan_1830", name="scan 18:30-18:55")
-    # 19:00 ... 20:55        (24)
-    scheduler.add_job(scan_job, CronTrigger(hour="19-20", minute="*/5", timezone=config.SCHEDULER_TZ),
-                      id="scan_19_20", name="scan 19:00-20:55")
-    # 21:00 ... 21:25        (6)  -> 36 scans total, last one 5 min before close
-    scheduler.add_job(scan_job, CronTrigger(hour=21, minute="0-25/5", timezone=config.SCHEDULER_TZ),
-                      id="scan_21", name="scan 21:00-21:25")
+    # 18:00, 18:05 ... 18:55  (12 scans)
+    scheduler.add_job(scan_job, CronTrigger(hour=18, minute="*/5", timezone=config.SCHEDULER_TZ),
+                      id="scan_18", name="scan 18:00-18:55")
+    # 19:00 ... 21:55         (36 scans)
+    scheduler.add_job(scan_job, CronTrigger(hour="19-21", minute="*/5", timezone=config.SCHEDULER_TZ),
+                      id="scan_19_21", name="scan 19:00-21:55")
+    # 22:00 ... 22:55         (12 scans) -> 60 scans total, last one 5 min before close
+    scheduler.add_job(scan_job, CronTrigger(hour=22, minute="*/5", timezone=config.SCHEDULER_TZ),
+                      id="scan_22", name="scan 22:00-22:55")
 
-    scheduler.add_job(guard.reset, CronTrigger(hour=21, minute=30, timezone=config.SCHEDULER_TZ),
-                      id="guard_reset", name="reset duplicate tracker 21:30")
+    scheduler.add_job(guard.reset, CronTrigger(hour=23, minute=0, timezone=config.SCHEDULER_TZ),
+                      id="guard_reset", name="reset duplicate tracker 23:00")
 
     def session_end() -> None:
-        log.info("9:30 PM IST - session over, bot sleeps until 6:30 PM tomorrow")
+        log.info("11:00 PM IST - session over, bot sleeps until 6:00 PM tomorrow")
 
-    scheduler.add_job(session_end, CronTrigger(hour=21, minute=31, timezone=config.SCHEDULER_TZ),
+    scheduler.add_job(session_end, CronTrigger(hour=23, minute=1, timezone=config.SCHEDULER_TZ),
                       id="session_end", name="session end marker")
     return scheduler
 
@@ -196,15 +204,19 @@ def main() -> None:
         exchange = scanner.make_exchange()
         try:
             tickers = exchange.fetch_tickers()
-            tickers_last = {s: t.get("last") for s, t in tickers.items() if t.get("last")}
         except Exception as exc:
             log.error("Ticker fetch failed in demo mode: %s", exc)
-            tickers_last = {}
-        run_scan(exchange, duplicate_guard.DuplicateGuard(), tickers_last, force=True)
+            tickers = {}
+        run_scan(exchange, duplicate_guard.DuplicateGuard(), tickers, force=True)
         return
 
+    if config.TELEGRAM_TOKEN:
+        started = telegram_bot.start_bot_listener()
+        if started:
+            log.info("Telegram Chat Assistant live: users can chat and query the bot on Telegram")
+
     scheduler = build_scheduler()
-    log.info("Scheduler live: scans every 5 min from %s to %s IST (36 scans), "
+    log.info("Scheduler live: scans every 5 min from %s to %s IST (60 scans), "
              "duplicate reset at %s. Ctrl+C to stop.",
              config.SESSION_START, config.SESSION_END, config.GUARD_RESET_TIME)
     try:

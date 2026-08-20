@@ -56,9 +56,15 @@ def send_alert(sig: dict) -> bool:
         return False
     text = format_alert(sig)
     try:
-        asyncio.run(asyncio.wait_for(_send(text), timeout=20))
+        # Use a fresh event loop in a dedicated thread to avoid RuntimeError
+        # when called inside APScheduler's already-running event loop.
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(asyncio.wait_for(_send(text), timeout=20))
+        finally:
+            loop.close()
         log.info("Telegram alert sent for %s %s", sig["coin"], sig["signal"])
         return True
-    except (telegram.error.TelegramError, asyncio.TimeoutError, RuntimeError, OSError) as exc:
+    except (telegram.error.TelegramError, asyncio.TimeoutError, OSError) as exc:
         log.error("Telegram send failed for %s: %s - bot continues", sig["coin"], exc)
         return False
