@@ -47,6 +47,24 @@ async def _send(text: str) -> None:
         )
 
 
+def send_telegram_text(text: str) -> bool:
+    """Send a custom text message to Telegram; never raises (failure is logged)."""
+    if not config.TELEGRAM_TOKEN or not config.TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured - message logged only:\n%s", text)
+        return False
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(asyncio.wait_for(_send(text), timeout=20))
+        finally:
+            loop.close()
+        log.info("Telegram notification sent")
+        return True
+    except (telegram.error.TelegramError, asyncio.TimeoutError, OSError) as exc:
+        log.error("Telegram notification failed: %s - bot continues", exc)
+        return False
+
+
 def send_alert(sig: dict) -> bool:
     """Send one alert; never raises (failure is logged, bot continues)."""
     if sig["signal"] not in ("BUY", "SELL"):
@@ -55,16 +73,7 @@ def send_alert(sig: dict) -> bool:
         log.warning("Telegram not configured - alert logged only:\n%s", format_alert(sig))
         return False
     text = format_alert(sig)
-    try:
-        # Use a fresh event loop in a dedicated thread to avoid RuntimeError
-        # when called inside APScheduler's already-running event loop.
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(asyncio.wait_for(_send(text), timeout=20))
-        finally:
-            loop.close()
+    success = send_telegram_text(text)
+    if success:
         log.info("Telegram alert sent for %s %s", sig["coin"], sig["signal"])
-        return True
-    except (telegram.error.TelegramError, asyncio.TimeoutError, OSError) as exc:
-        log.error("Telegram send failed for %s: %s - bot continues", sig["coin"], exc)
-        return False
+    return success

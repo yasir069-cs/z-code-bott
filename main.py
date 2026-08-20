@@ -176,11 +176,26 @@ def build_scheduler() -> BlockingScheduler:
     scheduler.add_job(scan_job, CronTrigger(hour=22, minute="*/5", timezone=config.SCHEDULER_TZ),
                       id="scan_22", name="scan 22:00-22:55")
 
+    def session_start() -> None:
+        log.info("6:00 PM IST - Trading session started, beginning 5-minute scans")
+        alerts.send_telegram_text(
+            "🟢 <b>Trading Session Started (18:00 IST)</b>\n"
+            "Scanning all USDT pairs every 5 minutes..."
+        )
+
+    scheduler.add_job(session_start, CronTrigger(hour=18, minute=0, timezone=config.SCHEDULER_TZ),
+                      id="session_start", name="session start marker")
+
     scheduler.add_job(guard.reset, CronTrigger(hour=23, minute=0, timezone=config.SCHEDULER_TZ),
                       id="guard_reset", name="reset duplicate tracker 23:00")
 
     def session_end() -> None:
         log.info("11:00 PM IST - session over, bot sleeps until 6:00 PM tomorrow")
+        alerts.send_telegram_text(
+            "🌙 <b>Trading Session Ended (23:00 IST)</b>\n"
+            "Daily market scans finished. Bot sleeping until 18:00 IST tomorrow.\n"
+            "<i>24/7 AI Chat Assistant remains active!</i>"
+        )
 
     scheduler.add_job(session_end, CronTrigger(hour=23, minute=1, timezone=config.SCHEDULER_TZ),
                       id="session_end", name="session end marker")
@@ -215,6 +230,15 @@ def main() -> None:
         if started:
             log.info("Telegram Chat Assistant live: users can chat and query the bot on Telegram")
 
+    # Send startup notification to Telegram
+    alerts.send_telegram_text(
+        f"🚀 <b>Crypto Signal Bot Started</b>\n\n"
+        f"⏰ <b>Session:</b> {config.SESSION_START} to {config.SESSION_END} IST (every 5 min)\n"
+        f"🤖 <b>AI Model:</b> <code>{config.AI_MODEL}</code>\n"
+        f"📊 <b>Volume Filter:</b> &gt;= ${config.VOLUME_MIN_USDT:,} USDT\n"
+        f"💬 <b>24/7 AI Chat:</b> Send /start or any question anytime!"
+    )
+
     scheduler = build_scheduler()
     log.info("Scheduler live: scans every 5 min from %s to %s IST (60 scans), "
              "duplicate reset at %s. Ctrl+C to stop.",
@@ -222,6 +246,7 @@ def main() -> None:
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
+        alerts.send_telegram_text("🛑 <b>Crypto Signal Bot Stopped</b>")
         log.info("Bot stopped by user")
 
 
