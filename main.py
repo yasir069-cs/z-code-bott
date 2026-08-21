@@ -2,7 +2,7 @@
 
 Every 5 minutes between 6:30 PM and 9:30 PM IST (36 scans/session):
 
-    STEP 1 full exchange scan (all USDT pairs, $5M volume filter)
+    STEP 1 full exchange scan (all USDT-M futures perps, $5M volume filter)
     STEP 2 1H context + liquidation sweep        -> fail: skip coin
     STEP 3 15M confirmation (need 4/5)           -> fail: reject
     STEP 4 5M entry + RSI trend                  -> fail: reject
@@ -180,7 +180,7 @@ def build_scheduler() -> BlockingScheduler:
         log.info("6:00 PM IST - Trading session started, beginning 5-minute scans")
         alerts.send_telegram_text(
             "🟢 <b>Trading Session Started (18:00 IST)</b>\n"
-            "Scanning all USDT pairs every 5 minutes..."
+            "⚡ Scanning all USDT-M Futures pairs every 5 minutes..."
         )
 
     scheduler.add_job(session_start, CronTrigger(hour=18, minute=0, timezone=config.SCHEDULER_TZ),
@@ -235,6 +235,7 @@ def main() -> None:
         f"🚀 <b>Crypto Signal Bot Started</b>\n\n"
         f"⏰ <b>Session:</b> {config.SESSION_START} to {config.SESSION_END} IST (every 5 min)\n"
         f"🤖 <b>AI Model:</b> <code>{config.AI_MODEL}</code>\n"
+        f"⚡ <b>Market:</b> Futures (USDT-M Perpetual)\n"
         f"📊 <b>Volume Filter:</b> &gt;= ${config.VOLUME_MIN_USDT:,} USDT\n"
         f"💬 <b>24/7 AI Chat:</b> Send /start or any question anytime!"
     )

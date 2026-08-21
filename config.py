@@ -41,23 +41,26 @@ RSI_HISTORY = 10                # store last 10 RSI values for trend analysis
 VWAP_ANCHOR = "D"               # daily VWAP
 
 # ------------------------------------------------------------------ 1H filter
-ZONE_PCT = 0.30                 # bottom 30% / top 30% of 50-candle range
-RSI_BUY_MIN, RSI_BUY_MAX = 40.0, 75.0    # bullish range (widened for early entries)
-RSI_SELL_MIN, RSI_SELL_MAX = 28.0, 55.0  # bearish range (widened for strong trends)
+ZONE_PCT = 0.40                 # bottom 40% / top 40% of 50-candle range (futures momentum)
+RSI_BUY_MIN, RSI_BUY_MAX = 45.0, 80.0    # futures: stronger momentum confirmation
+RSI_SELL_MIN, RSI_SELL_MAX = 22.0, 52.0  # futures: catch aggressive liquidation selloffs
+RSI_OVERBOUGHT = 78.0           # 1H RSI above this -> reject BUY (reversal trap risk)
+RSI_OVERSOLD = 25.0             # 1H RSI below this -> reject SELL (bounce risk)
 
 # ------------------------------------------------------------------ liquidation sweep
-SWEEP_SEARCH_CANDLES = 10       # look for the sweep candle among last N closed candles
+SWEEP_SEARCH_CANDLES = 5        # futures sweeps resolve fast, fresh data only
 SWEEP_WINDOW = 20               # swing high/low lookback (last 20 candles)
 SWEEP_WICK_BODY_RATIO = 2.0     # wick > 2x body
-SWEEP_VOL_RATIO = 1.5           # volume > 1.5x avg volume of last 20 candles
+SWEEP_VOL_RATIO = 2.0           # futures: demand real liquidation volume (2x avg)
 
 # ------------------------------------------------------------------ 15M filter
-CONFIRM_MIN_SCORE = 4           # need 4/5 conditions
-ENTRY_MIN_SCORE = 5             # 5M: need 5/7 conditions (scoring system)
+CONFIRM_MIN_SCORE = 4           # 15M: need 4/5 (core indicators mandatory)
+ENTRY_MIN_SCORE = 5             # 5M: need 5/7 (core mandatory + at least 1 bonus)
 
 # ------------------------------------------------------------------ shared tolerances
-BB_NEAR_PCT = 0.005             # 15M/5M: "touch/near" = within 0.5% of the band
-BB_NEAR_PCT_1H = 0.005          # 1H context uses a slightly wider near-band tolerance
+BB_NEAR_PCT = 0.008             # 15M/5M: within 0.8% of the band (futures volatility)
+BB_NEAR_PCT_1H = 0.012          # 1H: within 1.2% (1H futures candles have bigger ranges)
+BB_BANDWIDTH_MIN = 0.025        # BB bandwidth below 2.5% = sideways/squeeze, skip coin
 
 # ------------------------------------------------------------------ AI (OpenRouter / Nemotron)
 AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")

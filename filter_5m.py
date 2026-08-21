@@ -1,12 +1,10 @@
-"""Phase 6 — 5M entry filter (scoring system).
+"""Phase 6 — 5M entry filter (core + bonus scoring).
 
 Only candidates that passed 1H + 15M reach this stage.
-BUY conditions (need 5/7):
-  RSI 40-75, RSI trend UP, higher lows in recent RSI, price > EMA21,
-  price > VWAP, volume above average, lower BB bounce.
-SELL conditions (need 5/7):
-  RSI 28-55, RSI trend DOWN, lower highs, price < EMA21,
-  price < VWAP, volume above average, upper BB rejection.
+
+Core conditions (RSI, EMA21, VWAP, Volume) must ALL independently pass.
+Bonus conditions (RSI trend, RSI pattern, BB bounce) — need at least 1/3.
+Total score must be >= ENTRY_MIN_SCORE (5/7).
 
 RSI is analysed as a TREND, not a static value: 50 -> 55 -> 51 -> 56 is
 bullish because the RSI dip holds a higher low (spec example).
@@ -35,13 +33,15 @@ def entry_5m(df, direction: str) -> Optional[dict]:
         # higher_lows: check the last 3 RSI values form an ascending pattern
         recent3 = history[-3:] if len(history) >= 3 else history
         has_higher_lows = len(recent3) >= 3 and recent3[-1] > recent3[-3]
-        checks = {
-            "rsi_40_75": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX,
-            "rsi_trend_up": rsi_trend_up(history),
-            "rsi_higher_lows": has_higher_lows,
+        core = {
+            "rsi_in_range": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX,
             "price_above_ema21": snap["close"] > snap["ema21"],
             "price_above_vwap": snap["close"] > snap["vwap"],
             "volume_above_avg": snap["volume"] > snap["volume_avg20"],
+        }
+        bonus = {
+            "rsi_trend_up": rsi_trend_up(history),
+            "rsi_higher_lows": has_higher_lows,
             "bb_lower_bounce": bounce,
         }
     elif direction == "SELL":
@@ -52,22 +52,35 @@ def entry_5m(df, direction: str) -> Optional[dict]:
         # lower_highs: check the last 3 RSI values form a descending pattern
         recent3 = history[-3:] if len(history) >= 3 else history
         has_lower_highs = len(recent3) >= 3 and recent3[-1] < recent3[-3]
-        checks = {
-            "rsi_28_55": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX,
-            "rsi_trend_down": rsi_trend_down(history),
-            "rsi_lower_highs": has_lower_highs,
+        core = {
+            "rsi_in_range": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX,
             "price_below_ema21": snap["close"] < snap["ema21"],
             "price_below_vwap": snap["close"] < snap["vwap"],
             "volume_above_avg": snap["volume"] > snap["volume_avg20"],
+        }
+        bonus = {
+            "rsi_trend_down": rsi_trend_down(history),
+            "rsi_lower_highs": has_lower_highs,
             "bb_upper_rejection": rejection,
         }
     else:
         raise ValueError(f"direction must be BUY or SELL, got {direction!r}")
 
-    score = sum(checks.values())
-    if score < config.ENTRY_MIN_SCORE:
-        log.debug("5M %s rejected (score %d/%d): %s", direction, score, len(checks),
-                  {k: v for k, v in checks.items() if not v})
+    # Core conditions must ALL pass — RSI, EMA, VWAP, Volume independently verify
+    if not all(core.values()):
+        failed = {k: v for k, v in core.items() if not v}
+        log.debug("5M %s REJECTED — core failed: %s", direction, failed)
         return None
-    log.debug("5M %s passed (score %d/%d): %s", direction, score, len(checks), checks)
+
+    # Bonus: need at least 1/3 (RSI trend, RSI pattern, BB bounce)
+    bonus_passed = sum(bonus.values())
+    if bonus_passed < 1:
+        log.debug("5M %s REJECTED — core OK but no bonus passed (0/3): %s", direction,
+                  {k: v for k, v in bonus.items() if not v})
+        return None
+
+    checks = {**core, **bonus}
+    score = sum(checks.values())
+    log.debug("5M %s PASSED (score %d/7, core=4/4 ✓, bonus=%d/3): %s",
+              direction, score, bonus_passed, checks)
     return {"direction": direction, "score": score, "checks": checks, "indicators": snap}

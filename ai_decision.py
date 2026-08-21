@@ -25,7 +25,7 @@ log = logging.getLogger("ai_decision")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-_SYSTEM_PROMPT = """You are the final decision engine for a crypto futures signal bot.
+_SYSTEM_PROMPT = """You are the final decision engine for a USDT-M perpetual futures signal bot on Binance.
 
 Your job is NOT to execute trades. You only decide: BUY / SELL / HOLD.
 The Python engine has already filtered the market; analyze the complete

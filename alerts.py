@@ -23,6 +23,7 @@ def format_alert(sig: dict) -> str:
     icon = "🟢" if sig["signal"] == "BUY" else "🔴"
     lines = [
         f"{icon} <b>{sig['signal']} SIGNAL — {html.escape(sig['coin'])}</b>",
+        f"⚡ Market: <b>Futures (USDT-M Perpetual)</b>",
         f"Entry: <code>{sig['entry']:.6g}</code>",
         f"SL: <code>{sig['SL']:.6g}</code>",
         f"TP: <code>{sig['TP']:.6g}</code>",

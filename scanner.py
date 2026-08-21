@@ -1,7 +1,7 @@
 """Phase 1 — Data Foundation.
 
-Full Binance exchange scan via CCXT public mode (no API key):
-  * fetch_tickers() -> ALL USDT pairs, fetched dynamically (never hardcoded)
+Full Binance USDT-M Futures exchange scan via CCXT public mode (no API key):
+  * fetch_tickers() -> ALL USDT perpetual pairs, fetched dynamically (never hardcoded)
   * volume filter: skip coins with 24h quote volume < $5M
   * fetch 1H / 15M / 5M OHLCV (last 50 closed candles each)
 
@@ -22,19 +22,19 @@ log = logging.getLogger("scanner")
 
 _TIMEFRAME_DELTA = {"1h": pd.Timedelta(hours=1), "15m": pd.Timedelta(minutes=15), "5m": pd.Timedelta(minutes=5)}
 
-# Leveraged tokens are not spot trading targets for this strategy.
+# Leveraged tokens are not valid futures targets for this strategy.
 _LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
 
 def make_exchange() -> ccxt.Exchange:
-    """Binance public market data. No keys, no trading endpoints."""
-    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    """Binance USDT-M Futures public market data. No keys, no trading endpoints."""
+    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
 
 
 def get_active_usdt_symbols(exchange: ccxt.Exchange,
                              prefetched_tickers: dict | None = None) -> dict[str, float]:
-    """Return {symbol: 24h quote volume} for every active, spot USDT pair
-    whose 24h volume >= VOLUME_MIN_USDT, ordered by volume (desc).
+    """Return {symbol: 24h quote volume} for every active, USDT-M futures
+    perpetual pair whose 24h volume >= VOLUME_MIN_USDT, ordered by volume (desc).
 
     When *prefetched_tickers* is provided (the raw dict from
     exchange.fetch_tickers()), we skip the redundant API call.
@@ -48,7 +48,10 @@ def get_active_usdt_symbols(exchange: ccxt.Exchange,
     result: dict[str, float] = {}
     for symbol, ticker in tickers.items():
         market = markets.get(symbol)
-        if market is None or not market.get("spot", False) or not market.get("active", False):
+        if market is None or not market.get("swap", False) or not market.get("active", False):
+            continue
+        # Only USDT-margined (linear) perpetuals, skip coin-margined (inverse)
+        if not market.get("linear", False):
             continue
         if market.get("quote") != "USDT":
             continue
@@ -64,7 +67,7 @@ def get_active_usdt_symbols(exchange: ccxt.Exchange,
         result[symbol] = quote_volume
 
     ordered = dict(sorted(result.items(), key=lambda kv: kv[1], reverse=True))
-    log.info("Exchange scan: %d total tickers, %d USDT pairs with 24h volume >= $%s",
+    log.info("Futures scan: %d total tickers, %d USDT-M perps with 24h volume >= $%s",
              len(tickers), len(ordered), f"{config.VOLUME_MIN_USDT:,}")
     return ordered
 

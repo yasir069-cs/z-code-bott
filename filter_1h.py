@@ -92,7 +92,8 @@ def analyze_1h(df: pd.DataFrame) -> Optional[dict]:
     """Classify 1H context. Returns a context dict when the coin passes
     (direction BUY or SELL), otherwise None (skip the coin entirely).
 
-    3 Core Pillars: RSI + EMA21 + VWAP (plus volume and BB context).
+    3 Core Pillars: RSI + EMA21 + VWAP (plus volume, BB context, and guards).
+    Guards: overbought/oversold rejection, sideways/squeeze detection.
     Sweep detection is OPTIONAL — when found it adds high confidence for the AI,
     and all sweep metrics are collected and forwarded to the AI decision bundle.
     """
@@ -100,9 +101,17 @@ def analyze_1h(df: pd.DataFrame) -> Optional[dict]:
     if snap is None:
         return None
 
+    # --- Sideways market detection: skip when BB bandwidth is too narrow ---
+    bb_bandwidth = (snap["bb_upper"] - snap["bb_lower"]) / snap["bb_mid"] if snap["bb_mid"] > 0 else 0
+    if bb_bandwidth < config.BB_BANDWIDTH_MIN:
+        log.debug("1H rejected: BB bandwidth %.4f < %.4f (sideways/squeeze, no signal)",
+                  bb_bandwidth, config.BB_BANDWIDTH_MIN)
+        return None
+
     checks = {
         "BUY": {
-            "rsi_40_75_rising": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX
+            "not_overbought": snap["rsi"] <= config.RSI_OVERBOUGHT,
+            "rsi_45_80_rising": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX
                                 and snap["rsi"] > snap["rsi_prev"],
             "price_above_ema21": snap["close"] > snap["ema21"],
             "price_above_vwap": snap["close"] > snap["vwap"],
@@ -110,7 +119,8 @@ def analyze_1h(df: pd.DataFrame) -> Optional[dict]:
             "near_lower_bb": _near_lower_band(snap, config.BB_NEAR_PCT_1H),
         },
         "SELL": {
-            "rsi_28_55_falling": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX
+            "not_oversold": snap["rsi"] >= config.RSI_OVERSOLD,
+            "rsi_22_52_falling": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX
                                  and snap["rsi"] < snap["rsi_prev"],
             "price_below_ema21": snap["close"] < snap["ema21"],
             "price_below_vwap": snap["close"] < snap["vwap"],
@@ -139,5 +149,6 @@ def analyze_1h(df: pd.DataFrame) -> Optional[dict]:
             "indicators": snap,
             "sweep": sweep,  # Collected and passed to AI bundle (None if no sweep)
             "checks": checks[direction],
+            "bb_bandwidth": bb_bandwidth,
         }
     return None
