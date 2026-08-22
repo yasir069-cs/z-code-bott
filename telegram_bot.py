@@ -26,6 +26,7 @@ from chat_assistant import (
     get_recent_signals_summary,
 )
 import config
+import ondemand  # on-demand scan control
 
 log = logging.getLogger("telegram_bot")
 
@@ -62,7 +63,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — Live bot status & schedule\n"
         "/signals — Recent trade signals\n"
         "/strategy — Explain indicator strategy\n"
-        "/help — View all commands & tips\n\n"
+        "/help — View all commands & tips\n"
+        "/scan_on — 🟢 Start manual scan anytime\n"
+        "/scan_off — 🔴 Stop manual scan\n\n"
         "💬 <i>Just send any message to chat with the AI assistant!</i>"
     )
     if update.message:
@@ -78,7 +81,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• <code>/signals</code> — Show recent 5 BUY/SELL/HOLD signals\n"
         "• <code>/strategy</code> — Detailed explanation of the 3-layer trading strategy\n"
         "• <code>/ask [question]</code> — Ask AI any question directly\n"
-        "• <code>/clear</code> — Reset your chat history with the AI\n\n"
+        "• <code>/clear</code> — Reset your chat history with the AI\n"
+        "• <code>/scan_on</code> — 🟢 Manually start scanning (any time, outside 18-23 session)\n"
+        "• <code>/scan_off</code> — 🔴 Stop the manual scan session\n\n"
         "💡 <b>Chatting with AI:</b>\n"
         "You don't even need commands — just type your question normally! For example:\n"
         "• <i>\"How does the 1H VWAP and EMA filter work?\"</i>\n"
@@ -132,6 +137,75 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("🧹 Chat memory cleared. You can start a fresh conversation!")
 
 
+def _is_owner(update: Update) -> bool:
+    """Check if the sender is the bot owner (TELEGRAM_CHAT_ID)."""
+    if not config.TELEGRAM_CHAT_ID:
+        return True  # no restriction if chat_id not configured
+    chat_id = str(update.effective_chat.id) if update.effective_chat else ""
+    return chat_id == config.TELEGRAM_CHAT_ID
+
+
+async def cmd_scan_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /scan_on — start on-demand scan session anytime."""
+    if not _is_owner(update):
+        if update.message:
+            await update.message.reply_text("🚫 Access denied. Only the bot owner can use this command.")
+        return
+
+    if update.message:
+        await update.message.reply_text("⏳ Starting on-demand scan... Please wait.", parse_mode=ParseMode.HTML)
+
+    import threading
+    def _start_in_thread():
+        import scanner as sc
+        import duplicate_guard as dg
+        from main import run_scan
+        result = ondemand.start_ondemand_scan(
+            run_scan_fn=run_scan,
+            make_exchange_fn=sc.make_exchange,
+            fetch_funding_fn=sc.fetch_funding_rates,
+            DuplicateGuardClass=dg.DuplicateGuard,
+        )
+        status = result.get("status")
+        if status == "started":
+            msg = (
+                "🟢 <b>On-Demand Scan Started!</b>\n\n"
+                "⚡ Scanning every <b>5 minutes</b> \u2014 active until you send /scan_off\n"
+                "🔔 You will receive BUY/SELL alerts as signals are found."
+            )
+        elif status == "already_running":
+            msg = "⚠️ On-demand scan is <b>already running</b>. Send /scan_off to stop it first."
+        else:
+            msg = "❌ Could not start scan. Check bot logs."
+        import alerts as alerts_mod
+        alerts_mod.send_telegram_text(msg)
+
+    threading.Thread(target=_start_in_thread, daemon=True, name="ScanOnCmd").start()
+
+
+async def cmd_scan_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /scan_off — stop on-demand scan session."""
+    if not _is_owner(update):
+        if update.message:
+            await update.message.reply_text("🚫 Access denied. Only the bot owner can use this command.")
+        return
+
+    result = ondemand.stop_ondemand_scan()
+    status = result.get("status")
+    if status == "stopped":
+        msg = (
+            "🔴 <b>On-Demand Scan Stopped.</b>\n"
+            "Bot will resume its permanent session at <b>18:00 IST</b> as usual."
+        )
+    elif status == "not_running":
+        msg = "ℹ️ No on-demand scan is currently running."
+    else:
+        msg = "❌ Could not stop scan. Check bot logs."
+
+    if update.message:
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all non-command user text messages using the LLM."""
     if not update.message or not update.message.text:
@@ -176,6 +250,8 @@ def build_telegram_application() -> Optional[Application]:
     app.add_handler(CommandHandler("strategy", cmd_strategy))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("ask", handle_message))
+    app.add_handler(CommandHandler("scan_on", cmd_scan_on))
+    app.add_handler(CommandHandler("scan_off", cmd_scan_off))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     return app

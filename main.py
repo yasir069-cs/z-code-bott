@@ -1,18 +1,21 @@
 """Crypto Signal Bot — entry point + APScheduler timer (Phase 12).
 
-Every 5 minutes between 6:30 PM and 9:30 PM IST (36 scans/session):
+Every 5 minutes between 18:00 and 23:00 IST (60 scans/session):
 
-    STEP 1 full exchange scan (all USDT-M futures perps, $5M volume filter)
-    STEP 2 1H context + liquidation sweep        -> fail: skip coin
-    STEP 3 15M confirmation (need 4/5)           -> fail: reject
-    STEP 4 5M entry + RSI trend                  -> fail: reject
-    STEP 5 Claude AI decision (BUY/SELL/HOLD + SL/TP/RR) or Python fallback
-    STEP 6 duplicate guard (20 min per coin)
-    STEP 7 Telegram alert (BUY/SELL only, HOLD silent)
-    STEP 8 append every signal to signals_log.csv
+    STEP 1 full exchange scan (all USDT-M futures perps, $50M volume filter)
+    STEP 2 1H context + liquidation sweep + sideways/overbought guard -> fail: skip
+    STEP 3 funding rate check (reject overleveraged market)
+    STEP 4 15M confirmation (core mandatory)        -> fail: reject
+    STEP 5 5M entry + RSI trend (core mandatory)    -> fail: reject
+    STEP 6 AI decision (BUY/SELL/HOLD + SL/TP/RR) or Python fallback
+    STEP 7 duplicate guard (15 min per coin)
+    STEP 8 leverage suggestion + position size calc
+    STEP 9 Telegram alert (BUY/SELL only, HOLD silent)
+    STEP 10 append every signal to signals_log.csv
+    STEP 11 daily performance summary at session end
 
-Outside 18:30-21:30 IST the scheduler runs nothing: zero activity,
-zero market API calls, zero Claude calls.
+Outside 18:00-23:00 IST the scheduler runs nothing: zero activity,
+zero market API calls, zero AI calls.
 
 Usage:
     python main.py            # production schedule (APScheduler, IST)
@@ -21,6 +24,7 @@ Usage:
 Signals only — this bot NEVER places trades (no trading endpoints, no keys).
 """
 import argparse
+import csv
 import logging
 from datetime import datetime
 
@@ -36,6 +40,7 @@ import filter_5m
 import logger
 import scanner
 import telegram_bot
+import ondemand
 from ai_decision import AIDecisionError, nemotron_decision
 from fallback import fallback_decision
 
@@ -48,7 +53,7 @@ def _in_session(now_ist: datetime) -> bool:
 
 
 def _decide(bundle: dict) -> dict:
-    """OpenRouter/Nemotron decision with Python fallback (STEP 5 of the flow)."""
+    """OpenRouter/Nemotron decision with Python fallback (STEP 6 of the flow)."""
     try:
         decision = nemotron_decision(bundle)
         log.info("%s: AI -> %s (confidence=%s)", bundle["symbol"], decision["signal"],
@@ -59,16 +64,43 @@ def _decide(bundle: dict) -> dict:
         return fallback_decision(bundle)
 
 
+def _calc_leverage(atr: float, price: float) -> str:
+    """Suggest leverage based on ATR as percentage of price."""
+    if price <= 0:
+        return "3x-5x"
+    atr_pct = atr / price
+    if atr_pct < config.LEV_ATR_LOW:
+        return "10x-15x"
+    elif atr_pct < config.LEV_ATR_HIGH:
+        return "5x-8x"
+    else:
+        return "3x-5x"
+
+
+def _calc_position_size(entry: float, sl: float) -> dict:
+    """Calculate position size based on account balance and risk per trade."""
+    risk_amount = config.ACCOUNT_BALANCE * (config.RISK_PER_TRADE_PCT / 100)
+    risk_per_unit = abs(entry - sl) if sl else 0
+    if risk_per_unit <= 0 or entry <= 0:
+        return {"qty": 0, "value": 0, "risk_amount": risk_amount}
+    qty = risk_amount / risk_per_unit
+    value = qty * entry
+    return {"qty": round(qty, 6), "value": round(value, 2), "risk_amount": round(risk_amount, 2)}
+
+
 def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
              tickers: dict | None = None,
+             funding_rates: dict | None = None,
              force: bool = False) -> dict:
     """One full scan cycle. `force=True` runs it regardless of the session
     window (DEMO/TEST mode) — production scans are only ever scheduled
-    inside 18:30-21:30 IST.
+    inside 18:00-23:00 IST.
 
     *tickers* is the raw dict from exchange.fetch_tickers(); when provided
     it is forwarded to the scanner so fetch_tickers() is called only once
-    per scan cycle."""
+    per scan cycle.
+
+    *funding_rates* is the {symbol: rate} dict for funding rate filtering."""
     now_ist = datetime.now(config.TZ)
     if not force and not _in_session(now_ist):
         log.info("Outside active session (now %s IST) - zero activity", now_ist.strftime("%H:%M"))
@@ -79,8 +111,10 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
     tickers_last = {}
     if tickers:
         tickers_last = {s: t.get("last") for s, t in tickers.items() if isinstance(t, dict) and t.get("last")}
+    if funding_rates is None:
+        funding_rates = {}
     summary = {"scanned": len(symbols), "pass_1h": 0, "pass_15m": 0, "pass_5m": 0,
-               "duplicates": 0, "signals": 0, "holds": 0}
+               "funding_rejected": 0, "duplicates": 0, "signals": 0, "holds": 0}
 
     for symbol in symbols:
         df_1h = scanner.fetch_ohlcv(exchange, symbol, "1h")
@@ -91,6 +125,20 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
             continue
         summary["pass_1h"] += 1
         direction = ctx["direction"]
+
+        # STEP 3: Funding rate check — reject when market is overleveraged
+        fr = funding_rates.get(symbol)
+        if fr is not None:
+            if direction == "BUY" and fr > config.FUNDING_RATE_MAX_LONG:
+                log.info("%s: BUY rejected — funding %.4f%% > %.4f%% (longs overleveraged)",
+                         symbol, fr * 100, config.FUNDING_RATE_MAX_LONG * 100)
+                summary["funding_rejected"] += 1
+                continue
+            if direction == "SELL" and fr < config.FUNDING_RATE_MIN_SHORT:
+                log.info("%s: SELL rejected — funding %.4f%% < %.4f%% (shorts overleveraged)",
+                         symbol, fr * 100, config.FUNDING_RATE_MIN_SHORT * 100)
+                summary["funding_rejected"] += 1
+                continue
 
         df_15m = scanner.fetch_ohlcv(exchange, symbol, "15m")
         confirm = None if df_15m is None else filter_15m.confirm_15m(df_15m, direction)
@@ -117,14 +165,19 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
             "ind_5m": entry["indicators"],
         }
 
-        # STEP 6: duplicate guard — same coin signaled within 20 min: skip silently
+        # STEP 7: duplicate guard — same coin signaled within cooldown: skip silently
         if guard.is_duplicate(symbol, now_ist):
             summary["duplicates"] += 1
             log.debug("%s: duplicate within cooldown - skipped silently", symbol)
             continue
 
-        # STEP 5: OpenRouter/Nemotron (or fallback) -> BUY / SELL / HOLD
+        # STEP 6: OpenRouter/Nemotron (or fallback) -> BUY / SELL / HOLD
         decision = _decide(bundle)
+
+        # STEP 8: Leverage suggestion + position size
+        leverage = _calc_leverage(ctx["indicators"]["atr"], float(last_price))
+        pos = _calc_position_size(decision["entry"], decision.get("sl"))
+
         sig = {
             "coin": symbol,
             "signal": decision["signal"],
@@ -132,6 +185,9 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
             "SL": decision["sl"],
             "TP": decision["tp"],
             "RR": decision["rr"],
+            "leverage": leverage,
+            "position_size": pos["value"],
+            "funding_rate": fr,
             "reason": decision["reason"],
             "ai_used": decision["ai_used"],
         }
@@ -141,15 +197,68 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
             logger.log_signal(sig)
             summary["holds"] += 1
         else:
-            sent = alerts.send_alert(sig)  # STEP 7 (failure logged, bot continues)
-            logger.log_signal(sig)          # STEP 8
+            sent = alerts.send_alert(sig)  # STEP 9 (failure logged, bot continues)
+            logger.log_signal(sig)          # STEP 10
             summary["signals"] += 1
-            log.info("%s %s alert_sent=%s entry=%.6g sl=%.6g tp=%.6g rr=%.2f",
-                     symbol, sig["signal"], sent, sig["entry"], sig["SL"], sig["TP"], sig["RR"])
+            log.info("%s %s alert_sent=%s entry=%.6g sl=%.6g tp=%.6g rr=%.2f lev=%s pos=$%.2f",
+                     symbol, sig["signal"], sent, sig["entry"], sig["SL"], sig["TP"],
+                     sig["RR"], leverage, pos["value"])
             guard.record(symbol, now_ist)  # cooldown only for BUY/SELL, not HOLD
 
     log.info("Scan complete: %s", summary)
     return summary
+
+
+def start_ondemand_scan() -> dict:
+    """Telegram /scan_on: delegate to ondemand module."""
+    return ondemand.start_ondemand_scan(
+        run_scan_fn=run_scan,
+        make_exchange_fn=scanner.make_exchange,
+        fetch_funding_fn=scanner.fetch_funding_rates,
+        DuplicateGuardClass=duplicate_guard.DuplicateGuard,
+    )
+
+
+def stop_ondemand_scan() -> dict:
+    """Telegram /scan_off: delegate to ondemand module."""
+    return ondemand.stop_ondemand_scan()
+
+
+def _daily_summary() -> str:
+    """Generate daily performance summary from signals_log.csv."""
+    today = datetime.now(config.TZ).strftime("%Y-%m-%d")
+    buys, sells, holds = 0, 0, 0
+    try:
+        if not config.SIGNALS_LOG_FILE.exists():
+            return "No signals logged yet."
+        with open(config.SIGNALS_LOG_FILE, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                ts = row.get("timestamp", "")
+                if not ts.startswith(today):
+                    continue
+                sig = row.get("signal", "")
+                if sig == "BUY":
+                    buys += 1
+                elif sig == "SELL":
+                    sells += 1
+                elif sig == "HOLD":
+                    holds += 1
+    except Exception as exc:
+        log.error("Daily summary read error: %s", exc)
+        return f"Error reading signals: {exc}"
+
+    total = buys + sells
+    return (
+        f"📊 <b>Daily Report ({today})</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 BUY signals: <b>{buys}</b>\n"
+        f"🔴 SELL signals: <b>{sells}</b>\n"
+        f"⏸ HOLD (silent): <b>{holds}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📈 Total alerts sent: <b>{total}</b>\n"
+        f"💰 Account: <b>${config.ACCOUNT_BALANCE:,.0f}</b> | "
+        f"Risk: <b>{config.RISK_PER_TRADE_PCT}%</b>/trade"
+    )
 
 
 def build_scheduler() -> BlockingScheduler:
@@ -162,7 +271,8 @@ def build_scheduler() -> BlockingScheduler:
     def scan_job() -> None:
         try:
             tickers = exchange.fetch_tickers()
-            run_scan(exchange, guard, tickers)
+            funding_rates = scanner.fetch_funding_rates(exchange)
+            run_scan(exchange, guard, tickers, funding_rates)
         except Exception as exc:  # scheduler jobs must never kill the loop
             log.error("Scan job failed: %s", exc)
 
@@ -191,9 +301,10 @@ def build_scheduler() -> BlockingScheduler:
 
     def session_end() -> None:
         log.info("11:00 PM IST - session over, bot sleeps until 6:00 PM tomorrow")
+        summary = _daily_summary()
         alerts.send_telegram_text(
-            "🌙 <b>Trading Session Ended (23:00 IST)</b>\n"
-            "Daily market scans finished. Bot sleeping until 18:00 IST tomorrow.\n"
+            "🌙 <b>Trading Session Ended (23:00 IST)</b>\n\n"
+            f"{summary}\n\n"
             "<i>24/7 AI Chat Assistant remains active!</i>"
         )
 
@@ -219,10 +330,12 @@ def main() -> None:
         exchange = scanner.make_exchange()
         try:
             tickers = exchange.fetch_tickers()
+            funding_rates = scanner.fetch_funding_rates(exchange)
         except Exception as exc:
-            log.error("Ticker fetch failed in demo mode: %s", exc)
+            log.error("Ticker/funding fetch failed in demo mode: %s", exc)
             tickers = {}
-        run_scan(exchange, duplicate_guard.DuplicateGuard(), tickers, force=True)
+            funding_rates = {}
+        run_scan(exchange, duplicate_guard.DuplicateGuard(), tickers, funding_rates, force=True)
         return
 
     if config.TELEGRAM_TOKEN:
@@ -237,6 +350,7 @@ def main() -> None:
         f"🤖 <b>AI Model:</b> <code>{config.AI_MODEL}</code>\n"
         f"⚡ <b>Market:</b> Futures (USDT-M Perpetual)\n"
         f"📊 <b>Volume Filter:</b> &gt;= ${config.VOLUME_MIN_USDT:,} USDT\n"
+        f"💰 <b>Risk:</b> {config.RISK_PER_TRADE_PCT}% per trade on ${config.ACCOUNT_BALANCE:,.0f}\n"
         f"💬 <b>24/7 AI Chat:</b> Send /start or any question anytime!"
     )
 

@@ -129,3 +129,28 @@ def fetch_all_timeframes(exchange: ccxt.Exchange, symbol: str) -> Optional[dict[
             return None
         frames[timeframe] = df
     return frames
+
+
+def fetch_funding_rates(exchange: ccxt.Exchange) -> dict[str, float]:
+    """Fetch current funding rates for all USDT-M futures pairs.
+
+    Returns {symbol: funding_rate} dict. Funding rate is a decimal
+    (e.g. 0.0001 = 0.01%). Returns empty dict on failure (non-fatal).
+    """
+    for attempt in range(1, config.FETCH_RETRY_MAX + 1):
+        try:
+            rates = exchange.fetch_funding_rates()
+            result = {}
+            for symbol, data in rates.items():
+                if isinstance(data, dict) and data.get("fundingRate") is not None:
+                    result[symbol] = float(data["fundingRate"])
+            log.info("Funding rates fetched: %d symbols", len(result))
+            return result
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError, ccxt.ExchangeError) as exc:
+            log.warning("Funding rate fetch attempt %d/%d failed: %s",
+                        attempt, config.FETCH_RETRY_MAX, exc)
+            if attempt < config.FETCH_RETRY_MAX:
+                _backoff_sleep(attempt)
+    log.error("Funding rate fetch failed after %d attempts, continuing without", config.FETCH_RETRY_MAX)
+    return {}
+

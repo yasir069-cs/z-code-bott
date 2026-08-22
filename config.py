@@ -24,7 +24,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
 # ------------------------------------------------------------------ scanner
 EXCHANGE_ID = "binance"
-VOLUME_MIN_USDT = 5_000_000     # 24h quote volume filter ($5M minimum)
+VOLUME_MIN_USDT = 50_000_000    # 24h quote volume filter ($50M — futures liquidity)
 CANDLE_LIMIT = 50               # last 50 candles per timeframe (strategy window)
 INDICATOR_WARMUP = 250          # extra closed candles so pandas-ta values converge
                                 # to TradingView (Wilder/EMA recursions need warm-up)
@@ -62,6 +62,18 @@ BB_NEAR_PCT = 0.008             # 15M/5M: within 0.8% of the band (futures volat
 BB_NEAR_PCT_1H = 0.012          # 1H: within 1.2% (1H futures candles have bigger ranges)
 BB_BANDWIDTH_MIN = 0.025        # BB bandwidth below 2.5% = sideways/squeeze, skip coin
 
+# ------------------------------------------------------------------ funding rate (futures)
+FUNDING_RATE_MAX_LONG = 0.0005   # +0.05% — reject BUY above this (longs overleveraged)
+FUNDING_RATE_MIN_SHORT = -0.0003 # -0.03% — reject SELL below this (shorts overleveraged)
+
+# ------------------------------------------------------------------ risk management
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "1000"))  # USDT balance for sizing
+RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2.0"))  # max 2% risk per trade
+
+# ------------------------------------------------------------------ leverage suggestion (ATR-based)
+LEV_ATR_LOW = 0.01               # ATR < 1% of price -> high leverage OK
+LEV_ATR_HIGH = 0.03              # ATR > 3% of price -> low leverage only
+
 # ------------------------------------------------------------------ AI (OpenRouter / Nemotron)
 AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 AI_MAX_TOKENS = 300             # rules.md: max tokens 300
@@ -74,7 +86,7 @@ AI_TEMPERATURE = 0.1
 AI_REASONING_ENABLED = False
 
 # ------------------------------------------------------------------ duplicate guard
-DUPLICATE_COOLDOWN_MIN = 20     # same coin within 20 min -> skip silently
+DUPLICATE_COOLDOWN_MIN = 15     # same coin within 15 min -> skip (futures pace faster)
 GUARD_RESET_TIME = "23:00"      # tracker resets at 11:00 PM IST
 
 # ------------------------------------------------------------------ scheduler
@@ -88,7 +100,8 @@ SIGNALS_LOG_FILE = BASE_DIR / "signals_log.csv"
 BOT_LOG_FILE = BASE_DIR / "bot.log"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-CSV_COLUMNS = ["timestamp", "coin", "signal", "entry", "SL", "TP", "RR", "reason", "ai_used"]
+CSV_COLUMNS = ["timestamp", "coin", "signal", "entry", "SL", "TP", "RR",
+               "leverage", "position_size", "funding_rate", "reason", "ai_used"]
 
 
 def setup_logging() -> None:
