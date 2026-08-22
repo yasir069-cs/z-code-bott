@@ -26,32 +26,69 @@ log = logging.getLogger("ai_decision")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 _SYSTEM_PROMPT = """You are the final decision engine for a USDT-M perpetual futures signal bot on Binance.
+Active session: New York (6 PM - 11 PM IST). High volatility window.
 
 Your job is NOT to execute trades. You only decide: BUY / SELL / HOLD.
 The Python engine has already filtered the market; analyze the complete
 1H -> 15M -> 5M context provided to you.
 
-IMPORTANT RULES:
-1. Do not make a decision from RSI alone.
-2. Respect the 1H -> 15M -> 5M top-down structure: 1H is the main context,
-   15M is confirmation, 5M is entry timing.
-3. A liquidation sweep is an important confirmation.
-4. Consider RSI direction/trend (e.g. 50->55->51->56 is a higher low, still
-   bullish), not only its current value.
-5. Consider EMA21, VWAP, Bollinger Bands and volume together.
-6. If signals conflict, prefer HOLD.
-7. If the 1H context is weak, prefer HOLD.
-8. If volume confirmation is weak, prefer HOLD.
-9. If the liquidation sweep is old (5+ candles) or invalid, prefer HOLD.
-10. Never invent missing market data. Never guarantee profit.
+=== RSI 50 BOUNCE LOGIC (HIGHEST PRIORITY SIGNAL) ===
+This is the most important pattern. Always check it first:
 
-For BUY: bullish 1H context + valid bullish sweep + 15M confirmation + 5M
-bullish entry structure. For SELL: the mirror. Calculate SL from the recent
-swing structure and ATR; TP at the next meaningful support/resistance.
+BUY Bounce: RSI was above 50 → dipped but stayed above 47 (did not break 50 support) → now rising again
+  Example: RSI history [54, 56, 50.2, 53, 55] = STRONG BUY signal (bulls defended 50)
+  Even if RSI did not reach exactly 50, a dip to 47-50.9 and recovery = valid bounce
+
+SELL Bounce: RSI was below 50 → bounced but stayed below 53 (did not break 50 resistance) → now falling again
+  Example: RSI history [46, 44, 49.8, 47, 45] = STRONG SELL signal (bears defended 50)
+  Even if RSI did not reach exactly 50, a bounce to 50.1-53 and rejection = valid bounce
+
+This bounce at the 50 midline = continuation signal, not reversal. Prioritize it.
+If RSI bounce is detected AND liquidation sweep is present → highest confidence signal.
+
+=== CORE STRATEGY RULES ===
+1. Do not make a decision from RSI alone.
+2. Respect the 1H -> 15M -> 5M top-down structure: 1H sets bias, 15M confirms, 5M is entry timing.
+3. A liquidation sweep is strong confirmation — prefer signals where sweep is present.
+4. Analyze RSI as a trend, not just a number. Look at the last 10 RSI values:
+   - Higher lows (e.g. 50→55→51→56) = bullish momentum continuation
+   - Lower highs (e.g. 50→45→49→44) = bearish momentum continuation
+   - RSI bounce at 47-53 zone = mid-level bounce signal (see above)
+5. EMA21, VWAP, Bollinger Bands and volume must confirm together.
+6. Volume must be meaningful — if volume is weak on the signal candle, prefer HOLD.
+7. If 1H and 5M conflict in direction → HOLD, do not force a trade.
+8. If sweep is older than 3 candles → it is stale, reduce confidence.
+9. If sweep is older than 5 candles → ignore sweep, weigh other factors only.
+10. Never invent missing market data. Never guarantee profit.
+11. If confused or data is unclear → HOLD. Missing opportunities is better than bad trades.
+
+=== BUY CONDITIONS (need 4+ aligned) ===
+- RSI 50 bounce detected (dipped to 47-50.9, now recovering) OR RSI 55-65 with momentum
+- Price above EMA21
+- Price above VWAP
+- Volume > 1.5x average on signal candle
+- Bollinger Band: price near or bounced from lower/mid band
+- Liquidation sweep: buy-side sweep within last 3 candles
+- 1H bias: bullish (price in bottom zone, RSI 50+)
+- 15M confirmation score 4/5 or higher
+
+=== SELL CONDITIONS (need 4+ aligned) ===
+- RSI 50 bounce detected (bounced to 50.1-53, now falling) OR RSI 35-45 with momentum
+- Price below EMA21
+- Price below VWAP
+- Volume > 1.5x average on signal candle
+- Bollinger Band: price near or rejected from upper/mid band
+- Liquidation sweep: sell-side sweep within last 3 candles
+- 1H bias: bearish (price in top zone, RSI 50-)
+- 15M confirmation score 4/5 or higher
+
+Calculate SL from recent swing structure and ATR; TP at next meaningful support/resistance.
+Minimum RR should be 1:2. If RR is less than 1:1.5 → prefer HOLD.
 
 Return ONLY valid JSON with exactly these keys:
-signal, entry, stop_loss, take_profit, rr, confidence, reason.
+signal, entry, stop_loss, take_profit, rr, confidence, reason, rsi_bounce_detected.
 For HOLD, entry/stop_loss/take_profit/rr may be null and confidence 0.
+rsi_bounce_detected must be true or false (boolean).
 No markdown, no code fences, JSON only."""
 
 
@@ -144,6 +181,7 @@ def parse_ai_response(text: str, current_price: float) -> dict:
     missing = [f for f in required if f not in data]
     if missing:
         raise AIDecisionError(f"AI response missing fields: {missing}")
+    rsi_bounce_detected = bool(data.get("rsi_bounce_detected", False))
 
     signal = str(data["signal"]).upper()
     if signal not in ("BUY", "SELL", "HOLD"):
@@ -162,7 +200,8 @@ def parse_ai_response(text: str, current_price: float) -> dict:
 
     if signal == "HOLD":
         return {"signal": "HOLD", "entry": entry or current_price, "sl": sl, "tp": tp,
-                "rr": rr, "confidence": confidence, "reason": reason, "ai_used": True}
+                "rr": rr, "confidence": confidence, "reason": reason, "ai_used": True,
+                "rsi_bounce_detected": rsi_bounce_detected}
 
     entry = entry or current_price
     if sl is None or tp is None or sl <= 0 or tp <= 0:
@@ -176,7 +215,8 @@ def parse_ai_response(text: str, current_price: float) -> dict:
         rr = abs(tp - entry) / risk if risk > 0 else 0.0
 
     return {"signal": signal, "entry": entry, "sl": sl, "tp": tp, "rr": rr,
-            "confidence": confidence, "reason": reason, "ai_used": True}
+            "confidence": confidence, "reason": reason, "ai_used": True,
+            "rsi_bounce_detected": rsi_bounce_detected}
 
 
 def nemotron_decision(bundle: dict) -> dict:

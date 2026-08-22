@@ -15,26 +15,110 @@ import config
 
 log = logging.getLogger("alerts")
 
-_FALLBACK_TAG = "AI Unavailable - Indicator based signal"
+_FALLBACK_TAG = "AI Unavailable — Indicator based signal"
+
+# Confidence display mapping
+_CONF_META = {
+    "high":   ("🔥", "HIGH"),
+    "medium": ("⚡", "MEDIUM"),
+    "low":    ("⚠️", "LOW"),
+}
+
+
+def _conf_label(confidence) -> tuple[str, str]:
+    """Return (emoji, label) for a confidence value (float 0-100 or string)."""
+    try:
+        val = float(confidence)
+        if val >= 70:
+            return _CONF_META["high"]
+        if val >= 45:
+            return _CONF_META["medium"]
+        return _CONF_META["low"]
+    except (TypeError, ValueError):
+        key = str(confidence).lower()
+        return _CONF_META.get(key, ("⚡", str(confidence).upper()))
 
 
 def format_alert(sig: dict) -> str:
-    """Build the HTML alert message."""
-    icon = "🟢" if sig["signal"] == "BUY" else "🔴"
-    lines = [
-        f"{icon} <b>{sig['signal']} SIGNAL — {html.escape(sig['coin'])}</b>",
-        f"⚡ Market: <b>Futures (USDT-M Perpetual)</b>",
-        f"Entry: <code>{sig['entry']:.6g}</code>",
-        f"SL: <code>{sig['SL']:.6g}</code>",
-        f"TP: <code>{sig['TP']:.6g}</code>",
-        f"RR: <code>1:{sig['RR']:.2f}</code>",
-        f"Reason: {html.escape(str(sig['reason']))}",
-    ]
-    if not sig.get("ai_used", False):
-        lines.append(f"⚠️ <b>{_FALLBACK_TAG}</b>")
+    """Build the emoji-heavy HTML alert message."""
+    is_buy   = sig["signal"] == "BUY"
+    dir_icon = "🟢" if is_buy else "🔴"
+    dir_word = "LONG 📈" if is_buy else "SHORT 📉"
+
+    entry = sig.get("entry") or sig.get("Entry")
+    sl    = sig.get("sl")    or sig.get("SL")
+    tp    = sig.get("tp")    or sig.get("TP")
+    rr    = sig.get("rr")    or sig.get("RR")
+
+    # RSI bounce badge
+    bounce_line = ""
+    if sig.get("rsi_bounce_detected"):
+        bounce_icon = "📊 RSI Bounce at 50 detected ✅" if is_buy else "📊 RSI Rejection at 50 detected ✅"
+        bounce_line = f"\n{bounce_icon}"
+
+    # Indicator summary (optional fields — present when bundle is passed through)
+    ind = sig.get("indicators", {})
+    rsi_now  = ind.get("rsi_now")
+    rsi_prev = ind.get("rsi_prev")
+    ema_above = ind.get("price_above_ema")
+    vwap_above = ind.get("price_above_vwap")
+    vol_ratio  = ind.get("volume_ratio")
+
+    ind_lines = []
+    if rsi_now is not None and rsi_prev is not None:
+        arrow = "📈" if rsi_now > rsi_prev else "📉"
+        ind_lines.append(f"├ RSI: <code>{rsi_prev:.1f} → {rsi_now:.1f}</code> {arrow}")
+    if ema_above is not None:
+        ind_lines.append(f"├ EMA21: {'✅ Above' if ema_above else '❌ Below'}")
+    if vwap_above is not None:
+        ind_lines.append(f"├ VWAP: {'✅ Above' if vwap_above else '❌ Below'}")
+    if vol_ratio is not None:
+        ind_lines.append(f"└ Volume: <code>{vol_ratio:.1f}x</code> avg 💹")
+
+    ind_block = ("\n📊 <b>Indicators</b>\n" + "\n".join(ind_lines)) if ind_lines else ""
+
+    # Liquidation sweep
+    sweep = sig.get("sweep", {})
+    if sweep.get("detected"):
+        sweep_text = f"🌊 <b>Liq Sweep:</b> {html.escape(str(sweep.get('type', '')))} detected"
     else:
-        lines.append(f"🤖 AI: {config.AI_MODEL}")
-    return "\n".join(lines)
+        sweep_text = "➖ <b>Liq Sweep:</b> Not detected"
+
+    # Confidence
+    conf_emoji, conf_label = _conf_label(sig.get("confidence", 0))
+
+    # Trade levels
+    entry_str = f"<code>{entry:.6g}</code>" if entry else "—"
+    sl_str    = f"<code>{sl:.6g}</code>"    if sl    else "—"
+    tp_str    = f"<code>{tp:.6g}</code>"    if tp    else "—"
+    rr_str    = f"<code>1:{rr:.2f}</code>"  if rr    else "—"
+
+    # AI / fallback footer
+    if sig.get("ai_used", False):
+        footer = f"🤖 <i>AI: {html.escape(config.AI_MODEL)}</i>"
+    else:
+        footer = f"⚠️ <b>{_FALLBACK_TAG}</b>"
+
+    reason_text = html.escape(str(sig.get("reason", "")))
+
+    msg = (
+        f"{dir_icon} <b>{sig['signal']} SIGNAL — {html.escape(sig['coin'])}</b>  |  {dir_word}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+        f"{bounce_line}"
+        f"{ind_block}\n\n"
+        f"{sweep_text}\n\n"
+        f"💰 <b>Trade Levels</b>\n"
+        f"├ Entry:  {entry_str}\n"
+        f"├ SL:     {sl_str}\n"
+        f"├ TP:     {tp_str}\n"
+        f"└ RR:     {rr_str}\n\n"
+        f"{conf_emoji} <b>Confidence:</b> {conf_label}\n"
+        f"📝 <i>{reason_text}</i>\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ NY Session  |  1H → 15M → 5M\n"
+        f"{footer}"
+    )
+    return msg
 
 
 async def _send(text: str) -> None:
