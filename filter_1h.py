@@ -110,30 +110,40 @@ def analyze_1h(df: pd.DataFrame) -> Optional[dict]:
 
     checks = {
         "BUY": {
-            "not_overbought": snap["rsi"] <= config.RSI_OVERBOUGHT,
-            "rsi_45_80_rising": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX
-                                and snap["rsi"] > snap["rsi_prev"],
+            # Core — all 4 must pass
+            "not_overbought":    snap["rsi"] <= config.RSI_OVERBOUGHT,
+            "rsi_in_range_rising": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX
+                                   and snap["rsi"] > snap["rsi_prev"],
             "price_above_ema21": snap["close"] > snap["ema21"],
-            "price_above_vwap": snap["close"] > snap["vwap"],
+            "price_above_vwap":  snap["close"] > snap["vwap"],
+            # Bonus — passed to AI for confidence scoring, not required to pass 1H
             "volume_increasing": snap["volume"] > snap["volume_prev"],
-            "near_lower_bb": _near_lower_band(snap, config.BB_NEAR_PCT_1H),
+            "near_lower_bb":     _near_lower_band(snap, config.BB_NEAR_PCT_1H),
         },
         "SELL": {
-            "not_oversold": snap["rsi"] >= config.RSI_OVERSOLD,
-            "rsi_22_52_falling": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX
-                                 and snap["rsi"] < snap["rsi_prev"],
-            "price_below_ema21": snap["close"] < snap["ema21"],
-            "price_below_vwap": snap["close"] < snap["vwap"],
-            "volume_increasing": snap["volume"] > snap["volume_prev"],
-            "near_upper_bb": _near_upper_band(snap, config.BB_NEAR_PCT_1H),
+            # Core — all 4 must pass
+            "not_oversold":       snap["rsi"] >= config.RSI_OVERSOLD,
+            "rsi_in_range_falling": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX
+                                    and snap["rsi"] < snap["rsi_prev"],
+            "price_below_ema21":  snap["close"] < snap["ema21"],
+            "price_below_vwap":   snap["close"] < snap["vwap"],
+            # Bonus
+            "volume_increasing":  snap["volume"] > snap["volume_prev"],
+            "near_upper_bb":      _near_upper_band(snap, config.BB_NEAR_PCT_1H),
         },
     }
 
+    # Only 4 core keys must pass — volume + BB are bonus (forwarded to AI)
+    _CORE = {
+        "BUY":  {"not_overbought", "rsi_in_range_rising", "price_above_ema21", "price_above_vwap"},
+        "SELL": {"not_oversold", "rsi_in_range_falling", "price_below_ema21", "price_below_vwap"},
+    }
+
     for direction in ("BUY", "SELL"):
-        if not all(checks[direction].values()):
-            if any(checks[direction].values()):
-                log.debug("1H %s context failed: %s",
-                          direction, {k: v for k, v in checks[direction].items() if not v})
+        core_failed = {k: v for k, v in checks[direction].items()
+                       if k in _CORE[direction] and not v}
+        if core_failed:
+            log.debug("1H %s context failed: %s", direction, core_failed)
             continue
 
         # Sweep is optional for passing 1H, but ALWAYS collected for AI decision
