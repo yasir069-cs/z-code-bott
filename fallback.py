@@ -19,6 +19,8 @@ def fallback_decision(bundle: dict) -> dict:
     snap_1h = bundle["ind_1h"]
     sweep = bundle.get("sweep") or {}
     atr = snap_1h["atr"]
+    confirm = bundle.get("score_15m", bundle.get("confirm_score"))
+    confirm_txt = f"{confirm:.0f}/100" if isinstance(confirm, (int, float)) else "n/a"
 
     if direction == "BUY":
         sl = sweep.get("level", snap_1h["swing_low_20"])
@@ -31,7 +33,7 @@ def fallback_decision(bundle: dict) -> dict:
         tp = entry + 2 * risk
         trend = "up" if rsi_trend_up(bundle["ind_5m"]["rsi_history"]) else "flat"
         reason = (f"AI Unavailable - Indicator based signal: {direction} on {bundle['symbol']}; "
-                  f"1H {direction} context + 15M {bundle['confirm_score']}/5 + 5M entry passed; "
+                  f"1H {direction} context + 15M {confirm_txt} + 5M entry passed; "
                   f"RSI trend {trend}; SL at {sl_note}")
     elif direction == "SELL":
         sl = sweep.get("level", snap_1h["swing_high_20"])
@@ -44,10 +46,15 @@ def fallback_decision(bundle: dict) -> dict:
         tp = entry - 2 * risk
         trend = "down" if rsi_trend_down(bundle["ind_5m"]["rsi_history"]) else "flat"
         reason = (f"AI Unavailable - Indicator based signal: {direction} on {bundle['symbol']}; "
-                  f"1H {direction} context + 15M {bundle['confirm_score']}/5 + 5M entry passed; "
+                  f"1H {direction} context + 15M {confirm_txt} + 5M entry passed; "
                   f"RSI trend {trend}; SL at {sl_note}")
     else:
         raise ValueError(f"direction must be BUY or SELL, got {direction!r}")
+
+    # Confidence for a Python-only signal is the confluence the scoring engine
+    # already computed; run_scan then applies the no-sweep cap uniformly.
+    confluence = bundle.get("confluence")
+    confidence = float(confluence) if isinstance(confluence, (int, float)) else 40.0
 
     return {
         "signal": direction,
@@ -55,6 +62,8 @@ def fallback_decision(bundle: dict) -> dict:
         "sl": float(sl),
         "tp": float(tp),
         "rr": 2.0,
+        "confidence": confidence,
+        "rsi_bounce_detected": bool(bundle.get("rsi_bounce_detected", False)),
         "reason": reason,
         "ai_used": False,
     }

@@ -82,10 +82,22 @@ def format_alert(sig: dict) -> str:
     if sweep.get("detected"):
         sweep_text = f"🌊 <b>Liq Sweep:</b> {html.escape(str(sweep.get('type', '')))} detected"
     else:
-        sweep_text = "➖ <b>Liq Sweep:</b> Not detected"
+        sweep_text = "➖ <b>Liq Sweep:</b> Not detected <i>(confidence capped)</i>"
 
     # Confidence
     conf_emoji, conf_label = _conf_label(sig.get("confidence", 0))
+
+    # Confluence line — present when run_scan forwards the scored context
+    conf_val = sig.get("confluence")
+    conf_line = ""
+    if conf_val is not None:
+        parts = []
+        for label, key in (("1H", "score_1h"), ("15M", "score_15m"), ("5M", "score_5m")):
+            v = sig.get(key)
+            if v is not None:
+                parts.append(f"{label} {v:.0f}")
+        detail = f"  ({' · '.join(parts)})" if parts else ""
+        conf_line = f"🎯 <b>Confluence:</b> <code>{conf_val:.0f}/100</code>{detail}\n"
 
     # Trade levels
     entry_str = f"<code>{entry:.6g}</code>" if entry else "—"
@@ -113,6 +125,7 @@ def format_alert(sig: dict) -> str:
         f"├ TP:     {tp_str}\n"
         f"└ RR:     {rr_str}\n\n"
         f"{conf_emoji} <b>Confidence:</b> {conf_label}\n"
+        f"{conf_line}"
         f"📝 <i>{reason_text}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"⏰ NY Session  |  1H → 15M → 5M\n"
