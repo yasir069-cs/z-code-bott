@@ -128,7 +128,7 @@ def format_alert(sig: dict) -> str:
         f"{conf_line}"
         f"📝 <i>{reason_text}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ NY Session  |  1H → 15M → 5M\n"
+        f"⏰ {config.SESSION_START}–{config.SESSION_END} IST  |  1H → 15M → 5M\n"
         f"{footer}"
     )
     return msg
