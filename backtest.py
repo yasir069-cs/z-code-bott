@@ -58,11 +58,15 @@ def load_signals(log_path: Path) -> list[dict]:
         return [dict(row) for row in csv.DictReader(fh)]
 
 
-def evaluate_signal(sig: dict, fetcher: CandleFetcher) -> dict:
-    """Walk 5M candles after the signal; classify win/loss/open."""
+def evaluate_signal(sig: dict, fetcher: CandleFetcher, horizon_hours: int = 24) -> dict:
+    """Walk 5M candles after the signal; classify win/loss/open.
+
+    *horizon_hours* bounds how far past the signal a TP/SL is allowed to fill;
+    beyond it the trade is scored OPEN at the last close.
+    """
     ts = datetime.fromisoformat(sig["timestamp"])  # ISO with tz offset (IST)
     ts_utc = ts.astimezone(timezone.utc)
-    horizon = ts_utc + timedelta(hours=24)
+    horizon = ts_utc + timedelta(hours=horizon_hours)
     df = fetcher(sig["coin"], ts_utc + timedelta(minutes=5), horizon)
     result = {"coin": sig["coin"], "signal": sig["signal"], "timestamp": sig["timestamp"],
               "entry": float(sig["entry"]), "SL": float(sig["SL"]), "TP": float(sig["TP"]),
@@ -88,10 +92,10 @@ def evaluate_signal(sig: dict, fetcher: CandleFetcher) -> dict:
     return result
 
 
-def run_backtest(log_path: Path, fetcher: CandleFetcher) -> dict:
+def run_backtest(log_path: Path, fetcher: CandleFetcher, horizon_hours: int = 24) -> dict:
     signals = [s for s in load_signals(log_path) if s.get("signal") in ("BUY", "SELL")]
     holds = sum(1 for s in load_signals(log_path) if s.get("signal") == "HOLD")
-    results = [evaluate_signal(s, fetcher) for s in signals]
+    results = [evaluate_signal(s, fetcher, horizon_hours) for s in signals]
 
     wins = [r for r in results if r["outcome"] == "WIN"]
     losses = [r for r in results if r["outcome"] == "LOSS"]
@@ -101,6 +105,7 @@ def run_backtest(log_path: Path, fetcher: CandleFetcher) -> dict:
     return {
         "total_signals": len(results),
         "holds_logged": holds,
+        "horizon_hours": horizon_hours,
         "wins": len(wins),
         "losses": len(losses),
         "open": len(opens),
@@ -117,6 +122,7 @@ def write_report(report: dict, out_path: Path) -> None:
         "=== Crypto Signal Bot — Backtest Report ===",
         f"Generated: {datetime.now(config.TZ).isoformat(timespec='seconds')}",
         f"Total BUY/SELL signals: {report['total_signals']}  (HOLD logged: {report['holds_logged']})",
+        f"Fill horizon: {report.get('horizon_hours', 24)}h after each signal",
         f"Wins: {report['wins']}   Losses: {report['losses']}   Open: {report['open']}   No data: {report['no_data']}",
         f"Win rate (closed): {report['win_rate']:.1f}%",
         f"Avg RR (closed):   {report['avg_rr']:.2f}",
@@ -135,7 +141,8 @@ def write_report(report: dict, out_path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backtest signals_log.csv against Binance history")
     parser.add_argument("--log", type=Path, default=config.SIGNALS_LOG_FILE)
-    parser.add_argument("--horizon-hours", type=int, default=24)  # informational
+    parser.add_argument("--horizon-hours", type=int, default=24,
+                        help="hours after each signal to allow a TP/SL fill before scoring it OPEN")
     parser.add_argument("--offline-csv", type=Path, default=None,
                         help="use a local CSV of 5m candles (timestamp_ms,open,high,low,close,volume) "
                              "for all coins instead of live Binance (safe DEMO mode)")
@@ -170,7 +177,7 @@ def main() -> None:
         exchange = scanner.make_exchange()
         fetcher = _default_fetcher(exchange)
 
-    report = run_backtest(args.log, fetcher)
+    report = run_backtest(args.log, fetcher, args.horizon_hours)
     write_report(report, config.BASE_DIR / "backtest_report.txt")
     print(f"signals={report['total_signals']} wins={report['wins']} losses={report['losses']} "
           f"open={report['open']} win_rate={report['win_rate']:.1f}% total_r={report['total_r']:+.2f}R")

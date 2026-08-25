@@ -72,6 +72,38 @@ def test_sell_sl_hit_is_loss():
     assert out["outcome"] == "LOSS"
 
 
+def test_horizon_hours_bounds_the_fill_window():
+    """A TP that only prints ~1h45m after the signal is a WIN under the default
+    24h horizon but must score OPEN under a 1h horizon — proving --horizon-hours
+    actually bounds how far a fill is allowed to happen (E4)."""
+    start = datetime(2026, 8, 15, 13, 40, tzinfo=timezone.utc)  # ts_utc + 5m
+    flat = (101.0, 99.5, 100.2)          # never touches SL(98) or TP(104)
+    spike = (104.5, 100.0, 104.2)        # hits TP(104)
+    frame = _path(start, [flat] * 20 + [spike] + [flat] * 4)  # spike at +100m
+
+    long_h = backtest.evaluate_signal(_sig_row(), _fetcher(frame), horizon_hours=24)
+    assert long_h["outcome"] == "WIN" and long_h["r"] == 2.0
+
+    short_h = backtest.evaluate_signal(_sig_row(), _fetcher(frame), horizon_hours=1)
+    assert short_h["outcome"] == "OPEN"  # spike is past the 1h window
+
+
+def test_run_backtest_reports_horizon(tmp_path, monkeypatch):
+    """run_backtest threads horizon_hours through into the report so write_report
+    can print it — a silent cap on fills would otherwise look like real OPENs."""
+    log_path = tmp_path / "signals_log.csv"
+    log_path.write_text(
+        "timestamp,coin,signal,entry,SL,TP,RR,reason,ai_used\n"
+        "2026-08-15T19:05:00+05:30,BTC/USDT,BUY,100,98,104,2.0,r,True\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "SIGNALS_LOG_FILE", log_path)
+    start = datetime(2026, 8, 15, 13, 40, tzinfo=timezone.utc)
+    frame = _path(start, [(101, 99.5, 100.2)])
+    report = backtest.run_backtest(log_path, _fetcher(frame), horizon_hours=6)
+    assert report["horizon_hours"] == 6
+
+
 def test_run_backtest_summary(tmp_path, monkeypatch):
     log_path = tmp_path / "signals_log.csv"
     log_path.write_text(
