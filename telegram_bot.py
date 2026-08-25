@@ -36,6 +36,9 @@ _MAX_HISTORY_LEN = 8
 
 _bot_thread: Optional[threading.Thread] = None
 _bot_app: Optional[Application] = None
+# The listener's event loop, published so alerts.send_telegram_text can reuse
+# the long-lived Bot running on it instead of building a new Bot per message.
+_bot_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 def _get_history(chat_id: int) -> list[dict]:
@@ -259,8 +262,10 @@ def build_telegram_application() -> Optional[Application]:
 
 def _run_listener_loop(app: Application) -> None:
     """Loop runner for background daemon thread."""
+    global _bot_loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    _bot_loop = loop  # publish for alerts.send_telegram_text to reuse
     try:
         log.info("Telegram Chat Assistant listener started (polling live)")
         loop.run_until_complete(app.initialize())
@@ -278,6 +283,7 @@ def _run_listener_loop(app: Application) -> None:
             loop.run_until_complete(app.shutdown())
         except Exception:
             pass
+        _bot_loop = None  # stop alerts from submitting onto a closed loop
         loop.close()
 
 

@@ -392,18 +392,23 @@ def build_scheduler() -> BlockingScheduler:
     exchange = scanner.make_exchange()
     guard = duplicate_guard.DuplicateGuard()
     scheduler = BlockingScheduler(timezone=config.SCHEDULER_TZ)
-    fails = {"streak": 0}
+    # Per-session health tracking: consecutive-failure streak (health warning)
+    # and scan/signal counts so an empty session reads as confirmed-healthy
+    # silence, not a dead bot.
+    session = {"streak": 0, "scans": 0, "signals": 0}
 
     def scan_job() -> None:
         try:
             tickers = exchange.fetch_tickers()
             funding_rates = scanner.fetch_funding_rates(exchange)
-            run_scan(exchange, guard, tickers, funding_rates)
-            fails["streak"] = 0
+            summary = run_scan(exchange, guard, tickers, funding_rates)
+            session["scans"] += 1
+            session["signals"] += summary.get("signals", 0)
+            session["streak"] = 0
         except Exception as exc:  # scheduler jobs must never kill the loop
-            fails["streak"] += 1
-            log.error("Scan job failed (%d in a row): %s", fails["streak"], exc)
-            if fails["streak"] == 3:
+            session["streak"] += 1
+            log.error("Scan job failed (%d in a row): %s", session["streak"], exc)
+            if session["streak"] == 3:
                 alerts.send_telegram_text(
                     f"⚠️ <b>Bot health warning</b>\n"
                     f"3 scans in a row failed (last: {type(exc).__name__}). "
@@ -419,6 +424,7 @@ def build_scheduler() -> BlockingScheduler:
     )
 
     def session_start() -> None:
+        session.update(streak=0, scans=0, signals=0)  # fresh counters for the night
         log.info("6:00 PM IST - Trading session started, beginning 5-minute scans")
         alerts.send_telegram_text(
             "🟢 <b>Trading Session Started (18:00 IST)</b>\n"
@@ -434,9 +440,20 @@ def build_scheduler() -> BlockingScheduler:
     def session_end() -> None:
         log.info("11:00 PM IST - session over, bot sleeps until 6:00 PM tomorrow")
         summary = _daily_summary()
+        # Confirm the bot was alive even on a silent night, so "no alerts" is
+        # never mistaken for a crashed bot (the owner's "koi issue nahi" ask).
+        if session["scans"] == 0:
+            health = ("⚠️ <b>No scans ran this session</b> — please check the server "
+                      "(the schedule may not have fired).")
+        elif session["signals"] == 0:
+            health = (f"✅ <b>Bot healthy</b> — ran {session['scans']} scans; no setup "
+                      f"met the confluence bar today (normal on quiet days).")
+        else:
+            health = f"✅ <b>Bot healthy</b> — ran {session['scans']} scans this session."
         alerts.send_telegram_text(
             "🌙 <b>Trading Session Ended (23:00 IST)</b>\n\n"
             f"{summary}\n\n"
+            f"{health}\n\n"
             "<i>24/7 AI Chat Assistant remains active!</i>"
         )
 

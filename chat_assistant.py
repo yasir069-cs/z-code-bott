@@ -56,12 +56,29 @@ def get_bot_status_summary() -> str:
     hhmm = now_ist.strftime("%H:%M")
     in_session = config.SESSION_START <= hhmm < config.SESSION_END
     status = "🟢 ACTIVE (Scanning Market)" if in_session else "🌙 SLEEPING (Outside Trading Window)"
+
+    # AI budget + OHLCV cache health (best-effort — /status must never break).
+    extra = ""
+    try:
+        from ai_decision import budget_status
+        b = budget_status()
+        extra += f"\nAI Budget: {b['used']}/{b['limit']} used today ({b['remaining']} left)"
+    except Exception:
+        pass
+    try:
+        from scanner import cache_stats
+        c = cache_stats()
+        extra += f"\nOHLCV Cache: {c['entries']} frames, {c['hit_rate']:.0%} hit rate"
+    except Exception:
+        pass
+
     return (
         f"Current Time: {now_ist.strftime('%Y-%m-%d %H:%M:%S')} IST\n"
         f"Session Hours: {config.SESSION_START} to {config.SESSION_END} IST\n"
         f"Status: {status}\n"
         f"Active Model: {config.AI_MODEL}\n"
         f"Volume Filter: >= ${config.VOLUME_MIN_USDT:,} USDT"
+        f"{extra}"
     )
 
 

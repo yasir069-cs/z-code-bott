@@ -135,6 +135,11 @@ def format_alert(sig: dict) -> str:
 
 
 async def _send(text: str) -> None:
+    """One-shot send: build a Bot, send, tear it down.
+
+    Fallback path — used before the chat listener's long-lived Bot exists
+    (e.g. `--once`, or the first startup message) or if that listener is down.
+    """
     bot = telegram.Bot(token=config.TELEGRAM_TOKEN)
     async with bot:
         await bot.send_message(
@@ -145,11 +150,48 @@ async def _send(text: str) -> None:
         )
 
 
+def _send_via_listener(text: str) -> bool:
+    """Send using the long-lived Bot already running in the chat-listener's
+    event loop, reusing its warm connection pool instead of constructing a new
+    Bot and event loop on every message (finding G).
+
+    Returns False when the listener is not available so the caller can fall
+    back to the one-shot path. run_coroutine_threadsafe is thread-safe, so this
+    is safe to call from any scheduler worker thread while the listener owns
+    the loop.
+    """
+    try:
+        import telegram_bot  # lazy import: avoids an import cycle at module load
+    except Exception:
+        return False
+    app = getattr(telegram_bot, "_bot_app", None)
+    loop = getattr(telegram_bot, "_bot_loop", None)
+    if app is None or loop is None or not loop.is_running() or not getattr(app, "running", False):
+        return False
+    try:
+        coro = app.bot.send_message(
+            chat_id=config.TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=20)
+        return True
+    except Exception as exc:  # any failure -> caller uses the one-shot fallback
+        log.warning("listener-loop send failed (%s); falling back to one-shot", exc)
+        return False
+
+
 def send_telegram_text(text: str) -> bool:
     """Send a custom text message to Telegram; never raises (failure is logged)."""
     if not config.TELEGRAM_TOKEN or not config.TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured - message logged only:\n%s", text)
         return False
+    # Preferred: reuse the listener's long-lived Bot + loop (warm pool).
+    if _send_via_listener(text):
+        log.info("Telegram notification sent")
+        return True
+    # Fallback: one-shot Bot + event loop.
     try:
         loop = asyncio.new_event_loop()
         try:
