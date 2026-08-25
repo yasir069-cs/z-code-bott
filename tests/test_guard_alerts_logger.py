@@ -14,12 +14,15 @@ def _now():
 
 
 # ------------------------------------------------------------ duplicate guard
-def test_same_coin_within_20min_is_duplicate():
+def test_same_coin_within_cooldown_is_duplicate():
+    """Bounded by config.DUPLICATE_COOLDOWN_MIN rather than a literal, so
+    retuning the cooldown can't silently invalidate this test again."""
     g = duplicate_guard.DuplicateGuard()
     now = _now()
+    cooldown = config.DUPLICATE_COOLDOWN_MIN
     g.record("BTC/USDT", now)
-    assert g.is_duplicate("BTC/USDT", now + timedelta(minutes=19, seconds=59)) is True
-    assert g.is_duplicate("BTC/USDT", now + timedelta(minutes=20, seconds=1)) is False
+    assert g.is_duplicate("BTC/USDT", now + timedelta(minutes=cooldown, seconds=-1)) is True
+    assert g.is_duplicate("BTC/USDT", now + timedelta(minutes=cooldown, seconds=1)) is False
 
 
 def test_different_coins_are_independent():
@@ -54,13 +57,15 @@ def _sig(**over):
 def test_alert_contains_all_fields():
     text = alerts.format_alert(_sig())
     assert "BUY SIGNAL" in text and "BTC/USDT" in text
-    for needle in ("Entry", "SL", "TP", "RR", "Reason"):
+    for needle in ("Entry", "SL", "TP", "RR", "📝"):
         assert needle in text
 
 
 def test_alert_fallback_tag():
+    """alerts._FALLBACK_TAG uses an em dash; fallback.py's reason text uses a
+    hyphen. They are different strings by design — assert the badge here."""
     text = alerts.format_alert(_sig(ai_used=False))
-    assert "AI Unavailable - Indicator based signal" in text
+    assert alerts._FALLBACK_TAG in text
 
 
 def test_alert_ai_model_line():

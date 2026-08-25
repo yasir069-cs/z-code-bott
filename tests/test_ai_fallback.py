@@ -101,11 +101,11 @@ def test_valid_buy_json(monkeypatch):
     assert out["signal"] == "BUY" and out["ai_used"] is True
     assert out["sl"] == 98.5 and out["tp"] == 103.0 and out["rr"] == 2.0
     assert out["confidence"] == 82
-    # request shape: OpenRouter endpoint, model, reasoning per config, 300 tokens
+    # request shape: OpenRouter endpoint, model, reasoning per config, token budget
     assert calls["url"] == ai_decision.OPENROUTER_URL
     assert calls["payload"]["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"
     assert calls["payload"]["reasoning"] == {"enabled": config.AI_REASONING_ENABLED}
-    assert calls["payload"]["max_tokens"] == 300
+    assert calls["payload"]["max_tokens"] == config.AI_MAX_TOKENS
     assert "Authorization" not in calls["payload"]  # key only in headers
 
 

@@ -1,64 +1,67 @@
 """Phase 5 — 15M confirmation filter.
 
-Only coins that passed the 1H context reach this stage.
+Only coins that passed the 1H context reach this stage. The 1H direction must
+still hold here on the note's three shared conditions (RSI, volume, Bollinger),
+with EMA21 and VWAP as hard gates because they define the direction.
 
-Core conditions (RSI, EMA21, VWAP, Volume) must ALL independently pass.
-BB touch is a bonus condition — adds confidence but not required.
-
-BUY core: RSI in range | price > EMA21 | price > VWAP | volume > 20-avg
-SELL core: RSI in range | price < EMA21 | price < VWAP | volume > 20-avg
+Grading is delegated to scoring.score_ltf(); the resulting 0-100 score must
+clear config.MIN_SCORE_15M.
 """
 import logging
 from typing import Optional
 
 import config
+import scoring
 from indicators import compute_indicators
 
 log = logging.getLogger("filter_15m")
 
 
 def confirm_15m(df, direction: str) -> Optional[dict]:
-    """Score the confirmation conditions.
+    """Confirm the 1H direction on the 15M timeframe.
 
-    Core conditions (RSI, EMA, VWAP, Volume) must ALL pass independently —
-    no indicator can compensate for another. BB is an optional bonus.
+    Returns a dict with the graded `score` (0-100) and its `breakdown`, or
+    None when a hard gate fails or the score is below MIN_SCORE_15M.
     """
+    if direction not in ("BUY", "SELL"):
+        raise ValueError(f"direction must be BUY or SELL, got {direction!r}")
+
     snap = compute_indicators(df)
     if snap is None:
         return None
 
-    if direction == "BUY":
-        core = {
-            "rsi_in_range": config.RSI_BUY_MIN <= snap["rsi"] <= config.RSI_BUY_MAX,
-            "price_above_ema21": snap["close"] > snap["ema21"],
-            "price_above_vwap": snap["close"] > snap["vwap"],
-            "volume_above_avg": snap["volume"] > snap["volume_avg20"],
-        }
-        bonus = {
-            "near_lower_bb": (snap["low"] <= snap["bb_lower"] * (1 + config.BB_NEAR_PCT)
-                              and snap["high"] >= snap["bb_lower"] * (1 - config.BB_NEAR_PCT)),
-        }
-    elif direction == "SELL":
-        core = {
-            "rsi_in_range": config.RSI_SELL_MIN <= snap["rsi"] <= config.RSI_SELL_MAX,
-            "price_below_ema21": snap["close"] < snap["ema21"],
-            "price_below_vwap": snap["close"] < snap["vwap"],
-            "volume_above_avg": snap["volume"] > snap["volume_avg20"],
-        }
-        bonus = {
-            "near_upper_bb": (snap["high"] >= snap["bb_upper"] * (1 - config.BB_NEAR_PCT)
-                              and snap["low"] <= snap["bb_upper"] * (1 + config.BB_NEAR_PCT)),
-        }
-    else:
-        raise ValueError(f"direction must be BUY or SELL, got {direction!r}")
-
-    # Core conditions must ALL pass — RSI, EMA, VWAP, Volume independently verify
-    if not all(core.values()):
-        failed = {k: v for k, v in core.items() if not v}
-        log.debug("15M %s REJECTED — core failed: %s", direction, failed)
+    try:
+        scored = scoring.score_ltf(snap, direction)
+    except scoring.Rejected as rej:
+        log.debug("15M %s REJECTED — %s", direction, rej)
         return None
 
-    checks = {**core, **bonus}
-    score = sum(checks.values())
-    log.debug("15M %s PASSED (score %d/5, core=4/4 ✓): %s", direction, score, checks)
-    return {"direction": direction, "score": score, "checks": checks, "indicators": snap}
+    if scored["score"] < config.MIN_SCORE_15M:
+        log.debug("15M %s REJECTED — score %.1f < %d %s",
+                  direction, scored["score"], config.MIN_SCORE_15M, scored["breakdown"])
+        return None
+
+    log.debug("15M %s PASSED score=%.1f %s", direction, scored["score"], scored["breakdown"])
+    return {
+        "direction": direction,
+        "score": scored["score"],
+        "score_breakdown": scored["breakdown"],
+        "checks": _explain_checks(snap, direction, scored["breakdown"]),
+        "indicators": snap,
+    }
+
+
+def _explain_checks(snap: dict, direction: str, breakdown: dict) -> dict:
+    """Boolean view of the graded components, derived from the scores so the
+    two can never disagree. Read by the AI prompt and the tests."""
+    above = direction == "BUY"
+    return {
+        ("price_above_ema21" if above else "price_below_ema21"):
+            snap["close"] > snap["ema21"] if above else snap["close"] < snap["ema21"],
+        ("price_above_vwap" if above else "price_below_vwap"):
+            snap["close"] > snap["vwap"] if above else snap["close"] < snap["vwap"],
+        "rsi_in_range": breakdown["rsi"] > 0,
+        "rsi_in_note_band": breakdown["rsi"] >= config.W_LTF_RSI,
+        "volume_increasing": breakdown["volume"] > 0,
+        ("near_lower_bb" if above else "near_upper_bb"): breakdown["bb"] >= config.W_LTF_BB,
+    }

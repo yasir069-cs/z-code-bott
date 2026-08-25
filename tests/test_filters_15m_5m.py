@@ -1,8 +1,16 @@
-"""Phase 5 + 6 tests — 15M 4/5 scoring and 5M entry checks."""
+"""Phase 5 + 6 tests — 15M confirmation and 5M entry, graded 0-100.
+
+These replace the old "4 of 5" / "5 of 7" count-of-conditions assertions.
+The scoring model (strategy_spec.md) reweights the three shared conditions
+onto a 0-100 scale — RSI 40, volume 30, BB 30 — with EMA21 and VWAP as hard
+gates, so a failing EMA returns None no matter how good the rest is.
+"""
 import pytest
 
+import config
 import filter_15m
 import filter_5m
+import scoring
 from conftest import make_candles
 
 
@@ -40,95 +48,157 @@ _frame = lambda: make_candles([100.0] * 40)
 
 
 # ------------------------------------------------------------------ 15M BUY
-def test_15m_buy_5_of_5_passes(patch15):
+def test_15m_buy_all_conditions_score_full(patch15):
+    """RSI in the note's band + volume rising + touching the lower band = 100."""
     patch15(_snap())
     res = filter_15m.confirm_15m(_frame(), "BUY")
-    assert res is not None and res["score"] == 5
+    assert res is not None
+    assert res["score"] == pytest.approx(100.0)
+    assert res["direction"] == "BUY"
+    assert all(res["checks"].values())
 
 
-def test_15m_buy_4_of_5_passes(patch15):
-    patch15(_snap(ema21=100.9))  # only EMA condition fails
-    res = filter_15m.confirm_15m(_frame(), "BUY")
-    assert res is not None and res["score"] == 4
-
-
-def test_15m_buy_3_of_5_rejects(patch15):
-    patch15(_snap(ema21=100.9, vwap=100.9))  # EMA + VWAP fail -> 3/5
+def test_15m_buy_below_ema_is_hard_gate(patch15):
+    """EMA21 defines the direction, so it can never be traded off against score."""
+    patch15(_snap(ema21=100.9))  # close 100.5 < ema21
     assert filter_15m.confirm_15m(_frame(), "BUY") is None
 
 
-def test_15m_buy_far_from_bb_still_4_of_5(patch15):
-    # BB is the 5th condition; missing it alone must not reject
-    patch15(_snap(bb_lower=95.0))
+def test_15m_buy_below_vwap_is_hard_gate(patch15):
+    patch15(_snap(vwap=100.9))
+    assert filter_15m.confirm_15m(_frame(), "BUY") is None
+
+
+def test_15m_buy_far_from_bb_loses_only_the_bb_weight(patch15):
+    """BB is graded: missing it costs its weight but does not reject."""
+    patch15(_snap(bb_lower=95.0, bb_mid=96.0))
     res = filter_15m.confirm_15m(_frame(), "BUY")
-    assert res is not None and res["score"] == 4
+    assert res is not None
+    assert res["score_breakdown"]["bb"] == 0.0
+    assert res["score"] == pytest.approx(100.0 - config.W_LTF_BB)
+
+
+def test_15m_buy_rejects_when_score_below_floor(patch15):
+    """Losing BB *and* volume drops below MIN_SCORE_15M -> rejected."""
+    patch15(_snap(bb_lower=95.0, bb_mid=96.0,
+                  volume=900.0, volume_prev=1000.0, volume_avg20=1000.0))
+    res = filter_15m.confirm_15m(_frame(), "BUY")
+    assert res is None  # 40 < MIN_SCORE_15M (50)
 
 
 # ----------------------------------------------------------------- 15M SELL
-def test_15m_sell_4_of_5_passes(patch15):
+def test_15m_sell_passes(patch15):
     patch15(_snap(rsi=42.0, rsi_prev=47.0, rsi_history=[62, 60, 58, 56, 55, 50, 42, 46, 43, 41],
-                  ema21=101.2, vwap=101.0, bb_upper=100.7, high=101.0, low=100.2,
-                  close=100.4, open=100.6, range_pos=0.8))
+                  ema21=101.2, vwap=101.0, bb_upper=100.7, bb_mid=100.9,
+                  high=101.0, low=100.2, close=100.4, open=100.6, range_pos=0.8))
     res = filter_15m.confirm_15m(_frame(), "SELL")
-    assert res is not None and res["direction"] == "SELL" and res["score"] >= 4
+    assert res is not None
+    assert res["direction"] == "SELL"
+    assert res["score"] >= config.MIN_SCORE_15M
 
 
-def test_15m_sell_3_of_5_rejects(patch15):
-    # rsi ✓, below-ema ✓, below-vwap ✓ | volume falling ✗, price far above upper band ✗
+def test_15m_sell_rejects_when_score_below_floor(patch15):
     patch15(_snap(rsi=42.0, rsi_prev=47.0, rsi_history=[62, 60, 58, 56, 55, 50, 42, 46, 43, 41],
-                  ema21=101.2, vwap=101.0, bb_upper=90.0,
+                  ema21=101.2, vwap=101.0, bb_upper=90.0, bb_mid=89.0,
                   high=101.0, low=100.2, close=100.4, open=100.6,
-                  volume=900.0, volume_prev=1000.0))
+                  volume=900.0, volume_prev=1000.0, volume_avg20=1000.0))
     assert filter_15m.confirm_15m(_frame(), "SELL") is None
 
 
+def test_15m_rejects_bad_direction_argument():
+    with pytest.raises(ValueError):
+        filter_15m.confirm_15m(_frame(), "HOLD")
+
+
 # ------------------------------------------------------------------ 5M BUY
-def test_5m_buy_all_conditions_pass(patch5):
+def test_5m_buy_all_conditions_score_full(patch5):
     patch5(_snap())
     res = filter_5m.entry_5m(_frame(), "BUY")
-    assert res is not None and res["score"] == 7
+    assert res is not None
+    assert res["score"] == pytest.approx(100.0)
 
 
-def test_5m_buy_5_of_7_passes(patch5):
-    # Only 2 conditions fail (volume below avg + far from BB) -> 5/7 still passes
-    patch5(_snap(volume=900.0, volume_avg20=1000.0, bb_lower=90.0, close=100.0, low=99.0))
+def test_5m_buy_partial_volume_scores_fraction(patch5):
+    """Flat vs the previous candle but above the 20-candle average -> partial
+    credit, per the sanctioned "volume is graded" deviation."""
+    patch5(_snap(volume=1100.0, volume_prev=1200.0, volume_avg20=1000.0))
     res = filter_5m.entry_5m(_frame(), "BUY")
-    assert res is not None and res["score"] == 5
+    assert res is not None
+    assert res["score_breakdown"]["volume"] == pytest.approx(
+        config.W_LTF_VOLUME * config.VOLUME_AVG_FRACTION, abs=0.01)
 
 
-def test_5m_buy_4_of_7_rejects(patch5):
-    # 3 conditions fail -> 4/7 rejects (< 5)
-    patch5(_snap(volume=900.0, volume_avg20=1000.0,
-                 close=99.6, bb_lower=99.7, low=99.6,
-                 ema21=101.0))
+def test_5m_buy_below_ema_is_hard_gate(patch5):
+    patch5(_snap(ema21=101.0))
     assert filter_5m.entry_5m(_frame(), "BUY") is None
 
 
-def test_5m_buy_rsi_higher_low_pattern_passes(patch5):
-    # spec example: 50 -> 55 -> 51 -> 56 forms a higher low -> bullish
-    patch5(_snap(rsi=56.0, rsi_prev=51.0, rsi_history=[42, 44, 46, 47, 50, 55, 51, 53, 54, 56]))
-    assert filter_5m.entry_5m(_frame(), "BUY") is not None
-
-
-def test_5m_buy_multiple_failures_reject(patch5):
-    # flat trend + price below EMA + price below VWAP + volume low -> rejected
-    patch5(_snap(rsi_history=[55, 55, 55, 55, 55, 55, 55, 55, 55, 55],
-                 ema21=101.0, vwap=101.0, volume=800.0, volume_avg20=1000.0))
+def test_5m_buy_rejects_when_score_below_floor(patch5):
+    patch5(_snap(volume=900.0, volume_prev=1000.0, volume_avg20=1000.0,
+                 bb_lower=90.0, bb_mid=91.0))
     assert filter_5m.entry_5m(_frame(), "BUY") is None
+
+
+# --------------------------------------------------------- 5M RSI bounce flag
+def test_5m_rsi_higher_low_pattern_is_detected(patch5):
+    """The note's "RSI 50 above to 70" implies a bounce: 50 -> 55 -> 51 -> 56
+    holds a higher low. Reported as metadata, never as extra points."""
+    patch5(_snap(rsi=56.0, rsi_prev=51.0,
+                 rsi_history=[42, 44, 46, 47, 50, 55, 51, 53, 54, 56]))
+    res = filter_5m.entry_5m(_frame(), "BUY")
+    assert res is not None
+    assert res["rsi_bounce_detected"] is True
+
+
+def test_5m_rsi_bounce_does_not_inflate_the_score(patch5):
+    """The 0-100 scale must stay intact — the badge is metadata only."""
+    patch5(_snap(rsi=56.0, rsi_prev=51.0,
+                 rsi_history=[42, 44, 46, 47, 50, 55, 51, 53, 54, 56]))
+    bounce = filter_5m.entry_5m(_frame(), "BUY")
+    assert bounce["score"] <= 100.0
+    assert sum(bounce["score_breakdown"].values()) == pytest.approx(bounce["score"], abs=0.01)
+
+
+def test_5m_flat_rsi_is_not_a_bounce(patch5):
+    patch5(_snap(rsi=55.0, rsi_prev=55.0, rsi_history=[55] * 10))
+    res = filter_5m.entry_5m(_frame(), "BUY")
+    assert res is None  # flat RSI fails the trend gate outright
 
 
 # ----------------------------------------------------------------- 5M SELL
-def test_5m_sell_all_conditions_pass(patch5):
+def test_5m_sell_passes(patch5):
     patch5(_snap(rsi=42.0, rsi_prev=47.0, rsi_history=[60, 58, 56, 55, 52, 47, 50, 48, 45, 42],
-                 ema21=101.2, vwap=101.0, bb_upper=100.9, high=100.9, low=100.2,
-                 close=100.4, open=100.6))
+                 ema21=101.2, vwap=101.0, bb_upper=100.9, bb_mid=100.95,
+                 high=100.9, low=100.2, close=100.4, open=100.6))
     res = filter_5m.entry_5m(_frame(), "SELL")
-    assert res is not None and res["direction"] == "SELL"
+    assert res is not None
+    assert res["direction"] == "SELL"
 
 
-def test_5m_sell_under_threshold_rejects(patch5):
-    # 3+ conditions fail for SELL
-    patch5(_snap(rsi=60.0, rsi_prev=47.0, rsi_history=[40, 42, 45, 48, 52, 55, 58, 60, 62, 65],
-                 ema21=99.0, vwap=99.0, bb_upper=110.0, high=100.5, low=100.2,
-                 close=100.4, open=100.3, volume=800.0, volume_avg20=1000.0))
+def test_5m_sell_rejects_when_rsi_rising(patch5):
+    """RSI must be *moving through* the band, not merely sitting in it."""
+    patch5(_snap(rsi=48.0, rsi_prev=44.0, rsi_history=[40, 42, 45, 46, 47, 48],
+                 ema21=101.2, vwap=101.0, bb_upper=100.9, bb_mid=100.95,
+                 high=100.9, low=100.2, close=100.4, open=100.6))
     assert filter_5m.entry_5m(_frame(), "SELL") is None
+
+
+def test_5m_rejects_bad_direction_argument():
+    with pytest.raises(ValueError):
+        filter_5m.entry_5m(_frame(), "MAYBE")
+
+
+# -------------------------------------------------------- scale invariants
+def test_ltf_weights_sum_to_100():
+    assert config.W_LTF_RSI + config.W_LTF_VOLUME + config.W_LTF_BB == 100
+
+
+def test_1h_weights_sum_to_100():
+    assert (config.W_1H_ZONE + config.W_1H_RSI + config.W_1H_VOLUME
+            + config.W_1H_BB + config.W_1H_SWEEP) == 100
+
+
+def test_ltf_score_never_exceeds_100(patch5):
+    patch5(_snap())
+    res = filter_5m.entry_5m(_frame(), "BUY")
+    assert 0.0 <= res["score"] <= 100.0
