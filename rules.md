@@ -1,74 +1,86 @@
-rules.md — Coding Rules
-Libraries to Use
-ccxt → exchange data only
-pandas-ta → ALL indicator calculations (never manual)
-anthropic → Claude API
-python-telegram-bot → alerts
-APScheduler → timer
-python-dotenv → load .env secrets
-logging → all logs (never print)
-csv → signal log file
-Hard Rules
-No auto trade execution — signals only
-No paid APIs — CCXT public mode only
-No hardcoded API keys — always .env
-No bare except — specific exceptions only
-No sleep() loops — APScheduler only
-No manual indicator math — pandas-ta only
-Never call Claude without Python filter first
-Never send duplicate alert within 20 min same coin
-Scheduler Rules
-Timezone: Asia/Kolkata (IST = UTC+5:30 exactly)
-Active: 6:30 PM to 9:30 PM IST only
-Interval: every 5 minutes
-Outside hours: zero activity, zero API calls
-Scanner Rules
-Always fetch ALL USDT pairs (never hardcode list)
-Volume filter: skip coins with 24h volume < $5M USDT
-Fetch 1H, 15M, 5M candles (last 50 each)
-Indicator Rules
-RSI period: 14
-EMA period: 21
-VWAP: daily
-Bollinger Bands: 20 period, 2 std dev
-Always store last 10 RSI values for trend analysis
-1H Filter Rules
-Bottom zone: price in lower 30% of last 50 candle range
-Top zone: price in upper 30% of last 50 candle range
-Liq Sweep: wick > 2x body + volume spike > 1.5x avg + body reversal
-Context fail → skip coin immediately
-15M Filter Rules
-BUY: EMA21 < price, VWAP < price, volume up, BB lower touch
-SELL: EMA21 > price, VWAP > price, volume up, BB upper touch
-Need 4/5 → else reject
-5M Filter Rules
-BUY: RSI 50-70 + RSI higher low (last 3 candles up)
-SELL: RSI 35-50 + RSI lower high (last 3 candles down)
-All 15M conditions must hold on 5M too
-Claude AI Rules
-Send: coin, price, 1H context, 15M values, 5M RSI history (10 candles)
-Send: recent swing high/low + ATR
-Send: RSI trend direction explicitly
-Claude returns: BUY/SELL/HOLD + SL + TP + RR + one line reason
-Max tokens: 300
-HOLD → no Telegram alert, only log
-Claude Fallback Rules
-If Claude fails → use Python filter result
-SL = recent swing low (BUY) or swing high (SELL)
-TP = entry + 2x SL distance (1:2 RR fixed)
-Alert must say: 
- AI Unavailable — Indicator based signal
-Duplicate Guard Rules
-Track last signal timestamp per coin in memory dict
-Same coin within 20 min → skip silently
-Reset all at 9:30 PM IST
-Signal Log Rules
-Save every BUY/SELL signal to signals_log.csv
-Columns: timestamp, coin, signal, entry, SL, TP, RR, reason, ai_used
-HOLD signals also logged (for future analysis)
-Never delete log file — append only
-Error Handling
-Exchange fetch fails → retry 3x → skip coin
-Claude fails → fallback.py decision
-Telegram fails → log error, continue bot
-Rate limit → exponential backoff (1s, 2s, 4s)
+# rules.md — Coding Rules
+
+> Strategy authority is **[strategy_spec.md](strategy_spec.md)**. These are the
+> engineering rules the code must obey.
+
+## Libraries to use
+- `ccxt` → exchange data only (Binance USDT-M futures, public mode)
+- `pandas-ta` → ALL indicator calculations (never manual math)
+- `requests` → OpenRouter HTTP (AI decision + chat assistant)
+- `python-telegram-bot` → alerts + chat listener
+- `APScheduler` → timer (never `sleep()` loops)
+- `python-dotenv` → load `.env` secrets
+- `logging` → all logs (never `print`)
+- `csv` → signal log file
+
+## Hard rules
+- **No auto trade execution — signals only.** No `create_order`, no Binance API keys.
+- No paid exchange APIs — CCXT public mode only.
+- No hardcoded secrets — always `.env`.
+- No bare `except` — catch specific exceptions.
+- No manual indicator math — pandas-ta only.
+- Never call the AI without the Python scoring result first.
+- Never send a duplicate alert within `DUPLICATE_COOLDOWN_MIN` (15 min) for the same coin.
+- A scan must never bleed past `SCAN_DEADLINE_SECONDS` (240) into the next slot.
+
+## Scheduler rules
+- Timezone: Asia/Kolkata (IST = UTC+5:30, no DST).
+- Active: 18:00 – 23:00 IST only, every 5 minutes.
+- **One** cron job with `second=15` offset; `max_instances=1`, `misfire_grace_time=120`,
+  `coalesce=True`. No overlapping jobs.
+- Outside hours: zero market/AI calls.
+
+## Scanner rules
+- Always fetch ALL USDT-M futures pairs (never hardcode a list).
+- Exclude stablecoin bases (`EXCLUDED_BASES`) and leveraged tokens (UP/DOWN/BULL/BEAR).
+- Volume filter: skip coins with 24h volume < `$50M` USDT.
+- Check the duplicate guard **before** fetching OHLCV for a coin.
+- OHLCV TTL cache keyed `(symbol, timeframe)`; concurrent fetch capped at
+  `FETCH_MAX_WORKERS` with a shared token bucket.
+
+## Indicator rules
+- RSI period 14 · EMA period 21 · VWAP daily · Bollinger 20/2 · ATR 14.
+- `bbands(ddof=0)` (population std, TradingView-compatible).
+- 50 strategy candles + 250 warm-up candles per timeframe; only closed candles.
+
+## Scoring rules (scoring.py)
+- **Hard gates** (fail → drop coin): EMA21 side, VWAP side, RSI band, overbought/
+  oversold, BB bandwidth < `BB_BANDWIDTH_MIN`, zone in the wrong half.
+- **Graded** 0→full: zone (1H 25), RSI (1H 20 / LTF 40), volume (1H 15 / LTF 30),
+  Bollinger (1H 15 / LTF 30), sweep (1H 25, age-decayed).
+- `confluence = 0.40·score_1h + 0.30·score_15m + 0.30·score_5m`.
+- Gates: `MIN_SCORE_1H=55`, `MIN_SCORE_15M=50`, `MIN_SCORE_5M=50`, `MIN_CONFLUENCE=55`.
+- Sweep is weighted, **not** a hard gate; its absence caps confidence at
+  `NO_SWEEP_CONFIDENCE_CAP` (69) and is labelled in the alert.
+
+## AI rules (ai_decision.py)
+- Provider OpenRouter. Primary `AI_MODEL`, secondary `AI_MODEL_FALLBACK`, then Python.
+- **Batch** candidates (sorted by confluence, chunked at `AI_BATCH_MAX=12`) into one
+  request → JSON array keyed by symbol.
+- **Retry** `AI_RETRY_MAX=3` per model with exponential backoff on 429/5xx/timeout/bad-JSON.
+- `AI_MAX_TOKENS=2000`; `AI_REASONING_ENABLED=False` (token cap starves JSON if on).
+- Per-IST-day budget `AI_DAILY_BUDGET=50`; notify Telegram once when exhausted.
+- Returns BUY/SELL/HOLD + SL + TP + RR + confidence + one-line reason; validate
+  geometry per element (BUY: `sl < entry < tp`). HOLD → log only, no alert.
+
+## Fallback rules
+- AI unavailable → Python decision from the scoring result.
+- SL = sweep level / swing / entry ∓ 1.5×ATR; TP = 1:2 RR minimum.
+- Confidence derived from confluence; `rsi_bounce_detected` preserved.
+- Alert footer: `AI Unavailable — Indicator based signal` (em dash).
+
+## Duplicate guard rules
+- Track last signal timestamp per coin; same coin within 15 min → skip silently.
+- Applies to every decision (BUY/SELL/HOLD) to prevent log spam.
+- Reset at session end.
+
+## Signal log rules
+- Append every BUY/SELL/HOLD to `signals_log.csv`; never delete or truncate.
+- Row built generically from `config.CSV_COLUMNS` (20 columns).
+- On startup, `migrate_csv_header()` archives a stale-header file to `.v1.bak`.
+
+## Error handling
+- Exchange fetch fails → retry with backoff → skip coin.
+- AI fails → `fallback.py` decision.
+- Telegram fails → log error, continue the bot (never crash on a send).
+- Rate limit → exponential backoff (1s, 2s, 4s).

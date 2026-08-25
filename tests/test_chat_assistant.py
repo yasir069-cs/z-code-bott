@@ -97,4 +97,5 @@ def test_cmd_strategy():
 
     asyncio.run(telegram_bot.cmd_strategy(update, context))
     update.message.reply_text.assert_called_once()
-    assert "Top-Down 3-Layer Indicator Strategy" in update.message.reply_text.call_args[0][0]
+    text = update.message.reply_text.call_args[0][0]
+    assert "Confluence" in text and "Liquidation Sweep" in text

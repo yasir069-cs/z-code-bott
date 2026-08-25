@@ -90,17 +90,20 @@ def _build_system_prompt() -> str:
 Your job is to assist users in Telegram with queries about the bot's strategy, signals, indicators, crypto markets, and trading principles.
 
 === BOT ARCHITECTURE & STRATEGY CONTEXT ===
-1. Strategy Flow:
-   - 1H Context: Evaluates macro trend using 3 core pillars:
-     * RSI: 40-75 and rising for BUY / 28-55 and falling for SELL
-     * EMA21: Close > EMA21 for BUY / Close < EMA21 for SELL
-     * Daily VWAP: Close > VWAP for BUY / Close < VWAP for SELL
-     * Volume & Bollinger Bands confirmation
-     * Liquidation Sweep: Optional smart-money pattern (wicks sweeping swing levels with high volume).
-   - 15M Confirmation: Requires at least 4 out of 5 checks (RSI, EMA21, VWAP, Volume, BB).
-   - 5M Entry Timing: Requires at least 5 out of 7 checks (RSI trend, higher-lows/lower-highs, EMA21, VWAP, volume > 20-avg, BB bounce/rejection).
-   - AI Decision Engine: OpenRouter ({config.AI_MODEL}) analyzes complete top-down context, sets entry, SL, TP, and enforces minimum 1:2 Risk-to-Reward.
-   - Safety: Bot generates SIGNALS ONLY (never executes automated trades or holds private keys).
+1. Strategy Flow (top-down, graded confluence scoring — not pass/fail counts):
+   - Each timeframe is scored 0-100 from the handwritten-note conditions; the
+     weighted total is confluence = 0.40*1H + 0.30*15M + 0.30*5M.
+   - 1H Context (weight 0.40): zone (bottom->in-between for BUY / top->in-between
+     for SELL), RSI (50->70 up for BUY / 50->35 down for SELL), volume, Bollinger,
+     and the liquidation sweep (heaviest single weight, age-decayed).
+   - 15M Confirmation (weight 0.30): RSI, volume, Bollinger — same direction.
+   - 5M Entry (weight 0.30): RSI, volume, Bollinger; its close is the entry price.
+   - EMA21 and VWAP are HARD gates on every timeframe (they define direction).
+   - Liquidation Sweep: heavily weighted and labelled, but NOT a hard gate — a
+     no-sweep setup still alerts with confidence capped just below HIGH.
+   - AI Decision Engine: OpenRouter ({config.AI_MODEL}) receives the full scored
+     top-down context (as a batch), sets entry/SL/TP, and enforces a minimum 1:2 RR.
+   - Safety: SIGNALS ONLY — never executes trades, holds no exchange API keys.
 
 2. Operational Details:
 {bot_status}
