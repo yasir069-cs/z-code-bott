@@ -1,21 +1,40 @@
 """Phase 7 — OpenRouter (NVIDIA Nemotron 3 Ultra) final decision.
 
-Called ONLY after the Python filters passed (rules.md). Sends the full
-context (coin, prices, 1H context + sweep, 15M/5M indicator values, last 10
-RSI values, RSI trend direction, EMA21/VWAP/BB per timeframe, volume trend,
-swing high/low, ATR) to OpenRouter and expects strict JSON:
+Called ONLY after the Python filters passed (rules.md). The Python engine
+grades every candidate 0-100 per timeframe (scoring.py); this module hands
+the model that grading *plus* the raw numbers behind it, and the model makes
+the final BUY / SELL / HOLD call. Expected output per setup is strict JSON:
 
     {"signal": "BUY|SELL|HOLD", "entry": float, "stop_loss": float,
      "take_profit": float, "rr": float, "confidence": 0-100,
-     "reason": "one line"}
+     "reason": "one line", "rsi_bounce_detected": bool}
+
+Three properties this module is responsible for:
+
+  1. **Batching.** One HTTP request carries every candidate from a scan and
+     returns a JSON array. The free tier allows 50 requests/day and the bot
+     was already hitting it (45 calls Aug 20, then a 429); batching turns a
+     5-candidate scan from 5 requests / ~51s into 1 request / ~10s.
+  2. **Retry.** Nvidia's endpoint returns `502 Service temporarily overloaded`
+     regularly. Every failure used to drop straight to the indicator-only
+     fallback. Now: AI_RETRY_MAX attempts with exponential backoff, then the
+     secondary model, and only then the Python path.
+  3. **Truth in the prompt.** The zone line used to be hardcoded from
+     `direction` — the model was told "bottom 30% (BUY zone)" even when the
+     coin sat at the top of its range. It now reports the measured
+     `range_pos` and the graded zone score, and every threshold quoted in the
+     system prompt is interpolated from config so it cannot drift again.
 
 The model's reasoning output is NEVER exposed to Telegram/alerts — only the
-final JSON answer is used. Any failure (missing key, HTTP error, timeout,
-invalid/missing JSON fields) raises AIDecisionError so the caller falls
-back to the Python indicator decision (Phase 8, unchanged).
+final JSON answer is used. Any unrecoverable failure raises AIDecisionError
+so the caller falls back to the Python indicator decision (Phase 8).
 """
 import json
 import logging
+import threading
+import time
+from datetime import datetime
+from typing import Optional
 
 import requests
 
@@ -25,65 +44,88 @@ log = logging.getLogger("ai_decision")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-_SYSTEM_PROMPT = """You are the final decision engine for a USDT-M perpetual futures signal bot on Binance.
-Active session: New York (6 PM - 11 PM IST). High volatility window.
+# Statuses worth retrying: rate limits, timeouts and provider-side faults.
+# 400/401/403/404 mean the request itself is wrong — retrying just burns budget.
+_RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+
+def _build_system_prompt() -> str:
+    """Interpolate the live config values so the prompt can never again claim
+    thresholds the code does not use (it used to assert "volume > 1.5x average"
+    and "15M confirmation score 4/5" — neither was true)."""
+    return f"""You are the final decision engine for a USDT-M perpetual futures signal bot on Binance.
+Active session: New York overlap ({config.SESSION_START} - {config.SESSION_END} IST). High volatility window.
 
 Your job is NOT to execute trades. You only decide: BUY / SELL / HOLD.
-The Python engine has already filtered the market; analyze the complete
-1H -> 15M -> 5M context provided to you.
+A Python engine has already filtered and GRADED the market; analyze the
+complete 1H -> 15M -> 5M context provided to you and either confirm its
+direction or reject it with HOLD.
+
+=== HOW THE PYTHON ENGINE GRADED THIS SETUP ===
+Each timeframe is scored 0-100 against the owner's strategy note, and the
+scores you are shown are already the result of these rules:
+
+  1H  = zone {config.W_1H_ZONE} + RSI {config.W_1H_RSI} + volume {config.W_1H_VOLUME} \
++ Bollinger {config.W_1H_BB} + liquidation sweep {config.W_1H_SWEEP}
+  15M = RSI {config.W_LTF_RSI} + volume {config.W_LTF_VOLUME} + Bollinger {config.W_LTF_BB}
+  5M  = RSI {config.W_LTF_RSI} + volume {config.W_LTF_VOLUME} + Bollinger {config.W_LTF_BB}
+  Confluence = {config.CONFLUENCE_W_1H:.2f}*1H + {config.CONFLUENCE_W_15M:.2f}*15M + {config.CONFLUENCE_W_5M:.2f}*5M
+
+  Zone     : price in the bottom {config.ZONE_FULL_PCT:.0%} of the 1H range (BUY) scores full;
+             {config.ZONE_FULL_PCT:.0%}-{config.ZONE_MAX_PCT:.0%} ("in-between") tapers down; beyond \
+{config.ZONE_MAX_PCT:.0%} the setup was already rejected. SELL mirrors from the top.
+  RSI      : BUY {config.RSI_BUY_FULL_MIN:.0f}-{config.RSI_BUY_FULL_MAX:.0f} scores full, \
+{config.RSI_BUY_TOL_MIN:.0f}-{config.RSI_BUY_TOL_MAX:.0f} scores half.
+             SELL {config.RSI_SELL_FULL_MIN:.0f}-{config.RSI_SELL_FULL_MAX:.0f} full, \
+{config.RSI_SELL_TOL_MIN:.0f}-{config.RSI_SELL_TOL_MAX:.0f} half. RSI must also be MOVING in the trade direction.
+  Volume   : above the previous candle scores full; merely above the 20-candle
+             average scores {config.VOLUME_AVG_FRACTION:.0%}; below both scores zero.
+  Bollinger: within {config.BB_NEAR_PCT_1H:.1%} (1H) / {config.BB_NEAR_PCT:.1%} (15M/5M) of the \
+band scores full; between band and mid-line scores {config.BB_MID_FRACTION:.0%}.
+  Sweep    : <= {config.SWEEP_AGE_FULL} candles old scores full, <= {config.SWEEP_AGE_PARTIAL} \
+scores {config.SWEEP_PARTIAL_FRACTION:.0%}, <= {config.SWEEP_AGE_STALE} scores \
+{config.SWEEP_STALE_FRACTION:.0%}, older or absent scores zero.
+
+EMA21 and VWAP are hard gates, already passed: for a BUY price closed above
+both, for a SELL below both. Do not re-litigate direction on those two.
+
+A LOW component score is real information, not noise. If the sweep score is 0
+there was no recent liquidation sweep, and the owner's note treats the sweep as
+part of the setup — say so in your reason and lower confidence accordingly.
 
 === RSI 50 BOUNCE LOGIC (HIGHEST PRIORITY SIGNAL) ===
 This is the most important pattern. Always check it first:
 
-BUY Bounce: RSI was above 50 → dipped but stayed above 47 (did not break 50 support) → now rising again
+BUY Bounce: RSI was above 50, dipped but held above 47 (did not break 50 support), now rising again
   Example: RSI history [54, 56, 50.2, 53, 55] = STRONG BUY signal (bulls defended 50)
   Even if RSI did not reach exactly 50, a dip to 47-50.9 and recovery = valid bounce
 
-SELL Bounce: RSI was below 50 → bounced but stayed below 53 (did not break 50 resistance) → now falling again
+SELL Bounce: RSI was below 50, bounced but held below 53 (did not break 50 resistance), now falling again
   Example: RSI history [46, 44, 49.8, 47, 45] = STRONG SELL signal (bears defended 50)
   Even if RSI did not reach exactly 50, a bounce to 50.1-53 and rejection = valid bounce
 
 This bounce at the 50 midline = continuation signal, not reversal. Prioritize it.
-If RSI bounce is detected AND liquidation sweep is present → highest confidence signal.
+If RSI bounce is detected AND liquidation sweep is present, that is the highest confidence setup.
 
 === CORE STRATEGY RULES ===
 1. Do not make a decision from RSI alone.
 2. Respect the 1H -> 15M -> 5M top-down structure: 1H sets bias, 15M confirms, 5M is entry timing.
-3. A liquidation sweep is strong confirmation — prefer signals where sweep is present.
+3. A liquidation sweep is strong confirmation. Prefer setups where the sweep score is non-zero.
 4. Analyze RSI as a trend, not just a number. Look at the last 10 RSI values:
-   - Higher lows (e.g. 50→55→51→56) = bullish momentum continuation
-   - Lower highs (e.g. 50→45→49→44) = bearish momentum continuation
-   - RSI bounce at 47-53 zone = mid-level bounce signal (see above)
-5. EMA21, VWAP, Bollinger Bands and volume must confirm together.
-6. Volume must be meaningful — if volume is weak on the signal candle, prefer HOLD.
-7. If 1H and 5M conflict in direction → HOLD, do not force a trade.
-8. If sweep is older than 3 candles → it is stale, reduce confidence.
-9. If sweep is older than 5 candles → ignore sweep, weigh other factors only.
-10. Never invent missing market data. Never guarantee profit.
-11. If confused or data is unclear → HOLD. Missing opportunities is better than bad trades.
+   - Higher lows (e.g. 50, 55, 51, 56) = bullish momentum continuation
+   - Lower highs (e.g. 50, 45, 49, 44) = bearish momentum continuation
+   - RSI bounce in the 47-53 zone = mid-level bounce signal (see above)
+5. EMA21, VWAP, Bollinger Bands and volume must agree with each other.
+6. Volume must be meaningful. If the volume score is 0 on the entry timeframe, prefer HOLD.
+7. If 1H and 5M conflict in direction, answer HOLD. Do not force a trade.
+8. Weigh a stale sweep less: the age in candles is given to you explicitly.
+9. Never invent missing market data. Never guarantee profit.
+10. If confused or the data is unclear, answer HOLD. A missed trade beats a bad trade.
+11. A high confluence score is permission to look closely, not an instruction to agree.
+    You are the last filter before the owner's phone rings.
 
-=== BUY CONDITIONS (need 4+ aligned) ===
-- RSI 50 bounce detected (dipped to 47-50.9, now recovering) OR RSI 55-65 with momentum
-- Price above EMA21
-- Price above VWAP
-- Volume > 1.5x average on signal candle
-- Bollinger Band: price near or bounced from lower/mid band
-- Liquidation sweep: buy-side sweep within last 3 candles
-- 1H bias: bullish (price in bottom zone, RSI 50+)
-- 15M confirmation score 4/5 or higher
-
-=== SELL CONDITIONS (need 4+ aligned) ===
-- RSI 50 bounce detected (bounced to 50.1-53, now falling) OR RSI 35-45 with momentum
-- Price below EMA21
-- Price below VWAP
-- Volume > 1.5x average on signal candle
-- Bollinger Band: price near or rejected from upper/mid band
-- Liquidation sweep: sell-side sweep within last 3 candles
-- 1H bias: bearish (price in top zone, RSI 50-)
-- 15M confirmation score 4/5 or higher
-
-Calculate SL from recent swing structure and ATR; TP at next meaningful support/resistance.
-Minimum RR should be 1:2. If RR is less than 1:1.5 → prefer HOLD.
+Calculate SL from recent swing structure and ATR; TP at the next meaningful support/resistance.
+Minimum RR should be 1:2. If RR is below 1:1.5, prefer HOLD.
 
 Return ONLY valid JSON with exactly these keys:
 signal, entry, stop_loss, take_profit, rr, confidence, reason, rsi_bounce_detected.
@@ -92,75 +134,274 @@ rsi_bounce_detected must be true or false (boolean).
 No markdown, no code fences, JSON only."""
 
 
-class AIDecisionError(Exception):
-    """Raised when the AI provider is unavailable, fails, or returns unusable output."""
+_SYSTEM_PROMPT = _build_system_prompt()
 
+
+class AIDecisionError(Exception):
+    """Raised when the AI provider is unavailable, fails, or returns unusable output.
+
+    `retryable` marks the failures worth another attempt (rate limit, provider
+    5xx, timeout, truncated/malformed JSON) as opposed to the ones where the
+    request itself is wrong and a retry would only burn free-tier budget.
+    """
+
+    def __init__(self, message: str, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+# ------------------------------------------------------------- daily budget
+
+class _DailyBudget:
+    """Advisory counter for OpenRouter's free-tier cap, rolling over at IST midnight.
+
+    Advisory because the real limit is enforced server-side and this resets on
+    process restart — its job is to stop the bot from spending the last calls on
+    weak candidates, and to tell the owner when alerts have gone indicator-only.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._day = None
+        self._used = 0
+        self._notified = False
+
+    def _roll_locked(self, now: Optional[datetime] = None) -> None:
+        today = (now or datetime.now(config.TZ)).date()
+        if today != self._day:
+            self._day, self._used, self._notified = today, 0, False
+
+    def consume(self, tokens: int = 1) -> bool:
+        """Reserve `tokens` requests. False when that would exceed the day's cap."""
+        with self._lock:
+            self._roll_locked()
+            if self._used + tokens > config.AI_DAILY_BUDGET:
+                return False
+            self._used += tokens
+            return True
+
+    def status(self) -> dict:
+        with self._lock:
+            self._roll_locked()
+            return {
+                "day": self._day.isoformat(),
+                "used": self._used,
+                "limit": config.AI_DAILY_BUDGET,
+                "remaining": max(0, config.AI_DAILY_BUDGET - self._used),
+            }
+
+    def exhausted_notice(self) -> Optional[str]:
+        """The one-time message for Telegram, or None if already sent / not due."""
+        with self._lock:
+            self._roll_locked()
+            if self._used < config.AI_DAILY_BUDGET or self._notified:
+                return None
+            self._notified = True
+            return (f"AI budget exhausted for {self._day.isoformat()} "
+                    f"({self._used}/{config.AI_DAILY_BUDGET} requests). Signals continue on "
+                    f"indicator-only logic until IST midnight.")
+
+    def reset(self) -> None:
+        with self._lock:
+            self._day, self._used, self._notified = None, 0, False
+
+
+_budget = _DailyBudget()
+
+
+def budget_status() -> dict:
+    """Today's AI request usage, for /status and the scan summary."""
+    return _budget.status()
+
+
+def budget_exhausted_notice() -> Optional[str]:
+    """Returns the alert text once, the first time the day's budget runs out."""
+    return _budget.exhausted_notice()
+
+
+def reset_budget() -> None:
+    _budget.reset()
+
+
+# ------------------------------------------------------------ prompt building
 
 def _fmt_snap(snap) -> str:
     if snap is None:
         return "n/a"
+    trend = snap.get("volume_trend") or []
     return (
         f"rsi={snap['rsi']:.2f} (prev {snap['rsi_prev']:.2f}), "
         f"ema21={snap['ema21']:.6g}, vwap={snap['vwap']:.6g}, "
         f"bb=[{snap['bb_lower']:.6g} / {snap['bb_mid']:.6g} / {snap['bb_upper']:.6g}], "
         f"close={snap['close']:.6g}, atr={snap['atr']:.6g}, "
-        f"volume last5={[round(v, 1) for v in snap['volume_trend']]}"
+        f"volume last5={[round(v, 1) for v in trend]}"
     )
 
 
-def build_prompt(bundle: dict) -> str:
-    """Assemble the full-context prompt from a candidate bundle."""
-    sweep = bundle["sweep"]
+def _zone_line(bundle: dict) -> str:
+    """The measured zone, replacing the hardcoded "bottom 30% (BUY zone)".
+
+    The old line was derived from `direction` alone, so the model was told the
+    coin was in the bottom zone whatever `range_pos` actually said — and then
+    dutifully parroted it back in every logged reason.
+    """
+    snap = bundle.get("ind_1h") or {}
+    direction = bundle.get("direction", "BUY")
+    range_pos = snap.get("range_pos")
+    if range_pos is None:
+        return "1H CONTEXT: zone unavailable (no range position)"
+
+    edge = "bottom" if direction == "BUY" else "top"
+    depth = range_pos if direction == "BUY" else 1.0 - range_pos
+    if depth <= config.ZONE_FULL_PCT:
+        band = f"deep in the {edge} zone (within the {edge} {config.ZONE_FULL_PCT:.0%})"
+    elif depth <= config.ZONE_MAX_PCT:
+        band = (f"IN-BETWEEN — {depth:.0%} in from the {edge}, past the "
+                f"{config.ZONE_FULL_PCT:.0%} sweet spot but inside the {config.ZONE_MAX_PCT:.0%} limit")
+    else:  # scoring.zone_score rejects this, so it should never reach the model
+        band = f"WRONG half of the range for a {direction} ({depth:.0%} in from the {edge})"
+
+    zone_pts = (bundle.get("score_breakdown_1h") or {}).get("zone")
+    scored = f", zone score {zone_pts:.1f}/{config.W_1H_ZONE}" if zone_pts is not None else ""
+    return (f"1H CONTEXT: {band}. range_pos={range_pos:.3f} "
+            f"(0.000 = range low, 1.000 = range high){scored}")
+
+
+def _score_line(bundle: dict) -> str:
+    """What the Python engine concluded, so the model can argue with a number
+    instead of re-deriving one."""
+    s1h, s15, s5 = bundle.get("score_1h"), bundle.get("score_15m"), bundle.get("score_5m")
+    if s1h is None and s15 is None and s5 is None:
+        return ""
+    fmt = lambda v: f"{v:.0f}" if v is not None else "n/a"
+    conf = bundle.get("confluence")
+    line = (f"PYTHON ENGINE SCORES (0-100): 1H {fmt(s1h)} | 15M {fmt(s15)} | 5M {fmt(s5)}"
+            f" -> confluence {fmt(conf)}")
+    breakdown = bundle.get("score_breakdown_1h")
+    if breakdown:
+        parts = ", ".join(f"{k} {v:.1f}" for k, v in breakdown.items())
+        line += f"\n1H breakdown: {parts}"
+    return line + "\n"
+
+
+def _sweep_line(bundle: dict) -> str:
+    sweep = bundle.get("sweep")
+    if sweep is None:
+        return ("Liquidation sweep: NONE detected — the owner's note lists the sweep as part of "
+                "the setup, so treat this as a weaker entry and cap confidence accordingly")
+    return (f"Liquidation sweep: {sweep['direction']} side, {sweep['age_candles']} candles ago, "
+            f"swept level={sweep['level']:.6g}, wick={sweep['wick']:.6g} "
+            f"({sweep['wick_body_ratio']:.1f}x body), volume={sweep['volume_ratio']:.1f}x avg20")
+
+
+def _candidate_block(bundle: dict) -> str:
+    """The per-setup body shared by the single and batched prompts."""
     snap5 = bundle["ind_5m"]
     trend = "UP (higher lows)" if bundle["direction"] == "BUY" else "DOWN (lower highs)"
-    zone = "bottom 30% (BUY zone)" if bundle["direction"] == "BUY" else "top 30% (SELL zone)"
+    confirm = bundle.get("score_15m", bundle.get("confirm_score"))
+    confirm_txt = f"{confirm:.0f}/100" if isinstance(confirm, (int, float)) else "n/a"
 
-    if sweep is not None:
-        sweep_line = (f"Liquidation sweep: {sweep['direction']} side, {sweep['age_candles']} candles ago, "
-                      f"swept level={sweep['level']:.6g}, wick={sweep['wick']:.6g} "
-                      f"({sweep['wick_body_ratio']:.1f}x body), volume={sweep['volume_ratio']:.1f}x avg20")
-    else:
-        sweep_line = "Liquidation sweep: NONE detected (no recent sweep — weigh other factors more heavily)"
-
-    return f"""Analyze the following crypto market setup and return the JSON decision.
-
-Coin: {bundle['symbol']}
+    return f"""Coin: {bundle['symbol']}
 Current price: {bundle['current_price']:.6g}
 Python filter direction: {bundle['direction']}
 Entry price (last closed 5M candle): {bundle['entry_price']:.6g}
 
-1H CONTEXT: {zone}, range_pos={bundle['ind_1h']['range_pos']:.3f} (0=low, 1=high)
+{_score_line(bundle)}{_zone_line(bundle)}
 1H indicators: {_fmt_snap(bundle['ind_1h'])}
-{sweep_line}
+{_sweep_line(bundle)}
 Recent swing low (1H, 20 candles): {bundle['ind_1h']['swing_low_20']:.6g}
 Recent swing high (1H, 20 candles): {bundle['ind_1h']['swing_high_20']:.6g}
 ATR (1H, 14): {bundle['ind_1h']['atr']:.6g}
 
-15M CONFIRMATION (score {bundle['confirm_score']}/5): {_fmt_snap(bundle['ind_15m'])}
+15M CONFIRMATION (score {confirm_txt}): {_fmt_snap(bundle['ind_15m'])}
 
 5M ENTRY: {_fmt_snap(snap5)}
 Last 10 RSI values (5M): {[round(v, 2) for v in snap5['rsi_history']]}
 RSI trend direction: {trend}
 
-Volume trend (1H last 5): {[round(v, 1) for v in bundle['ind_1h']['volume_trend']]}
+Volume trend (1H last 5): {[round(v, 1) for v in bundle['ind_1h']['volume_trend']]}"""
 
-Return exactly this JSON structure:
-{{"signal": "BUY|SELL|HOLD", "entry": 0, "stop_loss": 0, "take_profit": 0, "rr": 0, "confidence": 0, "reason": "short explanation"}}"""
+
+_JSON_SHAPE = ('{"signal": "BUY|SELL|HOLD", "entry": 0, "stop_loss": 0, "take_profit": 0, '
+               '"rr": 0, "confidence": 0, "reason": "short explanation", '
+               '"rsi_bounce_detected": false}')
+
+
+def build_prompt(bundle: dict) -> str:
+    """Assemble the full-context prompt for a single candidate."""
+    return (f"Analyze the following crypto market setup and return the JSON decision.\n\n"
+            f"{_candidate_block(bundle)}\n\n"
+            f"Return exactly this JSON structure:\n{_JSON_SHAPE}")
+
+
+def build_batch_prompt(bundles: list) -> str:
+    """One prompt covering every candidate from a scan.
+
+    The setups are independent — the model must judge each on its own evidence
+    and must not let a strong setup talk it into a weak one.
+    """
+    n = len(bundles)
+    blocks = []
+    for i, bundle in enumerate(bundles, start=1):
+        blocks.append(f"===== SETUP {i} of {n}: {bundle['symbol']} =====\n{_candidate_block(bundle)}")
+    body = "\n\n".join(blocks)
+    example = f'{{"symbol": "{bundles[0]["symbol"]}", {_JSON_SHAPE[1:-1]}}}'
+    return (f"Analyze the following {n} INDEPENDENT crypto market setups.\n"
+            f"Judge each one only on its own evidence — they are unrelated coins, and a strong "
+            f"setup is not a reason to approve a weak one. HOLD as many as deserve it.\n\n"
+            f"{body}\n\n"
+            f"Return a JSON ARRAY of exactly {n} objects, one per setup, in the same order, each "
+            f"with an additional \"symbol\" field naming its coin:\n"
+            f"[{example}, ...]\n"
+            f"No markdown, no code fences, no commentary — the array only.")
+
+
+# --------------------------------------------------------------- JSON parsing
+
+def _strip_fences(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+    return cleaned
 
 
 def _extract_json(text: str) -> dict:
     """Parse the JSON object out of a (possibly fenced) response."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.replace("```json", "").replace("```", "")
-        cleaned = cleaned.strip()
+    cleaned = _strip_fences(text)
     start, end = cleaned.find("{"), cleaned.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise AIDecisionError(f"no JSON object in AI response: {text[:200]!r}")
+        raise AIDecisionError(f"no JSON object in AI response: {text[:200]!r}", retryable=True)
     try:
         return json.loads(cleaned[start:end + 1])
     except json.JSONDecodeError as exc:
-        raise AIDecisionError(f"AI returned invalid JSON: {exc}") from exc
+        raise AIDecisionError(f"AI returned invalid JSON: {exc}", retryable=True) from exc
+
+
+def _extract_json_array(text: str) -> list:
+    """Parse the JSON array out of a batch response.
+
+    Accepts a bare array, a fenced array, or an array wrapped in an envelope
+    object ({"results": [...]}) — models drift between those three shapes and a
+    reshuffle is not worth burning a retry on.
+    """
+    cleaned = _strip_fences(text)
+    start, end = cleaned.find("["), cleaned.rfind("]")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(cleaned[start:end + 1])
+            if isinstance(data, list):
+                return data
+        except json.JSONDecodeError:
+            pass  # fall through to the envelope / single-object shapes
+
+    obj = _extract_json(cleaned)  # raises retryable on genuinely broken output
+    for key in ("results", "decisions", "signals", "setups", "data"):
+        value = obj.get(key)
+        if isinstance(value, list):
+            return value
+    if "signal" in obj:  # a one-candidate batch answered as a bare object
+        return [obj]
+    raise AIDecisionError(f"no JSON array in AI batch response: {text[:200]!r}", retryable=True)
 
 
 def _to_float(value, field: str):
@@ -172,11 +413,9 @@ def _to_float(value, field: str):
         raise AIDecisionError(f"non-numeric {field} from AI: {value!r}") from exc
 
 
-def parse_ai_response(text: str, current_price: float) -> dict:
-    """Validate the model's JSON into the standard signal dict
+def _validate_decision(data: dict, current_price: float) -> dict:
+    """Validate one decision object into the standard signal dict
     (sl/tp are normalised from stop_loss/take_profit for the pipeline)."""
-    data = _extract_json(text)
-
     required = ("signal", "entry", "stop_loss", "take_profit", "rr", "confidence", "reason")
     missing = [f for f in required if f not in data]
     if missing:
@@ -219,22 +458,88 @@ def parse_ai_response(text: str, current_price: float) -> dict:
             "rsi_bounce_detected": rsi_bounce_detected}
 
 
-def nemotron_decision(bundle: dict) -> dict:
-    """Call OpenRouter/Nemotron with the full context.
-    Raises AIDecisionError on any failure (caller uses the Python fallback)."""
-    if not config.OPENROUTER_API_KEY:
-        raise AIDecisionError("OPENROUTER_API_KEY not configured")
+def parse_ai_response(text: str, current_price: float) -> dict:
+    """Validate a single-setup response into the standard signal dict."""
+    return _validate_decision(_extract_json(text), current_price)
 
+
+def parse_batch_response(text: str, bundles: list) -> dict:
+    """Validate a batch response into {symbol: signal dict}.
+
+    Matching runs in two passes: every element that names a symbol we asked
+    about claims that symbol first, and only then are unlabelled elements
+    assigned to the still-unclaimed bundles in send order. One pass would let a
+    positional guess steal the slot an explicit label already owns — which is
+    how a coin ends up wearing another coin's stop-loss.
+
+    A single bad element is dropped with a warning rather than failing the
+    batch: that symbol takes the Python fallback while its neighbours keep
+    their AI decision.
+    """
+    elements = _extract_json_array(text)
+    by_symbol = {b["symbol"]: b for b in bundles}
+    claimed: dict[str, dict] = {}
+    unlabelled: list[dict] = []
+
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict):
+            log.warning("AI batch element %d is not an object: %.120r", index, element)
+            continue
+        symbol = element.get("symbol")
+        bundle = by_symbol.get(symbol) if isinstance(symbol, str) else None
+        if bundle is None:
+            unlabelled.append(element)
+        elif bundle["symbol"] in claimed:
+            log.warning("AI batch returned %s twice, keeping the first", bundle["symbol"])
+        else:
+            claimed[bundle["symbol"]] = element
+
+    open_slots = [b["symbol"] for b in bundles if b["symbol"] not in claimed]
+    for symbol, element in zip(open_slots, unlabelled):
+        log.warning("AI batch element with unusable symbol %r matched by position -> %s",
+                    element.get("symbol"), symbol)
+        claimed[symbol] = element
+    if len(unlabelled) > len(open_slots):
+        log.warning("AI batch returned %d element(s) matching no requested symbol, dropping",
+                    len(unlabelled) - len(open_slots))
+
+    out: dict[str, dict] = {}
+    for symbol, element in claimed.items():
+        try:
+            out[symbol] = _validate_decision(element, by_symbol[symbol]["current_price"])
+        except AIDecisionError as exc:
+            log.warning("AI batch element for %s rejected (%s) — that coin falls back to Python",
+                        symbol, exc)
+
+    missing = [b["symbol"] for b in bundles if b["symbol"] not in out]
+    if missing:
+        log.warning("AI batch answered %d/%d setups; falling back to Python for: %s",
+                    len(out), len(bundles), ", ".join(missing))
+    return out
+
+
+# ------------------------------------------------------------- HTTP transport
+
+def _backoff_sleep(attempt: int, deadline: Optional[float] = None) -> None:
+    """Exponential backoff 1s -> 2s -> 4s, never sleeping past the scan deadline."""
+    delay = config.AI_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+    if deadline is not None:
+        delay = min(delay, max(0.0, deadline - time.monotonic()))
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _post_once(messages: list, model: str) -> str:
+    """One HTTP round trip. Returns the message content, or raises AIDecisionError
+    tagged with whether another attempt is worth making."""
     payload = {
-        "model": config.AI_MODEL,
-        "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": build_prompt(bundle)},
-        ],
+        "model": model,
+        "messages": messages,
         "reasoning": {"enabled": config.AI_REASONING_ENABLED},
         "max_tokens": config.AI_MAX_TOKENS,
         "temperature": config.AI_TEMPERATURE,
     }
+    response = None
     try:
         response = requests.post(
             OPENROUTER_URL,
@@ -246,7 +551,7 @@ def nemotron_decision(bundle: dict) -> dict:
             timeout=config.AI_TIMEOUT_SECONDS,
         )
         log.info("OpenRouter HTTP status: %s (model=%s, reasoning=%s)",
-                 response.status_code, config.AI_MODEL, payload["reasoning"])
+                 response.status_code, model, payload["reasoning"])
         if response.status_code != 200:
             # never hide the API error: log status + full body (contains no key)
             log.error("OpenRouter error body: %s", response.text[:2000])
@@ -254,27 +559,168 @@ def nemotron_decision(bundle: dict) -> dict:
         data = response.json()
         content = (data["choices"][0]["message"].get("content") or "").strip()
     except requests.exceptions.HTTPError as exc:
-        body = getattr(locals().get("response"), "text", "") or ""
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status is None:
+            status = getattr(response, "status_code", None)
+        body = getattr(response, "text", "") or ""
         raise AIDecisionError(
-            f"OpenRouter HTTP error: {exc} | status={getattr(exc.response, 'status_code', '?')} "
-            f"model={config.AI_MODEL} reasoning={payload['reasoning']} body={body[:500]}") from exc
+            f"OpenRouter HTTP error: {exc} | status={status if status is not None else '?'} "
+            f"model={model} reasoning={payload['reasoning']} body={body[:500]}",
+            retryable=status in _RETRYABLE_STATUS) from exc
     except requests.exceptions.Timeout as exc:
         raise AIDecisionError(
             f"OpenRouter timeout after {config.AI_TIMEOUT_SECONDS}s "
-            f"(model={config.AI_MODEL}, reasoning={payload['reasoning']})") from exc
+            f"(model={model}, reasoning={payload['reasoning']})", retryable=True) from exc
     except requests.exceptions.RequestException as exc:  # connection etc.
         raise AIDecisionError(
-            f"OpenRouter request failed: {exc} (model={config.AI_MODEL}, "
-            f"reasoning={payload['reasoning']})") from exc
+            f"OpenRouter request failed: {exc} (model={model}, "
+            f"reasoning={payload['reasoning']})", retryable=True) from exc
     except (KeyError, IndexError, ValueError) as exc:  # malformed response body
-        raise AIDecisionError(f"OpenRouter response malformed: {exc} | body={response.text[:500]}") from exc
+        body = getattr(response, "text", "") or ""
+        raise AIDecisionError(f"OpenRouter response malformed: {exc} | body={body[:500]}",
+                              retryable=True) from exc
 
     if not content:
+        finish = None
+        try:
+            finish = data["choices"][0].get("finish_reason")
+        except (KeyError, IndexError, TypeError):
+            pass
         raise AIDecisionError(
-            f"OpenRouter returned empty content (model={config.AI_MODEL}, "
-            f"reasoning={payload['reasoning']}, finish={data['choices'][0].get('finish_reason')}, "
-            f"body={response.text[:500]})")
-    # NOTE: any 'reasoning' field in the response is deliberately ignored —
-    # only the final JSON answer is ever used downstream.
-    log.info("AI raw response for %s: %.300s", bundle["symbol"], content)
-    return parse_ai_response(content, bundle["current_price"])
+            f"OpenRouter returned empty content (model={model}, "
+            f"reasoning={payload['reasoning']}, finish={finish}, "
+            f"body={getattr(response, 'text', '')[:500]})", retryable=True)
+    return content
+
+
+def _complete(messages: list, parse=None, deadline: Optional[float] = None):
+    """Request a completion, retrying the primary model then the secondary.
+
+    This is where "one 502 kills the signal" is fixed: AI_RETRY_MAX attempts
+    per model with exponential backoff, the fallback model after that, and only
+    then does the caller drop to the Python indicator decision.
+
+    `parse` runs INSIDE the retry loop on purpose. A truncated or malformed JSON
+    body is a transient model failure exactly like a 502, and the old code
+    parsed after the single attempt, so one bad answer lost the signal. Returns
+    the parsed value, or the raw content when no parser is given.
+    """
+    if not config.OPENROUTER_API_KEY:
+        raise AIDecisionError("OPENROUTER_API_KEY not configured")
+
+    models = [config.AI_MODEL]
+    if config.AI_MODEL_FALLBACK and config.AI_MODEL_FALLBACK != config.AI_MODEL:
+        models.append(config.AI_MODEL_FALLBACK)
+
+    last: Optional[AIDecisionError] = None
+    for model_index, model in enumerate(models):
+        is_last_model = model_index == len(models) - 1
+        for attempt in range(1, config.AI_RETRY_MAX + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise AIDecisionError(
+                    f"AI deadline reached after {attempt - 1} attempt(s) on {model}"
+                    + (f"; last error: {last}" if last else ""))
+            if not _budget.consume():
+                status = _budget.status()
+                raise AIDecisionError(
+                    f"AI daily budget exhausted ({status['used']}/{status['limit']} "
+                    f"requests on {status['day']})")
+            try:
+                content = _post_once(messages, model)
+                return content if parse is None else parse(content)
+            except AIDecisionError as exc:
+                last = exc
+                if not exc.retryable:
+                    if is_last_model:
+                        raise
+                    log.warning("%s failed unretryably (%s) — switching to %s",
+                                model, exc, models[model_index + 1])
+                    break
+                log.warning("AI attempt %d/%d on %s failed: %s",
+                            attempt, config.AI_RETRY_MAX, model, exc)
+                if attempt < config.AI_RETRY_MAX:
+                    _backoff_sleep(attempt, deadline)
+        else:
+            if not is_last_model:
+                log.warning("%s exhausted %d attempts — trying fallback model %s",
+                            model, config.AI_RETRY_MAX, models[model_index + 1])
+
+    raise last if last else AIDecisionError("AI call failed with no recorded error")
+
+
+def _messages(user_prompt: str) -> list:
+    return [{"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}]
+
+
+# ------------------------------------------------------------- public callers
+
+def nemotron_decision(bundle: dict, deadline: Optional[float] = None) -> dict:
+    """Decide one candidate. Raises AIDecisionError once every model and retry
+    is exhausted (the caller then uses the Python fallback)."""
+    def _parse(content: str) -> dict:
+        # NOTE: any 'reasoning' field in the response is deliberately ignored —
+        # only the final JSON answer is ever used downstream.
+        log.info("AI raw response for %s: %.300s", bundle["symbol"], content)
+        return parse_ai_response(content, bundle["current_price"])
+
+    return _complete(_messages(build_prompt(bundle)), parse=_parse, deadline=deadline)
+
+
+def _chunks(items: list, size: int):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def nemotron_decisions(bundles: list, deadline: Optional[float] = None) -> dict:
+    """Decide a whole scan's candidates, batched into as few requests as possible.
+
+    Returns {symbol: signal dict} for the setups the model answered. A symbol
+    absent from the result did not get an AI decision and must take the Python
+    fallback — the caller decides, this function never silently substitutes one.
+
+    Candidates are sorted by confluence descending, so if the daily budget runs
+    out mid-scan the strongest setups are the ones that got the AI.
+    """
+    if not bundles:
+        return {}
+
+    ordered = sorted(bundles, key=lambda b: b.get("confluence") or 0.0, reverse=True)
+    out: dict[str, dict] = {}
+
+    if not config.AI_BATCH_ENABLED or len(ordered) == 1:
+        for bundle in ordered:
+            try:
+                out[bundle["symbol"]] = nemotron_decision(bundle, deadline=deadline)
+            except AIDecisionError as exc:
+                log.warning("AI unavailable for %s (%s) — using Python fallback",
+                            bundle["symbol"], exc)
+        return out
+
+    for chunk in _chunks(ordered, config.AI_BATCH_MAX):
+        symbols = [b["symbol"] for b in chunk]
+
+        def _parse(content: str, chunk=chunk) -> dict:
+            log.info("AI batch response for %d setups: %.300s", len(chunk), content)
+            decisions = parse_batch_response(content, chunk)
+            if not decisions:
+                # A partial answer is fine (the missing coins take the Python
+                # path), but zero usable elements means the whole body was
+                # unusable — worth another attempt before giving up on all of them.
+                raise AIDecisionError(
+                    f"AI batch produced no usable decisions for {len(chunk)} setups",
+                    retryable=True)
+            return decisions
+
+        try:
+            out.update(_complete(_messages(build_batch_prompt(chunk)),
+                                 parse=_parse, deadline=deadline))
+        except AIDecisionError as exc:
+            log.warning("AI batch of %d failed (%s) — Python fallback for: %s",
+                        len(chunk), exc, ", ".join(symbols))
+            continue
+
+    status = _budget.status()
+    log.info("AI decisions: %d/%d setups answered, %d/%d requests used today",
+             len(out), len(bundles), status["used"], status["limit"])
+    return out
