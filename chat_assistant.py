@@ -1,8 +1,8 @@
 """Interactive LLM Chat Assistant for Telegram User Queries.
 
 Allows users to chat with the bot in Telegram and ask questions about:
-  - The bot's trading strategy (1H -> 15M -> 5M top-down filters)
-  - Indicators used (RSI, EMA21, daily VWAP, Bollinger Bands, ATR, sweeps)
+  - The bot's decision hierarchy (structure/S-R/liquidity/risk first, 1H -> 15M -> 5M)
+  - Indicators (RSI, EMA21, daily VWAP, Bollinger Bands, ATR) — secondary confirmation only
   - Recent signal performance and logs from signals_log.csv
   - General cryptocurrency trading, risk management, and market insights
 

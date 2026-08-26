@@ -1,4 +1,12 @@
 phases.md — Development Phases
+
+> **Historical build log (superseded).** This records the original indicator-checklist
+> build sequence and is kept for provenance. The bot now decides on a deterministic
+> price-action & market-context core — see **[price_action_spec.md](price_action_spec.md)**
+> (primary), **[Architecture.md](Architecture.md)** (runtime), and the price-action-first
+> phase status in **[memory.md](memory.md)**. "Claude AI Decision" below is also stale —
+> the LLM runs on OpenRouter and now writes the **explanation only**.
+
 Phase 1: Data Foundation
 CCXT Binance public mode setup
 fetch_tickers() → all USDT pairs

@@ -1,12 +1,19 @@
-# Strategy Specification — AUTHORITATIVE
+# Strategy Specification — SECONDARY (indicator confirmation layer)
 
-> This file is a transcription of the owner's **handwritten strategy note**.
-> It is the **single source of truth** for the bot's entry logic.
+> **Status (owner-directed):** the bot now decides on **market structure and
+> market context first** — see [`price_action_spec.md`](price_action_spec.md),
+> the **primary authority**. The six indicator conditions transcribed below are
+> now the **secondary confirmation layer**: they fold into `setup_quality` as a
+> bounded sub-score (`scoring.indicator_confirmation`) and **cannot trigger or
+> veto a trade on their own**. RSI / EMA21 / VWAP / Bollinger are no longer hard
+> gates or the direction-chooser.
 >
-> When code and this file disagree, **this file is right and the code is wrong**.
-> Any deliberate deviation must be recorded in the "Sanctioned deviations"
-> table at the bottom, with a reason. Anything not in that table is drift and
-> should be fixed.
+> This file remains the faithful transcription of the owner's **handwritten
+> indicator note** and the authority for *how those indicators are read*. The
+> "Hard gates" and "confluence = 0.40/0.30/0.30" descriptions below document the
+> **historical** indicator-checklist engine (`scoring.py`'s graded fns are
+> retained and reused as the secondary scorer); they no longer describe how a
+> trade is *decided*. For that, read `price_action_spec.md`.
 
 ## The note, verbatim
 
