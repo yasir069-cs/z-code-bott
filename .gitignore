@@ -5,5 +5,6 @@ __pycache__/
 bot.log*
 signals_log*.csv
 backtest_report*
+backtest_strategy_report*
 .pytest_cache/
 specs/
