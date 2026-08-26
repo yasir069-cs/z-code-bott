@@ -98,4 +98,4 @@ def test_cmd_strategy():
     asyncio.run(telegram_bot.cmd_strategy(update, context))
     update.message.reply_text.assert_called_once()
     text = update.message.reply_text.call_args[0][0]
-    assert "Confluence" in text and "Liquidation Sweep" in text
+    assert "Market structure" in text and "NO_TRADE" in text and "secondary" in text

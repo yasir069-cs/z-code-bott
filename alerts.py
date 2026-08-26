@@ -16,6 +16,10 @@ import config
 log = logging.getLogger("alerts")
 
 _FALLBACK_TAG = "AI Unavailable — Indicator based signal"
+# Honest footer for the structure-first path: the deterministic core ALWAYS
+# decides; the LLM (when wired) or a local template only writes the prose. This
+# is NOT the legacy "AI unavailable" fallback — the verdict never depended on it.
+_LOCAL_EXPLANATION_FOOTER = "Decision by deterministic core · explanation generated locally"
 
 # Confidence display mapping
 _CONF_META = {
@@ -56,6 +60,25 @@ def format_alert(sig: dict) -> str:
         bounce_icon = "📊 RSI Bounce at 50 detected ✅" if is_buy else "📊 RSI Rejection at 50 detected ✅"
         bounce_line = f"\n{bounce_icon}"
 
+    # Market-context block — the PRIMARY evidence the structure-first core decided
+    # on (present only for core-produced sigs; legacy/synthetic sigs skip it).
+    ctx_pairs = []
+    if sig.get("structure"):
+        ctx_pairs.append(("Structure", sig["structure"]))
+    if sig.get("htf_bias"):
+        ctx_pairs.append(("HTF bias", sig["htf_bias"]))
+    if sig.get("sr_zone"):
+        ctx_pairs.append(("Target zone", sig["sr_zone"]))
+    if sig.get("liquidity"):
+        ctx_pairs.append(("Liquidity", sig["liquidity"]))
+    context_block = ""
+    if ctx_pairs:
+        lines = []
+        for i, (label, val) in enumerate(ctx_pairs):
+            branch = "└" if i == len(ctx_pairs) - 1 else "├"
+            lines.append(f"{branch} {label}: <code>{html.escape(str(val))}</code>")
+        context_block = "\n\n🧭 <b>Market Context</b> <i>(primary)</i>\n" + "\n".join(lines)
+
     # Indicator summary (optional fields — present when bundle is passed through)
     ind = sig.get("indicators", {})
     rsi_now  = ind.get("rsi_now")
@@ -75,7 +98,7 @@ def format_alert(sig: dict) -> str:
     if vol_ratio is not None:
         ind_lines.append(f"└ Volume: <code>{vol_ratio:.1f}x</code> avg 💹")
 
-    ind_block = ("\n📊 <b>Indicators</b>\n" + "\n".join(ind_lines)) if ind_lines else ""
+    ind_block = ("\n📊 <b>Indicators</b> <i>(secondary confirmation)</i>\n" + "\n".join(ind_lines)) if ind_lines else ""
 
     # Liquidation sweep
     sweep = sig.get("sweep", {})
@@ -108,6 +131,8 @@ def format_alert(sig: dict) -> str:
     # AI / fallback footer
     if sig.get("ai_used", False):
         footer = f"🤖 <i>AI: {html.escape(config.AI_MODEL)}</i>"
+    elif sig.get("decision") or sig.get("structure") or sig.get("setup_quality") is not None:
+        footer = f"🧠 <i>{_LOCAL_EXPLANATION_FOOTER}</i>"
     else:
         footer = f"⚠️ <b>{_FALLBACK_TAG}</b>"
 
@@ -117,6 +142,7 @@ def format_alert(sig: dict) -> str:
         f"{dir_icon} <b>{sig['signal']} SIGNAL — {html.escape(sig['coin'])}</b>  |  {dir_word}\n"
         f"━━━━━━━━━━━━━━━━━━"
         f"{bounce_line}"
+        f"{context_block}"
         f"{ind_block}\n\n"
         f"{sweep_text}\n\n"
         f"💰 <b>Trade Levels</b>\n"

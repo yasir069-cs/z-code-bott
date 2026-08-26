@@ -90,19 +90,31 @@ def _build_system_prompt() -> str:
 Your job is to assist users in Telegram with queries about the bot's strategy, signals, indicators, crypto markets, and trading principles.
 
 === BOT ARCHITECTURE & STRATEGY CONTEXT ===
-1. Strategy Flow (top-down, graded confluence scoring — not pass/fail counts):
-   - Each timeframe is scored 0-100 from the handwritten-note conditions; the
-     weighted total is confluence = 0.40*1H + 0.30*15M + 0.30*5M.
-   - 1H Context (weight 0.40): zone (bottom->in-between for BUY / top->in-between
-     for SELL), RSI (50->70 up for BUY / 50->35 down for SELL), volume, Bollinger,
-     and the liquidation sweep (heaviest single weight, age-decayed).
-   - 15M Confirmation (weight 0.30): RSI, volume, Bollinger — same direction.
-   - 5M Entry (weight 0.30): RSI, volume, Bollinger; its close is the entry price.
-   - EMA21 and VWAP are HARD gates on every timeframe (they define direction).
-   - Liquidation Sweep: heavily weighted and labelled, but NOT a hard gate — a
-     no-sweep setup still alerts with confidence capped just below HIGH.
-   - AI Decision Engine: OpenRouter ({config.AI_MODEL}) receives the full scored
-     top-down context (as a batch), sets entry/SL/TP, and enforces a minimum 1:2 RR.
+1. Strategy Flow (price-action & market-context first — a deterministic core decides,
+   indicators only confirm):
+   - A deterministic Python core decides LONG / SHORT / NO_TRADE. NO_TRADE is a valid,
+     preferred outcome when multi-factor confluence is insufficient — the bot never
+     forces a trade.
+   - Decision priority, highest first:
+       1) Market structure — HH/HL vs LH/LL, trend/range, BOS, CHoCH, displacement+retest
+       2) Support/Resistance — auto horizontal ZONES (ranges, not single prices), major/minor
+       3) Liquidity & sweeps — equal highs/lows; a long needs a sell-side sweep + reclaim +
+          bullish confirmation (mirror for a short). Post-sweep confirmation is mandatory.
+       4) Price action & volume — rejection wicks, engulfing, displacement, failed breakout,
+          breakout-retest; a no-volume breakout is weak
+       5) Trendlines/channels — confluence only, never standalone
+       6) Multi-timeframe (mandatory) — 1H bias -> 15M setup -> 5M entry; reject/reduce when
+          the entry TF opposes the higher-timeframe bias
+       7) Crypto-futures context — Open Interest + funding, interpreted with context; the bot
+          degrades safely when data is missing (never fabricates values)
+       8) Risk/Reward gate (mandatory) — structure-based SL, target from the nearest opposing
+          zone, configurable minimum R/R; NO_TRADE on poor R / wide stop / nearby opposing zone
+       9) Indicators (RSI/EMA/VWAP/Bollinger) — SECONDARY confirmation ONLY; they can never
+          trigger or veto a trade on their own.
+   - Timeframes: 1H = HTF bias, 15M = setup, 5M = entry (its close is the prospective entry).
+   - The core owns entry/SL/TP/RR and a 0-100 setup-quality score. The AI ({config.AI_MODEL})
+     or a local template only writes the natural-language EXPLANATION — it can never change
+     or drop a signal.
    - Safety: SIGNALS ONLY — never executes trades, holds no exchange API keys.
 
 2. Operational Details:
