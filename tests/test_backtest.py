@@ -122,3 +122,130 @@ def test_run_backtest_summary(tmp_path, monkeypatch):
     assert report["wins"] == 1 and report["losses"] == 1
     assert report["win_rate"] == 50.0
     assert report["total_r"] == 1.0  # +2 -1
+
+
+# ── Strategy-replay mode ─────────────────────────────────────────────────────
+# These prove the replay HARNESS (slicing, scoring, cooldown, safe-degrade),
+# using stub deciders so they don't depend on decision.decide's thresholds
+# (those live in test_decision.py). The last test wires the REAL core through.
+from conftest import make_candles
+
+
+def _upframe(n, freq, start="2026-08-14 00:00"):
+    """A gently rising OHLCV frame of n candles at the given pandas freq."""
+    return make_candles([100 + i * 0.4 for i in range(n)], start=start, freq=freq, wick=0.05)
+
+
+def _long(entry=100.0):
+    return {"decision": "LONG", "entry": entry, "sl": entry - 2, "tp": entry + 4, "rr": 2.0}
+
+
+def _ohlcv(df):
+    """DataFrame -> ccxt fetch_ohlcv list ([ms, o, h, l, c, v])."""
+    return [[int(ts.timestamp() * 1000), r["open"], r["high"], r["low"], r["close"], r["volume"]]
+            for ts, r in df.iterrows()]
+
+
+class _FakeExchange:
+    """Returns canned OHLCV per timeframe; records calls; no network."""
+    def __init__(self, per_tf):
+        self._per_tf = per_tf
+        self.calls = []
+
+    def fetch_ohlcv(self, symbol, timeframe, limit):
+        self.calls.append((symbol, timeframe, limit))
+        return list(self._per_tf.get(timeframe, []))
+
+
+def test_slice_frames_excludes_unclosed_htf_candle():
+    """A 1H candle is usable only once its hour has fully closed — the 10:00
+    candle is IN at c5=11:00 but OUT at c5=10:55 (no look-ahead)."""
+    frames = {
+        "1h": make_candles([10, 11, 12, 13, 14], start="2026-08-14 08:00", freq="1h"),
+        "5m": make_candles([1] * 40, start="2026-08-14 08:00", freq="5min"),
+    }
+    closed = backtest._slice_frames(frames, pd.Timestamp("2026-08-14 11:00", tz="UTC"))
+    assert closed["1h"].index[-1] == pd.Timestamp("2026-08-14 10:00", tz="UTC")
+    forming = backtest._slice_frames(frames, pd.Timestamp("2026-08-14 10:55", tz="UTC"))
+    assert forming["1h"].index[-1] == pd.Timestamp("2026-08-14 09:00", tz="UTC")
+
+
+def test_replay_never_sees_a_future_candle():
+    """Core safety property: at every decision bar the decider only sees candles
+    whose close-time is <= that bar's close-time, across all timeframes."""
+    frames = {"1h": _upframe(40, "1h"), "15m": _upframe(80, "15min"), "5m": _upframe(120, "5min")}
+    seen = []
+
+    def spy(fr):
+        c5 = fr["5m"].index[-1] + backtest._TF_DURATION["5m"]
+        for tf, df in fr.items():
+            if len(df):
+                assert (df.index + backtest._TF_DURATION[tf]).max() <= c5
+        seen.append(c5)
+        return {"decision": "NO_TRADE"}
+
+    out = backtest.replay_strategy("BTC/USDT:USDT", frames, decide_fn=spy)
+    assert out == []            # NO_TRADE is silent
+    assert len(seen) == 120     # every 5m bar evaluated (no cooldown skips on NO_TRADE)
+
+
+def test_replay_scores_long_through_fill_sim():
+    """When the core says LONG, replay builds a sig and scores it with the same
+    fill simulator — a TP-tagging future path returns WIN at the core RR."""
+    closes = [100.0] * 5 + [100.0, 104.2] + [104.0] * 3   # spike tags TP(104) one bar after entry
+    entry_df = make_candles(closes, start="2026-08-14 00:00", freq="5min", wick=0.05)
+    frames = {"1h": _upframe(10, "1h"), "15m": _upframe(20, "15min"), "5m": entry_df}
+    target = entry_df.index[5]
+
+    def stub(fr):
+        return _long() if fr["5m"].index[-1] == target else {"decision": "NO_TRADE"}
+
+    out = backtest.replay_strategy("BTC/USDT:USDT", frames, decide_fn=stub)
+    assert len(out) == 1
+    assert out[0]["signal"] == "BUY" and out[0]["outcome"] == "WIN" and out[0]["r"] == 2.0
+
+
+def test_replay_cooldown_spaces_emissions():
+    """An always-LONG core must not fire every 5m bar — the duplicate-guard
+    cooldown (DUPLICATE_COOLDOWN_MIN) spaces emissions out."""
+    frames = {"1h": _upframe(10, "1h"), "15m": _upframe(20, "15min"), "5m": _upframe(30, "5min")}
+    out = backtest.replay_strategy("BTC/USDT:USDT", frames, decide_fn=lambda fr: _long())
+    cd = timedelta(minutes=config.DUPLICATE_COOLDOWN_MIN)
+    stamps = [datetime.fromisoformat(r["timestamp"]) for r in out]
+    assert 0 < len(out) < 30
+    assert all(b - a >= cd for a, b in zip(stamps, stamps[1:]))
+
+
+def test_replay_all_no_trade_returns_empty():
+    frames = {"1h": _upframe(10, "1h"), "15m": _upframe(20, "15min"), "5m": _upframe(30, "5min")}
+    out = backtest.replay_strategy("X", frames, decide_fn=lambda fr: {"decision": "NO_TRADE"})
+    assert out == []
+
+
+def test_run_strategy_backtest_fetches_all_tfs(monkeypatch):
+    per_tf = {"1h": _ohlcv(_upframe(40, "1h")), "15m": _ohlcv(_upframe(80, "15min")),
+              "5m": _ohlcv(_upframe(120, "5min"))}
+    ex = _FakeExchange(per_tf)
+    monkeypatch.setattr(backtest.decision_core, "decide", lambda fr: _long())
+    report = backtest.run_strategy_backtest("BTC/USDT:USDT", ex, horizon_hours=24)
+    assert {tf for _, tf, _ in ex.calls} == {config.TF_HTF, config.TF_SETUP, config.TF_ENTRY}
+    assert report["total_signals"] >= 1
+    assert set(report).issuperset({"win_rate", "avg_rr", "total_r", "results"})
+
+
+def test_run_strategy_backtest_safe_degrade_on_missing_tf():
+    ex = _FakeExchange({"1h": _ohlcv(_upframe(40, "1h")), "15m": _ohlcv(_upframe(80, "15min"))})
+    report = backtest.run_strategy_backtest("X/USDT:USDT", ex)   # no 5m data
+    assert report["total_signals"] == 0 and report["results"] == []
+
+
+def test_replay_real_core_is_wired_and_look_ahead_safe():
+    """Smoke test: the DEFAULT decider is the live decision.decide. Replaying it
+    over trending history runs without error and yields only valid outcomes."""
+    frames = {config.TF_HTF: _upframe(60, "1h"), config.TF_SETUP: _upframe(120, "15min"),
+              config.TF_ENTRY: _upframe(180, "5min")}
+    out = backtest.replay_strategy("BTC/USDT:USDT", frames)   # real decision.decide
+    assert isinstance(out, list)
+    for r in out:
+        assert r["signal"] in ("BUY", "SELL")
+        assert r["outcome"] in ("WIN", "LOSS", "OPEN", "NO_DATA")
