@@ -1,27 +1,27 @@
-"""Phase 6 — 5M entry filter.
+"""5M entry-timeframe **feature extractor** (structure-first rework).
 
-Only candidates that passed 1H + 15M reach this stage. The 5M close becomes
-the alert's entry price.
+`entry_5m` used to hard-gate the direction on the 5M indicator checklist and
+only then report the entry price. Under the structure-first design it is now a
+thin feature extractor: it reports the 5M structural bias, whether it aligns
+with the direction under consideration, the prospective entry price (the last
+5M close), the indicator snapshot for the bounded secondary layer, and the RSI
+bounce/rejection pattern (kept as metadata for the alert badge). It never hard-
+rejects — the authoritative verdict is made by ``decision.decide()``.
 
-Grading of the note's three shared conditions is delegated to
-scoring.score_ltf() (EMA21/VWAP hard, RSI/volume/Bollinger graded) and the
-resulting 0-100 score must clear config.MIN_SCORE_5M.
-
-On top of the score this stage detects the RSI *pattern* that the note's
-"RSI 50 above to 70" wording implies — RSI dipping but holding a higher low
-before turning back up (50 -> 55 -> 51 -> 56 is bullish). That is reported as
-`rsi_bounce_detected` metadata rather than extra points, so the 0-100 scale
-stays intact; it drives the RSI-bounce badge in the Telegram alert and is a
-strong input to the AI decision.
+Kept name/signature so `main.py` and the scripts stay recognizable.
 """
 import logging
 from typing import Optional
 
 import config
-import scoring
+import market_structure
 from indicators import compute_indicators, rsi_trend_down, rsi_trend_up
 
 log = logging.getLogger("filter_5m")
+
+_MIN_FRAME = config.STRUCT_PIVOT_LEFT + config.STRUCT_PIVOT_RIGHT + 2
+
+_WANT_BIAS = {"BUY": "bullish", "SELL": "bearish"}
 
 
 def _rsi_pattern(snap: dict, direction: str) -> dict:
@@ -47,53 +47,43 @@ def _rsi_pattern(snap: dict, direction: str) -> dict:
 
 
 def entry_5m(df, direction: str) -> Optional[dict]:
-    """Final entry trigger on the 5M timeframe.
+    """Read the 5M entry-timeframe structure for `direction` (BUY|SELL).
 
-    Returns a dict with the graded `score` (0-100), its `breakdown`, and the
-    RSI-pattern metadata, or None when a hard gate fails or the score is
-    below MIN_SCORE_5M.
+    Returns a feature dict (never a pass/fail gate):
+
+        direction            — the direction being evaluated
+        bias                 — 5M structural bias
+        aligned              — True when the 5M structure supports `direction`
+        entry_price          — last 5M close (the prospective entry)
+        structure            — full market_structure.analyze output
+        indicators           — secondary-layer snapshot (may be None)
+        rsi_bounce_detected  — RSI bounce/rejection pattern metadata
+
+    Returns None only when the frame is too short to analyze.
     """
     if direction not in ("BUY", "SELL"):
         raise ValueError(f"direction must be BUY or SELL, got {direction!r}")
+    if df is None or len(df) < _MIN_FRAME:
+        return None
 
+    struct = market_structure.analyze(df)
     snap = compute_indicators(df)
-    if snap is None:
-        return None
+    pattern = _rsi_pattern(snap, direction) if snap else {
+        "rsi_trend": False, "rsi_stair": False, "rsi_bounce_detected": False}
+    aligned = struct["bias"] == _WANT_BIAS[direction]
+    entry_price = float(df["close"].iloc[-1])
 
-    try:
-        scored = scoring.score_ltf(snap, direction)
-    except scoring.Rejected as rej:
-        log.debug("5M %s REJECTED — %s", direction, rej)
-        return None
-
-    if scored["score"] < config.MIN_SCORE_5M:
-        log.debug("5M %s REJECTED — score %.1f < %d %s",
-                  direction, scored["score"], config.MIN_SCORE_5M, scored["breakdown"])
-        return None
-
-    pattern = _rsi_pattern(snap, direction)
-    log.debug("5M %s PASSED score=%.1f %s bounce=%s",
-              direction, scored["score"], scored["breakdown"], pattern["rsi_bounce_detected"])
-
-    above = direction == "BUY"
-    checks = {
-        ("price_above_ema21" if above else "price_below_ema21"):
-            snap["close"] > snap["ema21"] if above else snap["close"] < snap["ema21"],
-        ("price_above_vwap" if above else "price_below_vwap"):
-            snap["close"] > snap["vwap"] if above else snap["close"] < snap["vwap"],
-        "rsi_in_range": scored["breakdown"]["rsi"] > 0,
-        "rsi_in_note_band": scored["breakdown"]["rsi"] >= config.W_LTF_RSI,
-        "volume_increasing": scored["breakdown"]["volume"] > 0,
-        ("near_lower_bb" if above else "near_upper_bb"):
-            scored["breakdown"]["bb"] >= config.W_LTF_BB,
-        **pattern,
-    }
+    log.debug("5M %s bias=%s aligned=%s entry=%.6g bounce=%s",
+              direction, struct["bias"], aligned, entry_price,
+              pattern["rsi_bounce_detected"])
 
     return {
         "direction": direction,
-        "score": scored["score"],
-        "score_breakdown": scored["breakdown"],
-        "checks": checks,
-        "rsi_bounce_detected": pattern["rsi_bounce_detected"],
+        "bias": struct["bias"],
+        "aligned": aligned,
+        "entry_price": entry_price,
+        "structure": struct,
         "indicators": snap,
+        "rsi_bounce_detected": pattern["rsi_bounce_detected"],
+        "rsi_pattern": pattern,
     }

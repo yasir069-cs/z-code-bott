@@ -191,6 +191,102 @@ SCAN_MISFIRE_GRACE_SEC = 120
 # into the next 5-minute slot.
 SCAN_DEADLINE_SECONDS = 240
 
+# ==================================================================
+# PRICE-ACTION & MARKET-CONTEXT-FIRST DECISION SYSTEM
+# ==================================================================
+# The block below powers the deterministic decision core (decision.py) and its
+# detectors. Market structure / S-R / liquidity / price-action decide direction
+# and quality; the indicators above are demoted to a bounded SECONDARY
+# confirmation. Every threshold is a named constant here — the detectors carry
+# no magic numbers. NO_TRADE is a valid, preferred output.
+
+# ---- timeframe roles (reuse the existing 1H/15M/5M fetch; roles configurable)
+TF_HTF = "1h"                    # higher-timeframe bias / market context
+TF_SETUP = "15m"                 # setup / structure confirmation
+TF_ENTRY = "5m"                  # entry trigger / execution timeframe
+
+# ---- market structure (fractal swings, HH/HL/LH/LL, BOS, CHoCH, displacement)
+STRUCT_LOOKBACK = 50             # recent candles analysed for structure
+STRUCT_PIVOT_LEFT = 3            # fractal pivot: strictly-higher/lower bars to the left
+STRUCT_PIVOT_RIGHT = 3           # ...and to the right (confirmation lag = RIGHT bars)
+STRUCT_MIN_SWINGS = 4            # need this many swings to classify a trend
+STRUCT_TREND_SWINGS = 4          # swings inspected for the HH/HL vs LH/LL verdict
+STRUCT_ATR_LENGTH = 14           # ATR used for structure/zone tolerances (simple RMA)
+STRUCT_DISPLACEMENT_ATR = 1.5    # body > this * ATR = displacement/impulse candle
+STRUCT_RANGE_ATR = 1.0           # swing span < this * ATR over lookback = range/consolidation
+STRUCT_RETEST_ATR = 0.5         # price within this * ATR of a broken level = retest
+
+# ---- support / resistance (horizontal ZONES = ranges, never single prices)
+SR_LOOKBACK = 50
+SR_CLUSTER_ATR_MULT = 0.5        # levels within this * ATR merge into one zone
+SR_ZONE_PAD_ATR = 0.25           # half-width padding of a zone built from one level
+SR_MIN_TOUCHES = 2               # a zone needs at least this many touches to count
+SR_MAJOR_TOUCHES = 4             # touches >= this -> major zone (else minor)
+SR_PROXIMITY_ATR = 1.0           # price within this * ATR of a zone = "at" the zone
+SR_WICK_BONUS = 0.5              # rejection-wick touches score this extra vs body touches
+SR_MAX_ZONES = 8                 # keep the strongest N zones per side (noise guard)
+
+# ---- liquidity & sweeps (equal highs/lows = stop pools; reclaim + confirm)
+LIQ_EQUAL_TOL_ATR = 0.15         # highs/lows within this * ATR are "equal" (a pool)
+LIQ_MIN_EQUAL = 2                # this many equal extremes = a liquidity pool
+LIQ_RECLAIM_CANDLES = 3          # reclaim of the swept level must occur within N candles
+LIQ_CONFIRM_REQUIRED = True      # MANDATORY post-sweep confirmation candle (no touch-only entries)
+LIQ_CONFIRM_CLOSE_ATR = 0.0      # confirmation close must clear the level by this * ATR
+
+# ---- price action & volume
+PA_REJECTION_WICK_RATIO = 2.0    # dominant wick >= this * body = rejection candle
+PA_ENGULF_MIN_RATIO = 1.0        # engulfing body must exceed the prior body by this factor
+PA_DISPLACEMENT_ATR = 1.5        # body > this * ATR = displacement
+PA_VOLUME_STRONG = 1.5           # volume >= this * avg20 = strong/confirmed
+PA_VOLUME_WEAK = 0.8             # volume <  this * avg20 = weak (no-volume breakout flag)
+PA_BREAKOUT_LOOKBACK = 20        # window whose high/low defines a breakout level
+
+# ---- trendlines / channels (confluence only, never standalone)
+TL_LOOKBACK = 50
+TL_MIN_TOUCHES = 3               # a valid trendline needs at least this many swing touches
+TL_TOLERANCE_ATR = 0.3           # a swing within this * ATR of the line counts as a touch
+TL_MAX_SLOPE_PCT = 0.05          # per-candle slope beyond this % of price = too steep, discard
+TL_BREAK_ATR = 0.25              # close beyond the line by this * ATR = break
+
+# ---- multi-timeframe alignment (MANDATORY)
+MTF_REQUIRE_HTF_ALIGN = True     # entry-TF bias opposing HTF bias -> reject
+MTF_NEUTRAL_HTF_PENALTY = 10     # HTF neutral (range) -> shave this many quality points
+MTF_COUNTER_SETUP_PENALTY = 15   # setup-TF disagrees with HTF -> shave this many points
+
+# ---- crypto-futures context (OI + funding now; basis / L-S ratio flagged for later)
+OI_FETCH_ENABLED = True          # fetch open-interest history per candidate
+OI_HISTORY_TIMEFRAME = "5m"      # OI-history granularity
+OI_HISTORY_LIMIT = 24            # this many OI points -> OI-change-vs-price read
+OI_CHANGE_MIN_PCT = 0.01         # |OI change| below this % is treated as "flat"
+FUNDING_EXTREME_LONG = 0.0010    # funding above this = crowded longs (context, not a gate)
+FUNDING_EXTREME_SHORT = -0.0010  # funding below this = crowded shorts
+BASIS_ENABLED = False            # config-flagged slot: spot-vs-futures basis (not built yet)
+LONG_SHORT_RATIO_ENABLED = False # config-flagged slot: account long/short ratio (not built yet)
+
+# ---- setup quality (primary evidence drives it; indicators are bounded/secondary)
+QUALITY_W_STRUCTURE = 25         # primary-evidence weights (sum below = 100)
+QUALITY_W_SR = 20
+QUALITY_W_LIQUIDITY = 20
+QUALITY_W_PRICE_ACTION = 15
+QUALITY_W_MTF = 10
+QUALITY_W_TRENDLINE = 5
+QUALITY_W_FUTURES = 5
+QUALITY_PRIMARY_FLOOR = 45       # primary score below this -> NO_TRADE (indicators cannot rescue)
+IND_CONFIRM_BONUS_MAX = 10       # aligned indicators add at most this (cannot trigger alone)
+IND_CONFLICT_PENALTY_MAX = 15    # opposing indicators shave at most this (secondary yields)
+QUALITY_MIN = 55                 # final setup-quality gate for a tradable setup
+
+# ---- risk / reward gate (MANDATORY; never bypasses existing sizing limits)
+MIN_RR = 1.5                     # configurable minimum reward:risk
+RISK_SL_BUFFER_ATR = 0.5         # SL placed beyond the structural invalidation by this * ATR
+RISK_MAX_STOP_ATR = 3.0          # stop wider than this * ATR -> NO_TRADE (poor structure)
+RISK_MIN_TARGET_ATR = 1.0        # nearest opposing zone closer than this * ATR -> NO_TRADE
+RISK_MAX_SPREAD_PCT = 0.0015     # spread wider than this (when known) -> NO_TRADE
+RISK_TARGET_ZONE_PAD_ATR = 0.25  # target placed this * ATR short of the opposing zone edge
+
+# ---- decision engine
+DECISION_ENABLED = True          # master switch: price-action core decides (vs legacy funnel)
+
 # ------------------------------------------------------------------ files
 SIGNALS_LOG_FILE = BASE_DIR / "signals_log.csv"
 BOT_LOG_FILE = BASE_DIR / "bot.log"
@@ -199,7 +295,10 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 CSV_COLUMNS = ["timestamp", "coin", "signal", "entry", "SL", "TP", "RR",
                "leverage", "position_size", "funding_rate", "confidence",
                "confluence", "score_1h", "score_15m", "score_5m",
-               "sweep", "sweep_age", "rsi_bounce", "reason", "ai_used"]
+               "sweep", "sweep_age", "rsi_bounce", "reason", "ai_used",
+               # structure-first decision core (Phase 6): the primary evidence
+               "decision", "setup_quality", "htf_bias", "structure",
+               "sr_zone", "liquidity", "no_trade_reason", "data_warnings"]
 
 
 def setup_logging() -> None:

@@ -38,6 +38,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 import alerts
 import config
+import decision as decision_core
 import duplicate_guard
 import filter_15m
 import filter_1h
@@ -49,7 +50,7 @@ import telegram_bot
 import ondemand
 from ai_decision import (AIDecisionError, budget_exhausted_notice,
                          nemotron_decision, nemotron_decisions)
-from fallback import fallback_decision
+from fallback import explanation_fallback, fallback_decision
 
 log = logging.getLogger("main")
 
@@ -57,6 +58,11 @@ log = logging.getLogger("main")
 def _in_session(now_ist: datetime) -> bool:
     hhmm = now_ist.strftime("%H:%M")
     return config.SESSION_START <= hhmm < config.SESSION_END
+
+
+# decision.decide() speaks LONG/SHORT/NO_TRADE; the alert/log/guard layer speaks
+# BUY/SELL/HOLD. Map at this single boundary so everything downstream is unchanged.
+_SIGNAL_MAP = {"LONG": "BUY", "SHORT": "SELL", "NO_TRADE": "HOLD"}
 
 
 def _decide(bundle: dict) -> dict:
@@ -99,63 +105,121 @@ def _calc_position_size(entry: float, sl: float) -> dict:
     return {"qty": round(qty, 6), "value": round(value, 2), "risk_amount": round(risk_amount, 2)}
 
 
-def _build_sig(symbol: str, decision: dict, ctx: dict, confirm: dict, entry: dict,
-               confluence: float, funding_rate, last_price: float) -> dict:
-    """Assemble the alert/log record from a decision + its scored context.
+def _summarize_structure(struct: dict | None) -> str:
+    """Compact one-cell structure label for the CSV / log."""
+    if not struct:
+        return ""
+    label = f"{struct.get('trend', '?')}/{struct.get('bias', '?')}"
+    if struct.get("choch"):
+        label += f" CHoCH-{struct['choch'].get('dir', '')}"
+    elif struct.get("bos"):
+        label += f" BOS-{struct['bos'].get('dir', '')}"
+    return label
 
-    This is where the confidence, indicator block, sweep line and confluence
-    that alerts.format_alert() already knows how to render finally get their
-    data — previously they were computed and then thrown away.
+
+def _fmt_zone(zone: dict | None) -> str:
+    if not zone:
+        return ""
+    tag = "major" if zone.get("major") else "minor"
+    return f"{tag}@{zone.get('mid')}"
+
+
+def _aligned_sweep(liq: dict | None, signal: str) -> dict | None:
+    """The sweep on the side that matters for `signal` (buy-side for a short,
+    sell-side for a long — liquidity.analyze keys them by trade direction)."""
+    if not liq:
+        return None
+    if signal == "BUY":
+        return liq.get("buy_sweep")
+    if signal == "SELL":
+        return liq.get("sell_sweep")
+    return None
+
+
+def _summarize_liquidity(liq: dict | None, signal: str) -> str:
+    if not liq:
+        return ""
+    sweep = _aligned_sweep(liq, signal)
+    if sweep:
+        return f"{sweep.get('side', '')}:{'confirmed' if sweep.get('confirmed') else 'unconfirmed'}"
+    ready = liq.get("long_ready") if signal == "BUY" else liq.get("short_ready")
+    return "ready" if ready else "none"
+
+
+def _build_sig(symbol: str, d: dict, signal: str, snap5: dict | None,
+               rsi_bounce: bool, funding_rate, last_price: float) -> dict:
+    """Assemble the alert/log record from a finished decision.decide() result.
+
+    The deterministic core owns the verdict and every level (entry/SL/TP/RR/
+    setup_quality); this only formats them plus the structured multi-factor
+    evidence for the Telegram alert and the CSV. The reason text is the local
+    structured explanation — when the LLM explanation layer is wired it will
+    replace this string (and set ai_used=True); it can never change the verdict.
     """
-    direction = ctx["direction"]
-    sweep = ctx["sweep"]
-    snap5 = entry["indicators"]
-    vol_avg = snap5.get("volume_avg20") or 0.0
-    vol_ratio = (snap5["volume"] / vol_avg) if vol_avg > 0 else 0.0
+    struct = d.get("structure") or {}
+    sr = d.get("sr") or {}
+    liq = d.get("liquidity") or {}
 
-    # Sweep is required for a FULL-confidence alert (owner's decision): without
-    # one the confidence is capped just below the HIGH band and the alert is
-    # labelled. Applies to both the AI's confidence and the fallback's.
-    confidence = decision.get("confidence")
-    if confidence is None:
-        confidence = confluence
-    confidence = scoring.apply_sweep_confidence_cap(float(confidence), sweep)
+    sweep = _aligned_sweep(liq, signal)
+    quality = float(d.get("setup_quality") or 0.0)
+    # Sweep still governs FULL confidence (owner's rule): no confirmed sweep ->
+    # capped just below the HIGH band, and the alert says so.
+    confidence = scoring.apply_sweep_confidence_cap(quality, sweep)
 
-    bounce = bool(decision.get("rsi_bounce_detected") or entry.get("rsi_bounce_detected"))
-    leverage = _calc_leverage(ctx["indicators"]["atr"], float(last_price))
-    pos = _calc_position_size(decision["entry"], decision.get("sl"))
-    sweep_type = ("bullish" if direction == "BUY" else "bearish") if sweep else ""
+    entry = d.get("entry")
+    atr = float(struct.get("atr") or 0.0)
+    leverage = _calc_leverage(atr, float(last_price or entry or 0.0))
+    pos = _calc_position_size(entry or 0.0, d.get("sl"))
+
+    opp_zone = (sr.get("nearest_resistance") if signal == "BUY"
+                else sr.get("nearest_support") if signal == "SELL" else None)
+
+    ind_block = {}
+    if snap5:
+        vol_avg = snap5.get("volume_avg20") or 0.0
+        ind_block = {
+            "rsi_now": snap5.get("rsi"),
+            "rsi_prev": snap5.get("rsi_prev"),
+            "price_above_ema": snap5.get("close", 0) > snap5.get("ema21", 0),
+            "price_above_vwap": snap5.get("close", 0) > snap5.get("vwap", 0),
+            "volume_ratio": (snap5["volume"] / vol_avg) if vol_avg > 0 else 0.0,
+        }
+
+    sweep_type = ("bullish" if signal == "BUY" else "bearish") if sweep else ""
 
     return {
         "coin": symbol,
-        "signal": decision["signal"],
-        "entry": decision["entry"],
-        "SL": decision["sl"],
-        "TP": decision["tp"],
-        "RR": decision["rr"],
+        "signal": signal,
+        "entry": entry,
+        "SL": d.get("sl"),
+        "TP": d.get("tp"),
+        "RR": d.get("rr"),
         "leverage": leverage,
         "position_size": pos["value"],
         "funding_rate": funding_rate,
         "confidence": round(float(confidence), 1),
-        "confluence": confluence,
-        "score_1h": ctx["score"],
-        "score_15m": confirm["score"],
-        "score_5m": entry["score"],
+        "confluence": round(quality, 1),
+        "score_1h": None,          # per-TF indicator scores retired (structure decides)
+        "score_15m": None,
+        "score_5m": None,
         # dict for the Telegram alert; logger coerces it to a scalar for the CSV
         "sweep": {"detected": sweep is not None, "type": sweep_type,
                   "age": (sweep or {}).get("age_candles")},
         "sweep_age": (sweep or {}).get("age_candles", ""),
-        "rsi_bounce": bounce,
-        "rsi_bounce_detected": bounce,
-        "indicators": {
-            "rsi_now": snap5["rsi"],
-            "rsi_prev": snap5["rsi_prev"],
-            "price_above_ema": snap5["close"] > snap5["ema21"],
-            "price_above_vwap": snap5["close"] > snap5["vwap"],
-            "volume_ratio": vol_ratio,
-        },
-        "reason": decision["reason"],
-        "ai_used": decision["ai_used"],
+        "rsi_bounce": bool(rsi_bounce),
+        "rsi_bounce_detected": bool(rsi_bounce),
+        "indicators": ind_block,
+        "reason": explanation_fallback(d),
+        "ai_used": False,
+        # --- structure-first decision evidence (new CSV columns) ---
+        "decision": d.get("decision"),
+        "setup_quality": round(quality, 1),
+        "htf_bias": d.get("htf_bias"),
+        "structure": _summarize_structure(struct),
+        "sr_zone": _fmt_zone(opp_zone),
+        "liquidity": _summarize_liquidity(liq, signal),
+        "no_trade_reason": ", ".join(d.get("no_trade_reasons") or []),
+        "data_warnings": ", ".join(d.get("data_warnings") or []),
     }
 
 
@@ -192,15 +256,15 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
                "funding_rejected": 0, "duplicates": 0, "gate_rejected": 0,
                "ai_used": 0, "signals": 0, "holds": 0}
 
-    # --- STEP 1+2: batch-fetch 1H for every symbol, then grade the context ---
+    # --- STEP 1+2: batch-fetch 1H for every symbol; structure funnel ---
     frames_1h = scanner.fetch_timeframe_batch(symbols, "1h", deadline=deadline)
-    candidates = []  # survivors of 1H + funding + duplicate guard
+    candidates = []  # survivors of the 1H structure funnel + funding + duplicate guard
     for symbol, df_1h in frames_1h.items():
-        ctx = filter_1h.analyze_1h(df_1h)
-        if ctx is None:
-            continue
+        feat = filter_1h.analyze_1h(df_1h)
+        if feat is None or feat["direction"] is None:
+            continue                       # ranging / undecided HTF -> not worth LTF fetch
         summary["pass_1h"] += 1
-        direction = ctx["direction"]
+        direction = feat["direction"]
 
         # STEP 3: funding rate — reject when the market is overleveraged
         fr = funding_rates.get(symbol)
@@ -216,111 +280,87 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
                 summary["funding_rejected"] += 1
                 continue
 
-        # STEP 4: duplicate guard FIRST — a cooling-down coin costs zero 15M/5M fetches
+        # STEP 4: duplicate guard FIRST — a cooling-down coin costs zero LTF fetches
         if guard.is_duplicate(symbol, now_ist):
             summary["duplicates"] += 1
             log.debug("%s: duplicate within cooldown - skipped before LTF fetch", symbol)
             continue
 
-        candidates.append({"symbol": symbol, "direction": direction, "ctx": ctx, "fr": fr})
+        candidates.append({"symbol": symbol, "direction": direction,
+                           "df_1h": df_1h, "fr": fr})
 
-    # --- STEP 5a: batch-fetch 15M for the survivors, confirm the direction ---
+    # --- STEP 5a: batch-fetch 15M (setup TF) for the survivors ---
     frames_15m = scanner.fetch_timeframe_batch([c["symbol"] for c in candidates], "15m",
                                                deadline=deadline)
-    confirmed = []
+    with_15m = []
     for c in candidates:
         df_15m = frames_15m.get(c["symbol"])
-        confirm = None if df_15m is None else filter_15m.confirm_15m(df_15m, c["direction"])
-        if confirm is None:
+        if df_15m is None:
             continue
         summary["pass_15m"] += 1
-        c["confirm"] = confirm
-        confirmed.append(c)
+        c["df_15m"] = df_15m
+        with_15m.append(c)
 
-    # --- STEP 5b: batch-fetch 5M for the survivors, gate on confluence ---
-    frames_5m = scanner.fetch_timeframe_batch([c["symbol"] for c in confirmed], "5m",
+    # --- STEP 5b: batch-fetch 5M (entry TF); run the decision core over all 3 TFs ---
+    frames_5m = scanner.fetch_timeframe_batch([c["symbol"] for c in with_15m], "5m",
                                               deadline=deadline)
-    bundles = []
-    meta: dict[str, dict] = {}
-    for c in confirmed:
+    decided = []   # (setup_quality, signal, sig, symbol) for ranked emission
+    for c in with_15m:
         df_5m = frames_5m.get(c["symbol"])
-        entry = None if df_5m is None else filter_5m.entry_5m(df_5m, c["direction"])
-        if entry is None:
+        if df_5m is None:
             continue
         summary["pass_5m"] += 1
+        symbol, direction, fr = c["symbol"], c["direction"], c["fr"]
 
-        ctx, confirm = c["ctx"], c["confirm"]
-        conf = scoring.confluence(ctx["score"], confirm["score"], entry["score"])
-        if not scoring.passes_gates(ctx["score"], confirm["score"], entry["score"], conf):
+        # entry-TF features: the 5M snapshot + RSI-bounce badge (never gates)
+        entry_feat = filter_5m.entry_5m(df_5m, direction)
+        snap5 = (entry_feat or {}).get("indicators")
+        rsi_bounce = bool((entry_feat or {}).get("rsi_bounce_detected"))
+
+        # crypto-futures context: OI history (safe-degrade to None past the deadline)
+        oi_df = None
+        if config.OI_FETCH_ENABLED and time.monotonic() < deadline:
+            oi_df = scanner.fetch_open_interest_history(
+                exchange, symbol, config.OI_HISTORY_TIMEFRAME, config.OI_HISTORY_LIMIT)
+
+        # THE decision: deterministic core over HTF/setup/entry frames.
+        frames = {config.TF_HTF: c["df_1h"], config.TF_SETUP: c["df_15m"],
+                  config.TF_ENTRY: df_5m}
+        d = decision_core.decide(frames, funding_rate=fr, oi_df=oi_df)
+
+        signal = _SIGNAL_MAP.get(d["decision"], "HOLD")
+        last_price = ((tickers_last or {}).get(symbol) or d.get("entry")
+                      or (snap5 or {}).get("close"))
+        sig = _build_sig(symbol, d, signal, snap5, rsi_bounce, fr, last_price)
+
+        if signal == "HOLD":
             summary["gate_rejected"] += 1
-            log.info("%s: rejected on confluence %.1f (1H %.0f/15M %.0f/5M %.0f)",
-                     c["symbol"], conf, ctx["score"], confirm["score"], entry["score"])
-            continue
+            log.info("%s: NO_TRADE — %s (quality=%.0f)", symbol,
+                     ", ".join(d["no_trade_reasons"]) or "insufficient confluence",
+                     d.get("setup_quality") or 0.0)
+        decided.append((float(d.get("setup_quality") or 0.0), signal, sig, symbol))
 
-        last_price = (tickers_last or {}).get(c["symbol"]) or entry["indicators"]["close"]
-        bundles.append({
-            "symbol": c["symbol"],
-            "direction": c["direction"],
-            "current_price": float(last_price),
-            "entry_price": entry["indicators"]["close"],
-            "ind_1h": ctx["indicators"],
-            "sweep": ctx["sweep"],
-            "ind_15m": confirm["indicators"],
-            "ind_5m": entry["indicators"],
-            "confirm_score": confirm["score"],
-            "score_1h": ctx["score"],
-            "score_15m": confirm["score"],
-            "score_5m": entry["score"],
-            "confluence": conf,
-            "score_breakdown_1h": ctx["score_breakdown"],
-            "rsi_bounce_detected": entry.get("rsi_bounce_detected", False),
-        })
-        meta[c["symbol"]] = {"ctx": ctx, "confirm": confirm, "entry": entry,
-                             "fr": c["fr"], "confluence": conf, "last_price": last_price}
-
-    # --- STEP 6: ONE batched AI request for the whole scan; fallback per coin ---
-    if not bundles:
+    if not decided:
         log.info("Scan complete: %s", summary)
         return summary
 
-    if time.monotonic() >= deadline:
-        log.warning("Scan hit the %ds deadline before the AI stage — %d candidate(s) "
-                    "use the Python fallback", config.SCAN_DEADLINE_SECONDS, len(bundles))
-        alerts.send_telegram_text(
-            f"⚠️ <b>Scan hit the {config.SCAN_DEADLINE_SECONDS}s deadline</b> before the AI "
-            f"stage; {len(bundles)} setup(s) fell back to indicator-only logic (still on time).")
-        ai_results = {}
-    else:
-        ai_results = nemotron_decisions(bundles, deadline=deadline)
-
-    notice = budget_exhausted_notice()
-    if notice:
-        alerts.send_telegram_text(f"⚠️ <b>{notice}</b>")
-
-    # --- STEP 7-9: build the full record, alert (BUY/SELL) and log every signal ---
-    for bundle in bundles:
-        symbol = bundle["symbol"]
-        m = meta[symbol]
-        decision = ai_results.get(symbol)
-        if decision is None:
-            decision = fallback_decision(bundle)
-        else:
-            summary["ai_used"] += 1
-
-        sig = _build_sig(symbol, decision, m["ctx"], m["confirm"], m["entry"],
-                         m["confluence"], m["fr"], m["last_price"])
-
-        if sig["signal"] == "HOLD":
-            logger.log_signal(sig)          # HOLD: logged, no alert, no cooldown
+    # --- STEP 6-9: rank by setup-quality; alert (BUY/SELL) + log every signal ---
+    # Strongest setups first so the best alerts lead the session; NO_TRADE (HOLD)
+    # rows are logged silently. The LLM explanation layer (optional, cosmetic) is
+    # not called here — the reason text is the local structured explanation.
+    decided.sort(key=lambda t: t[0], reverse=True)
+    for _quality, signal, sig, symbol in decided:
+        if signal == "HOLD":
+            logger.log_signal(sig)          # NO_TRADE: logged, no alert, no cooldown
             summary["holds"] += 1
         else:
-            sent = alerts.send_alert(sig)   # STEP 8 (failure logged, bot continues)
-            logger.log_signal(sig)          # STEP 9
+            sent = alerts.send_alert(sig)   # failure logged, bot continues
+            logger.log_signal(sig)
             summary["signals"] += 1
-            log.info("%s %s alert_sent=%s entry=%.6g sl=%.6g tp=%.6g rr=%.2f conf=%.0f "
-                     "lev=%s pos=$%.2f ai=%s", symbol, sig["signal"], sent, sig["entry"],
+            log.info("%s %s alert_sent=%s entry=%.6g sl=%.6g tp=%.6g rr=%s conf=%.0f "
+                     "lev=%s pos=$%.2f", symbol, signal, sent, sig["entry"],
                      sig["SL"], sig["TP"], sig["RR"], sig["confidence"], sig["leverage"],
-                     sig["position_size"], sig["ai_used"])
+                     sig["position_size"])
             guard.record(symbol, now_ist)   # cooldown only for BUY/SELL, not HOLD
 
     log.info("Scan complete: %s", summary)

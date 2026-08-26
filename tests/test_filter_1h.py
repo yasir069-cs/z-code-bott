@@ -1,15 +1,17 @@
-"""Phase 4 tests — 1H context classification (monkeypatched indicator
-snapshot so the filter logic itself is under test; sweep uses real candles).
+"""1H feature-extractor tests (structure-first rework) + the retained scoring
+unit tests.
 
-Grading model (strategy_spec.md): EMA21 / VWAP / RSI-band / overbought /
-squeeze / zone are HARD gates that drop the coin; zone, RSI, volume, BB and
-sweep are graded into a 0-100 score that must clear MIN_SCORE_1H.
+`filter_1h.analyze_1h` is no longer an indicator gate that *chooses* the trade
+direction — it is a thin structure reader that returns a directional funnel hint
+(BUY / SELL / None) from the 1H market structure. Indicators are attached as
+context only and can never gate here; the authoritative verdict is
+``decision.decide()``'s. The first block below asserts that behaviour.
 
-Note on the fixture bandwidth: (101.5 - 99.2) / 100 = 0.023. Until the
-server's BB_BANDWIDTH_MIN = 0.015 was adopted, the shipped 0.025 rejected
-EVERY frame here as a squeeze, so the "fails when X" tests below passed
-without ever exercising X. They assert the real reason now.
+`scoring.py` is KEPT intact as the bounded secondary indicator-confirmation
+layer, so its component unit tests (zone / rsi / sweep / confluence / gates)
+are preserved verbatim in the second block.
 """
+import numpy as np
 import pytest
 
 import config
@@ -18,24 +20,72 @@ import scoring
 from conftest import make_candles
 
 
-def _snap(**over):
-    base = dict(
-        timestamp=None, open=100.0, high=101.0, low=99.0, close=100.5,
-        volume=1500.0, volume_prev=1000.0, volume_avg20=1000.0,
-        volume_trend=[1000, 1100, 1200, 1300, 1500],
-        rsi=55.0, rsi_prev=51.0, rsi_history=[48, 50, 55, 51, 56],
-        ema21=99.0, vwap=99.5,
-        bb_lower=99.2, bb_mid=100.0, bb_upper=101.5,
-        atr=1.0,
-        range_high=110.0, range_low=99.0, range_pos=0.14,
-        swing_low_20=99.0, swing_high_20=110.0,
-    )
-    base.update(over)
-    return base
+# --------------------------------------------------------------------------- helpers
+def _zig(controls, seg=5):
+    """Piecewise-linear close series through `controls` (each leg `seg` candles)."""
+    closes = []
+    for a, b in zip(controls[:-1], controls[1:]):
+        closes.extend(np.linspace(a, b, seg, endpoint=False))
+    closes.append(controls[-1])
+    return closes
 
 
-def _frame_with_bullish_sweep():
-    import numpy as np
+# Proven structure fixtures (mirrors test_decision): clean HH/HL, LH/LL, and flat.
+UP = [130, 126, 131, 101, 107, 104, 110, 107, 112, 111, 112.5]
+DOWN = [100, 104, 99, 129, 123, 126, 120, 123, 118, 119, 117.5]
+RANGE = [100, 101, 99, 100.5, 99.5, 100.5, 99.5, 100.5, 99.5, 100.5, 99.5]
+
+
+# --------------------------------------------------- analyze_1h feature extractor
+def test_analyze_1h_reports_bullish_direction():
+    feat = filter_1h.analyze_1h(make_candles(_zig(UP), wick=0.3))
+    assert feat is not None
+    assert feat["direction"] == "BUY"      # funnel hint, driven by STRUCTURE
+    assert feat["bias"] == "bullish"
+    assert feat["structure"]["trend"] == "uptrend"
+    # context attached, never gating
+    assert "sweep" in feat and "indicators" in feat
+
+
+def test_analyze_1h_reports_bearish_direction():
+    feat = filter_1h.analyze_1h(make_candles(_zig(DOWN), wick=0.3))
+    assert feat is not None
+    assert feat["direction"] == "SELL"
+    assert feat["bias"] == "bearish"
+
+
+def test_analyze_1h_ranging_has_no_direction():
+    """A structure-neutral frame yields no funnel hint — a skip, not a crash."""
+    feat = filter_1h.analyze_1h(make_candles(_zig(RANGE), wick=0.2))
+    assert feat is not None
+    assert feat["direction"] is None
+
+
+def test_analyze_1h_too_short_is_none():
+    short = make_candles(_zig(UP), wick=0.3).head(
+        config.STRUCT_PIVOT_LEFT + config.STRUCT_PIVOT_RIGHT)
+    assert filter_1h.analyze_1h(short) is None
+
+
+def test_analyze_1h_indicators_do_not_gate(monkeypatch):
+    """The old hard gates (RSI/EMA/VWAP/zone) are gone: even with the indicator
+    snapshot degraded to None, a bullish STRUCTURE still produces the BUY funnel
+    hint. Structure decides the hint; indicators are only attached context."""
+    monkeypatch.setattr(filter_1h, "compute_indicators", lambda _df: None)
+    feat = filter_1h.analyze_1h(make_candles(_zig(UP), wick=0.3))
+    assert feat["direction"] == "BUY"      # structure alone drove the hint
+    assert feat["indicators"] is None      # snapshot degraded, no gate fired
+
+
+def test_analyze_1h_sweep_is_direction_aligned():
+    """When a hint exists, the attached sweep (if any) is on that direction."""
+    feat = filter_1h.analyze_1h(make_candles(_zig(UP), wick=0.3))
+    if feat["sweep"] is not None:
+        assert feat["sweep"]["direction"] == "BUY"
+
+
+def test_detect_sweep_still_finds_a_manual_bullish_sweep():
+    """detect_sweep is unchanged and still reused by liquidity.py + the core."""
     n = 40
     closes = 100 + np.sin(np.arange(n) * 0.7) * 0.5
     df = make_candles(closes, vol_base=1000.0, vol_spread=0.0, wick=0.2, seed=1,
@@ -46,139 +96,15 @@ def _frame_with_bullish_sweep():
     df.iloc[-1, df.columns.get_loc("low")] = swing - 1.5
     df.iloc[-1, df.columns.get_loc("close")] = swing + 0.25
     df.iloc[-1, df.columns.get_loc("volume")] = 2500.0
-    return df
-
-
-@pytest.fixture
-def patch_ind(monkeypatch):
-    def _patch(snap):
-        monkeypatch.setattr(filter_1h, "compute_indicators", lambda df: snap)
-    return _patch
-
-
-def test_buy_context_passes(patch_ind):
-    patch_ind(_snap())
-    ctx = filter_1h.analyze_1h(_frame_with_bullish_sweep())
-    assert ctx is not None
-    assert ctx["direction"] == "BUY"
-    assert all(ctx["checks"].values())
-
-
-def test_buy_context_passes_with_sweep(patch_ind):
-    patch_ind(_snap())
-    ctx = filter_1h.analyze_1h(_frame_with_bullish_sweep())
-    assert ctx is not None
-    assert ctx["sweep"] is not None
-    assert ctx["sweep"]["direction"] == "BUY"
-
-
-def test_context_fails_when_rsi_below_min(patch_ind):
-    patch_ind(_snap(rsi=38.0))  # below the BUY tolerance min (45)
-    assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
-
-
-def test_context_fails_when_rsi_above_max(patch_ind):
-    """RSI past RSI_OVERBOUGHT is a hard gate — reversal-trap risk."""
-    patch_ind(_snap(rsi=79.0, rsi_prev=72.0))  # above RSI_OVERBOUGHT (78)
-    assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
-
-
-def test_rsi_outside_tolerance_band_is_rejected():
-    """Outside the tolerance band is a hard gate, not a reduced score."""
-    with pytest.raises(scoring.Rejected) as err:
-        scoring.rsi_score(81.0, 78.0, "BUY", config.W_1H_RSI)
-    assert err.value.code == scoring.REJECT_RSI_BAND
-
-
-def test_rsi_in_note_band_scores_more_than_tolerance_band():
-    """The note's 50-70 scores full; the wider band that production ran scores half."""
-    note = scoring.rsi_score(55.0, 51.0, "BUY", config.W_1H_RSI)
-    tol = scoring.rsi_score(47.0, 46.0, "BUY", config.W_1H_RSI)
-    assert note == config.W_1H_RSI
-    assert tol == pytest.approx(config.W_1H_RSI * config.RSI_TOL_FRACTION)
-    assert note > tol
-
-
-def test_context_fails_when_rsi_falling(patch_ind):
-    patch_ind(_snap(rsi=55.0, rsi_prev=60.0))  # dropping
-    assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
-
-
-def test_context_fails_below_ema(patch_ind):
-    patch_ind(_snap(ema21=101.0))  # price 100.5 < ema21 101.0
-    assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
-
-
-def test_context_fails_below_vwap(patch_ind):
-    patch_ind(_snap(vwap=101.0))  # price 100.5 < vwap 101.0
-    assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
-
-
-def test_falling_volume_scores_zero_but_does_not_reject(patch_ind):
-    """Sanctioned deviation: volume is graded, not a gate. Below the previous
-    candle AND below the 20-candle average scores 0 — the coin survives on the
-    strength of the other conditions, at a reduced score."""
-    patch_ind(_snap(volume=900.0, volume_prev=1000.0, volume_avg20=1000.0))
-    ctx = filter_1h.analyze_1h(_frame_with_bullish_sweep())
-    assert ctx is not None
-    assert ctx["score_breakdown"]["volume"] == 0.0
-    assert ctx["checks"]["volume_increasing"] is False
-
-    # Same frame, full-volume snapshot: the only delta must be the volume weight.
-    patch_ind(_snap())
-    full = filter_1h.analyze_1h(_frame_with_bullish_sweep())
-    assert ctx["score"] == full["score"] - config.W_1H_VOLUME
-
-
-def test_far_from_lower_bb_scores_zero_but_does_not_reject(patch_ind):
-    """Sanctioned deviation: Bollinger is one graded voice, not a gate.
-    Price above the mid-line scores 0 for BB."""
-    patch_ind(_snap(bb_lower=95.0, bb_mid=96.0, bb_upper=101.5))
-    ctx = filter_1h.analyze_1h(_frame_with_bullish_sweep())
-    assert ctx is not None
-    assert ctx["score_breakdown"]["bb"] == 0.0
-    assert ctx["checks"]["near_lower_bb"] is False
-
-
-def test_context_passes_without_sweep(patch_ind):
-    """Sweep is optional — context passes and sweep is None."""
-    import numpy as np
-    n = 40
-    closes = 100 + np.sin(np.arange(n) * 0.7) * 0.5
-    frame_no_sweep = make_candles(closes, vol_base=1000.0, vol_spread=0.0, seed=1,
-                                  volumes=np.full(n, 1000.0))
-    patch_ind(_snap())
-    ctx = filter_1h.analyze_1h(frame_no_sweep)
-    assert ctx is not None
-    assert ctx["direction"] == "BUY"
-    assert ctx["sweep"] is None
-
-
-def test_sell_context_passes(patch_ind, monkeypatch):
-    import numpy as np
-    n = 40
-    closes = 100 + np.sin(np.arange(n) * 0.7) * 0.5
-    frame = make_candles(closes, vol_base=1000.0, vol_spread=0.0, wick=0.2, seed=1,
-                         volumes=np.full(n, 1000.0))
-    swing_high = frame["high"].iloc[-21:-1].max()
-    frame.iloc[-1, frame.columns.get_loc("open")] = swing_high - 0.2
-    frame.iloc[-1, frame.columns.get_loc("low")] = swing_high - 0.3
-    frame.iloc[-1, frame.columns.get_loc("high")] = swing_high + 1.5
-    frame.iloc[-1, frame.columns.get_loc("close")] = swing_high - 0.25
-    frame.iloc[-1, frame.columns.get_loc("volume")] = 2500.0
-
-    patch_ind(_snap(range_pos=0.88, rsi=42.0, rsi_prev=47.0, rsi_history=[55, 50, 42, 46, 41],
-                    ema21=102.0, vwap=101.5, bb_upper=101.0, bb_lower=98.0, bb_mid=99.5,
-                    low=100.2, high=101.0, close=100.8, open=100.85))
-    ctx = filter_1h.analyze_1h(frame)
-    assert ctx is not None
-    assert ctx["direction"] == "SELL"
+    sweep = filter_1h.detect_sweep(df, "BUY")
+    assert sweep is not None
+    assert sweep["direction"] == "BUY"
 
 
 # ------------------------------------------------------- zone (the note's core)
 # "Bottom to inbetween" for BUY / "Top to inbetween" for SELL. This check did
 # not exist before the reconstruction: a coin at the TOP of its range could
-# alert as a BUY.
+# alert as a BUY. Kept as a scoring unit test — scoring is the secondary layer.
 
 @pytest.mark.parametrize("range_pos,expected", [
     (0.00, 25.00),   # very bottom          -> full
@@ -215,16 +141,27 @@ def test_zone_score_sell_rejects_wrong_half(range_pos):
     assert err.value.code == scoring.REJECT_ZONE
 
 
-def test_buy_at_top_of_range_is_rejected(patch_ind):
-    """The regression this whole check exists to prevent."""
-    patch_ind(_snap(range_pos=0.95))
-    assert filter_1h.analyze_1h(_frame_with_bullish_sweep()) is None
-
-
 def test_zone_taper_is_monotonic():
     """No jump in the "inbetween" band — deeper is always worth at least as much."""
     scores = [scoring.zone_score(p / 100.0, "BUY") for p in range(0, 61)]
     assert all(a >= b for a, b in zip(scores, scores[1:]))
+
+
+# ------------------------------------------------------------------- rsi scoring
+def test_rsi_outside_tolerance_band_is_rejected():
+    """Outside the tolerance band is a hard gate, not a reduced score."""
+    with pytest.raises(scoring.Rejected) as err:
+        scoring.rsi_score(81.0, 78.0, "BUY", config.W_1H_RSI)
+    assert err.value.code == scoring.REJECT_RSI_BAND
+
+
+def test_rsi_in_note_band_scores_more_than_tolerance_band():
+    """The note's 50-70 scores full; the wider band that production ran scores half."""
+    note = scoring.rsi_score(55.0, 51.0, "BUY", config.W_1H_RSI)
+    tol = scoring.rsi_score(47.0, 46.0, "BUY", config.W_1H_RSI)
+    assert note == config.W_1H_RSI
+    assert tol == pytest.approx(config.W_1H_RSI * config.RSI_TOL_FRACTION)
+    assert note > tol
 
 
 # ------------------------------------------------------------- sweep weighting

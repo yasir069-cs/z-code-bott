@@ -273,3 +273,71 @@ def passes_gates(score_1h_val: float, score_15m_val: float, score_5m_val: float,
             and score_15m_val >= config.MIN_SCORE_15M
             and score_5m_val >= config.MIN_SCORE_5M
             and total >= config.MIN_CONFLUENCE)
+
+
+# --------------------------------------------------- secondary indicator layer
+
+def indicator_confirmation(snap: Optional[dict], direction: str, cfg=config) -> dict:
+    """SECONDARY indicator agreement with an already-decided direction.
+
+    In the price-action-first system indicators no longer gate or choose a
+    trade. This function is the whole of their remaining role: given a direction
+    the primary layers already produced, it reports how much the indicators
+    *agree*, as a net score in [-1, +1] (positive = confirmation). It NEVER
+    raises and NEVER decides — setup_quality maps the net onto a bounded
+    confirmation bonus / conflict penalty, so indicators can neither trigger nor
+    veto an entry on their own.
+
+    `direction` accepts either the primary vocabulary (LONG/SHORT) or the legacy
+    BUY/SELL.
+    """
+    if snap is None:
+        return {"score": 0.0, "agrees": False, "checks": {},
+                "notes": ["no_indicator_snapshot"]}
+
+    bull = direction in ("BUY", "LONG", "bullish")
+    checks: dict[str, int] = {}
+    notes: list[str] = []
+
+    def mark(name: str, agree: bool, disagree: bool, msg_ok: str, msg_no: str) -> None:
+        if agree:
+            checks[name] = 1
+            notes.append(msg_ok)
+        elif disagree:
+            checks[name] = -1
+            notes.append(msg_no)
+        else:
+            checks[name] = 0
+
+    close = snap["close"]
+    mark("ema21", close > snap["ema21"] if bull else close < snap["ema21"],
+         close < snap["ema21"] if bull else close > snap["ema21"],
+         "price on trend side of EMA21", "price against EMA21")
+    mark("vwap", close > snap["vwap"] if bull else close < snap["vwap"],
+         close < snap["vwap"] if bull else close > snap["vwap"],
+         "price on trend side of VWAP", "price against VWAP")
+
+    rising = snap["rsi"] > snap["rsi_prev"]
+    mark("rsi_trend", rising if bull else not rising,
+         (not rising) if bull else rising,
+         "RSI momentum aligns", "RSI momentum opposes")
+
+    if bull:
+        mark("rsi_extreme", snap["rsi"] <= cfg.RSI_OVERBOUGHT, snap["rsi"] > cfg.RSI_OVERBOUGHT,
+             "RSI not overbought", "RSI overbought")
+        mark("bb", close <= snap["bb_mid"], close >= snap["bb_upper"],
+             "price in lower half of Bollinger", "price at upper Bollinger band")
+    else:
+        mark("rsi_extreme", snap["rsi"] >= cfg.RSI_OVERSOLD, snap["rsi"] < cfg.RSI_OVERSOLD,
+             "RSI not oversold", "RSI oversold")
+        mark("bb", close >= snap["bb_mid"], close <= snap["bb_lower"],
+             "price in upper half of Bollinger", "price at lower Bollinger band")
+
+    if snap["volume"] > snap["volume_prev"]:
+        checks["volume"] = 1
+        notes.append("volume rising")
+    else:
+        checks["volume"] = 0
+
+    net = sum(checks.values()) / len(checks) if checks else 0.0
+    return {"score": round(net, 3), "agrees": net > 0, "checks": checks, "notes": notes}

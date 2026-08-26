@@ -445,3 +445,57 @@ def fetch_funding_rates(exchange: ccxt.Exchange) -> dict[str, float]:
                 _backoff_sleep(attempt)
     log.error("Funding rate fetch failed after %d attempts, continuing without", config.FETCH_RETRY_MAX)
     return {}
+
+
+def fetch_open_interest_history(exchange: ccxt.Exchange, symbol: str,
+                                timeframe: str = config.OI_HISTORY_TIMEFRAME,
+                                limit: int = config.OI_HISTORY_LIMIT) -> Optional[pd.DataFrame]:
+    """Fetch recent open-interest history for one symbol (futures context).
+
+    Returns a DataFrame indexed by UTC timestamp with a single ``oi`` column
+    (open-interest amount, base units), oldest→newest, or ``None`` when OI is
+    disabled, unsupported, or every retry fails. Open interest is *contextual*:
+    a missing value must degrade the decision safely (no fabricated data), so
+    callers treat ``None`` as "OI unavailable", never as zero.
+
+    Only called for the handful of symbols that reach the decision stage, so a
+    per-symbol call here is cheap — no market-wide OI sweep.
+    """
+    if not config.OI_FETCH_ENABLED:
+        return None
+    if not exchange.has.get("fetchOpenInterestHistory"):
+        return None
+
+    for attempt in range(1, config.FETCH_RETRY_MAX + 1):
+        try:
+            _bucket.acquire()
+            rows = exchange.fetch_open_interest_history(symbol, timeframe=timeframe, limit=limit)
+            if not rows:
+                return None
+            recs = []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                ts = r.get("timestamp")
+                # ccxt normalises to openInterestAmount (base) / openInterestValue (quote);
+                # fall back to the raw info payload when a key is absent.
+                oi = r.get("openInterestAmount")
+                if oi is None:
+                    info = r.get("info") or {}
+                    oi = info.get("sumOpenInterest") or info.get("openInterest")
+                if ts is None or oi is None:
+                    continue
+                recs.append((ts, float(oi)))
+            if not recs:
+                return None
+            df = pd.DataFrame(recs, columns=["timestamp", "oi"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            return df.set_index("timestamp").sort_index()
+        except (ccxt.RateLimitExceeded, ccxt.NetworkError, ccxt.ExchangeError) as exc:
+            log.warning("%s: OI-history fetch attempt %d/%d failed: %s",
+                        symbol, attempt, config.FETCH_RETRY_MAX, exc)
+            if attempt < config.FETCH_RETRY_MAX:
+                _backoff_sleep(attempt)
+    log.warning("%s: OI-history fetch failed after %d attempts, continuing without",
+                symbol, config.FETCH_RETRY_MAX)
+    return None
