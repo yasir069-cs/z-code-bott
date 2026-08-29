@@ -204,4 +204,81 @@ def decide(frames: dict, funding_rate: Optional[float] = None,
         "rr": risk["rr"],
         "no_trade_reasons": reasons,
         "data_warnings": warnings,
+        # indicator snapshots by role, exposed so the LLM decision stage gets
+        # the full structured data and a flipped direction can be re-scored
+        # without re-fetching anything
+        "snaps": {"1h": htf_snap, "15m": snap, "5m": entry_snap},
     }
+
+
+def rescore_direction(d: dict, direction: str, cfg=config) -> dict:
+    """Re-run every deterministic gate for a DIFFERENT direction on the same evidence.
+
+    The LLM decision stage may return a direction opposite to the one the
+    structure proposed. Before that verdict can stand, the same validation the
+    core applies — directional confirmation, risk/reward (stop width, target
+    distance, structure stop), setup quality with all exhaustion penalties —
+    must pass for the NEW direction. An LLM opinion never bypasses a gate.
+
+    Returns a decision dict shaped like decide()'s with the flipped direction
+    (decision becomes NO_TRADE when any gate rejects it). Pure: reuses the
+    evidence and snapshots stored in `d`.
+    """
+    if direction not in ("LONG", "SHORT") or direction == d.get("direction"):
+        return d
+
+    snaps = d.get("snaps") or {}
+    mtf = d.get("mtf") or {}
+    structure = d.get("structure") or {}
+    sr = d.get("sr") or {}
+    liq = d.get("liquidity") or {}
+    pa = d.get("price_action") or {}
+    tl = d.get("trendline") or {}
+    futures = d.get("futures") or {}
+    indicator_conf = d.get("indicators") or {}
+    entry = d.get("entry")
+    atr = structure.get("atr") or (sr or {}).get("atr")
+
+    # HTF alignment for the NEW direction (mtf.combine's counter_htf was
+    # computed for the original one)
+    want_bias = "bullish" if direction == "LONG" else "bearish"
+    htf_bias = mtf.get("htf_bias", "neutral")
+    counter = htf_bias not in (want_bias, "neutral")
+
+    dir_check = direction_gate.confirm(direction, snaps.get("1h"), snaps.get("15m"),
+                                       snaps.get("5m"), structure, liq, mtf, cfg)
+    risk = risk_gate.evaluate(direction, entry, structure, sr, atr, cfg)
+    quality = setup_quality.score(direction, structure, sr, liq, pa, mtf, tl,
+                                  futures, indicator_conf, cfg,
+                                  htf_snap=snaps.get("1h"), risk=risk,
+                                  direction_factor=dir_check["factor"],
+                                  direction_reasons=dir_check["reasons"])
+
+    reasons: list[str] = []
+    if cfg.MTF_REQUIRE_HTF_ALIGN and counter:
+        reasons.append("counter_htf")
+    if dir_check["status"] == "conflict":
+        reasons.append("directional_conflict")
+    if not quality["primary_floor_ok"]:
+        reasons.append("insufficient_primary_evidence")
+    elif not quality["passes"]:
+        reasons.append("low_setup_quality")
+    if not risk["ok"]:
+        reasons.extend(risk["reasons"])
+
+    out = dict(d)
+    out.update({
+        "direction": direction,
+        "decision": direction if not reasons else "NO_TRADE",
+        "setup_quality": quality["quality"],
+        "confidence": quality["quality"],
+        "primary": quality["primary"],
+        "quality": quality,
+        "direction_check": dir_check,
+        "risk": risk,
+        "sl": risk["sl"],
+        "tp": risk["tp"],
+        "rr": risk["rr"],
+        "no_trade_reasons": reasons,
+    })
+    return out

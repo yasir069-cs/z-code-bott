@@ -328,6 +328,15 @@ RISK_TARGET_ZONE_PAD_ATR = 0.25  # target placed this * ATR short of the opposin
 # ---- decision engine
 DECISION_ENABLED = True          # master switch: price-action core decides (vs legacy funnel)
 
+# ---- LLM decision stage (shortlisted coins -> LLM BEFORE the gates reject)
+# After the 1H/15M/5M + funding funnel, every shortlisted coin is sent to the
+# LLM with its full structured data. The model may return LONG, SHORT or
+# NO_TRADE — including disagreeing with the deterministic core — but every
+# verdict then faces the SAME deterministic validation (direction gates,
+# stop width, R:R, quality floor) before an alert can go out.
+LLM_DECISION_ENABLED = True      # False -> pure deterministic core (previous behaviour)
+ALERT_QUALITY_MIN = 65           # Telegram alert floor; a BUY/SELL below this is log-only
+
 # ---- news verification engine (VERIFY FIRST — AI never decides what is true)
 NEWS_ENABLED = True              # start the persistent news engine with the bot
 NEWS_POLL_SECONDS = 300          # RSS polling interval

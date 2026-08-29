@@ -695,6 +695,243 @@ def _chunks(items: list, size: int):
         yield items[start:start + size]
 
 
+# ------------------------------------------- LLM decision stage (full data)
+
+_VERDICT_MAP = {"LONG": "LONG", "SHORT": "SHORT", "NO_TRADE": "NO_TRADE",
+                "BUY": "LONG", "SELL": "SHORT", "HOLD": "NO_TRADE"}
+_VERDICT_JSON_SHAPE = ('{"symbol": "...", "signal": "LONG|SHORT|NO_TRADE", '
+                       '"confidence": 0, "reason": "short explanation"}')
+
+_DECISION_INSTRUCTIONS = """You are the decision stage of a crypto futures signal bot.
+The Python pipeline has collected and structured all the data below for one
+shortlisted coin. Consider EVERY factor — market structure, S/R zones,
+liquidity/sweep, price action, multi-timeframe alignment, futures context
+(open interest, funding), indicators, AND the websocket liquidation data.
+
+You may AGREE with the deterministic Python core or DISAGREE with it, but:
+- Judge the setup on its merits; the Python quality score and reasons are
+  evidence, not orders.
+- Liquidation data is context only — never decide on a liquidation spike alone.
+- Do NOT fabricate facts or data that is not provided.
+- After your verdict, deterministic gates (stop width, R/R, setup quality)
+  re-validate it, so a verdict without a real tradable structure will be
+  rejected anyway. NO_TRADE is a fully acceptable answer.
+Return ONLY JSON."""
+
+
+def _evidence_block(det: dict) -> str:
+    """Render the deterministic core's structured evidence for the prompt."""
+    structure = det.get("structure") or {}
+    sr = det.get("sr") or {}
+    liq = det.get("liquidity") or {}
+    pa = det.get("price_action") or {}
+    tl = det.get("trendline") or {}
+    fut = det.get("futures") or {}
+    risk = det.get("risk") or {}
+    quality = det.get("quality") or {}
+    mtf = det.get("mtf") or {}
+
+    lines = [
+        f"Python core direction: {det.get('direction') or 'n/a'} "
+        f"(decision: {det.get('decision')})",
+        f"Setup quality: {det.get('setup_quality', 0):.1f}/100 "
+        f"(primary {det.get('primary', 0):.1f})",
+        f"HTF bias: {det.get('htf_bias', 'n/a')}",
+        f"Structure: trend={structure.get('trend', 'n/a')}, "
+        f"bias={structure.get('bias', 'n/a')}, "
+        f"bos={(structure.get('bos') or {}).get('dir', 'none')}, "
+        f"choch={(structure.get('choch') or {}).get('dir', 'none')}, "
+        f"displacement={(structure.get('displacement') or {}).get('dir', 'none')}, "
+        f"retest={(structure.get('retest') or {}).get('dir', 'none')}",
+        f"S/R: at_zone={(sr.get('at_zone') or {}).get('side', 'none')}"
+        f"{'(major)' if (sr.get('at_zone') or {}).get('major') else ''}",
+        f"Liquidity: long_ready={liq.get('long_ready')}, "
+        f"short_ready={liq.get('short_ready')}, "
+        f"equal_lows={len(liq.get('equal_lows') or [])}, "
+        f"equal_highs={len(liq.get('equal_highs') or [])}",
+        f"Price action signals: {pa.get('signals') or {}}",
+        f"Trendline break: {(tl.get('break') or {}).get('dir', 'none')}",
+        f"Futures context: available={fut.get('available')}, "
+        f"bias={fut.get('bias', 'n/a')}, conviction={fut.get('conviction', 'n/a')}",
+        f"Risk (Python structural): sl={risk.get('sl')}, tp={risk.get('tp')}, "
+        f"rr={risk.get('rr')}{' REJECTED: ' + ', '.join(risk.get('reasons') or []) if risk.get('reasons') else ''}",
+        f"Funding rate: {det.get('funding_rate') if det.get('funding_rate') is not None else 'n/a'}",
+    ]
+    if mtf.get("notes"):
+        lines.append(f"MTF notes: {'; '.join(mtf['notes'])}")
+    if det.get("no_trade_reasons"):
+        lines.append(f"Python NO_TRADE reasons: {', '.join(det['no_trade_reasons'])}")
+    if quality.get("penalties"):
+        lines.append(f"Quality penalties: {'; '.join(quality['penalties'])}")
+    return "\n".join(lines)
+
+
+def build_decision_prompt(bundle: dict) -> str:
+    """Single-setup prompt for the LLM decision stage: the FULL structured
+    data (funnel indicators + deterministic evidence + liquidation)."""
+    det = bundle["deterministic"]
+    return f"""{_DECISION_INSTRUCTIONS}
+
+Coin: {bundle['symbol']}
+Current price: {bundle['current_price']:.6g}
+Funnel direction (1H structure): {bundle['funnel_direction']}
+
+=== INDICATORS ===
+1H: {_fmt_snap(bundle['ind_1h'])}
+15M: {_fmt_snap(bundle['ind_15m'])}
+5M: {_fmt_snap(bundle['ind_5m'])}
+
+=== 1H LIQUIDITY SWEEP ===
+{_sweep_line(bundle)}
+
+=== WEBSOCKET LIQUIDATION DATA ===
+{_liquidation_line(bundle)}
+
+=== DETERMINISTIC PYTHON CORE OUTPUT ===
+{_evidence_block(det)}
+
+=== YOUR VERDICT ===
+Return exactly this JSON object:
+{_VERDICT_JSON_SHAPE}"""
+
+
+def _build_batch_decision_prompt(chunk: list) -> str:
+    blocks = []
+    for b in chunk:
+        det = b["deterministic"]
+        blocks.append(f"""--- {b['symbol']} ---
+Current price: {b['current_price']:.6g}
+Funnel direction: {b['funnel_direction']}
+1H: {_fmt_snap(b['ind_1h'])}
+15M: {_fmt_snap(b['ind_15m'])}
+5M: {_fmt_snap(b['ind_5m'])}
+Sweep: {_sweep_line(b)}
+Liquidation: {_liquidation_line(b)}
+Python core: {_evidence_block(det)}""")
+    return f"""{_DECISION_INSTRUCTIONS}
+
+Setups ({len(chunk)}):
+{chr(10).join(blocks)}
+
+=== YOUR VERDICTS ===
+Return ONLY a JSON ARRAY with exactly {len(chunk)} objects, one per setup, in
+the same order, each shaped exactly like:
+{_VERDICT_JSON_SHAPE}"""
+
+
+def parse_verdict(content: str, current_price: float = None) -> dict:
+    """Validate one LLM decision-stage answer into the standard verdict dict.
+
+    Accepts the LONG/SHORT/NO_TRADE vocabulary as well as the legacy
+    BUY/SELL/HOLD; anything else is an error (the caller retries or falls
+    back to the deterministic core)."""
+    raw = _extract_json(content)
+    if not isinstance(raw, dict):
+        raise AIDecisionError(f"verdict is not a JSON object: {str(raw)[:120]}")
+    signal = _VERDICT_MAP.get(str(raw.get("signal", "")).strip().upper())
+    if signal is None:
+        raise AIDecisionError(f"invalid verdict signal: {raw.get('signal')!r}")
+    reason = str(raw.get("reason") or "").strip() or "no reason given"
+    confidence = _to_float(raw.get("confidence"), "confidence")
+    if confidence is None:
+        confidence = 0.0
+    confidence = max(0.0, min(100.0, confidence))
+    return {"signal": signal, "confidence": confidence, "reason": reason,
+            "ai_used": True}
+
+
+def _parse_verdict_batch(content: str, bundles: list) -> dict:
+    """Validate a batch of verdicts into {symbol: verdict dict} (same
+    symbol-first / positional-second matching as parse_batch_response)."""
+    elements = _extract_json_array(content)
+    by_symbol = {b["symbol"]: b for b in bundles}
+    claimed: dict[str, dict] = {}
+    unlabelled: list[dict] = []
+
+    for index, element in enumerate(elements):
+        if not isinstance(element, dict):
+            log.warning("Verdict batch element %d is not an object: %.120r",
+                        index, element)
+            continue
+        symbol = element.get("symbol")
+        if isinstance(symbol, str) and symbol in by_symbol and symbol not in claimed:
+            claimed[symbol] = element
+        elif symbol not in by_symbol:
+            unlabelled.append(element)
+        else:
+            log.warning("Verdict batch returned %s twice, keeping the first", symbol)
+
+    for b in bundles:
+        if b["symbol"] in claimed:
+            continue
+        if unlabelled:
+            claimed[b["symbol"]] = unlabelled.pop(0)
+        else:
+            break
+
+    out: dict[str, dict] = {}
+    for symbol, element in claimed.items():
+        try:
+            out[symbol] = parse_verdict(json.dumps(element))
+        except AIDecisionError as exc:
+            log.warning("Verdict for %s unusable (%s) — deterministic path", symbol, exc)
+    if not out:
+        raise AIDecisionError(
+            f"verdict batch produced no usable decisions for {len(bundles)} setups",
+            retryable=True)
+    return out
+
+
+def llm_verdicts(bundles: list, deadline: Optional[float] = None) -> dict:
+    """LLM decision stage: verdicts for a scan's shortlisted coins, batched.
+
+    Returns {symbol: {"signal": LONG|SHORT|NO_TRADE, "confidence": float,
+    "reason": str}}. A symbol absent from the result got no AI answer and
+    takes the deterministic path — this function never substitutes one.
+    Sorted by deterministic quality descending so a mid-scan budget
+    exhaustion hits the weakest setups first."""
+    if not bundles:
+        return {}
+
+    ordered = sorted(bundles,
+                     key=lambda b: (b["deterministic"].get("setup_quality") or 0.0),
+                     reverse=True)
+    out: dict[str, dict] = {}
+
+    if not config.AI_BATCH_ENABLED or len(ordered) == 1:
+        for bundle in ordered:
+            def _parse(content: str, bundle=bundle) -> dict:
+                log.info("LLM verdict for %s: %.200s", bundle["symbol"], content)
+                return {bundle["symbol"]: parse_verdict(content)}
+            try:
+                out.update(_complete(_messages(build_decision_prompt(bundle)),
+                                     parse=_parse, deadline=deadline))
+            except AIDecisionError as exc:
+                log.warning("LLM verdict unavailable for %s (%s) — deterministic path",
+                            bundle["symbol"], exc)
+        return out
+
+    for chunk in _chunks(ordered, config.AI_BATCH_MAX):
+        symbols = [b["symbol"] for b in chunk]
+
+        def _parse(content: str, chunk=chunk) -> dict:
+            log.info("LLM verdict batch for %d setups: %.300s", len(chunk), content)
+            return _parse_verdict_batch(content, chunk)
+
+        try:
+            out.update(_complete(_messages(_build_batch_decision_prompt(chunk)),
+                                 parse=_parse, deadline=deadline))
+        except AIDecisionError as exc:
+            log.warning("LLM verdict batch of %d failed (%s) — deterministic path "
+                        "for: %s", len(chunk), exc, ", ".join(symbols))
+            continue
+
+    status = _budget.status()
+    log.info("LLM verdicts: %d/%d setups answered, %d/%d requests used today",
+             len(out), len(bundles), status["used"], status["limit"])
+    return out
+
+
 def nemotron_decisions(bundles: list, deadline: Optional[float] = None) -> dict:
     """Decide a whole scan's candidates, batched into as few requests as possible.
 

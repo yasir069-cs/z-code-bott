@@ -6,13 +6,17 @@ Every 5 minutes, 24/7:
     STEP 2 1H context (graded confluence + liquidation sweep) -> fail: skip
     STEP 3 funding rate check (reject overleveraged market)
     STEP 4 duplicate guard (15 min per coin) — checked BEFORE 15M/5M fetches
-    STEP 5 15M confirmation + 5M entry (graded, gated on confluence)
-    STEP 6 AI decision — ONE batched request for the whole scan (BUY/SELL/HOLD
-           + SL/TP/RR + confidence), Python fallback per undecided coin
-    STEP 7 leverage suggestion + position size
-    STEP 8 Telegram alert (BUY/SELL only, HOLD silent) with the full setup
-    STEP 9 append every signal to signals_log.csv
-    STEP 10 daily performance summary at session end
+    STEP 5 15M confirmation + 5M entry; deterministic decision core over
+           1H/15M/5M (structure, S/R, liquidity, price action, MTF, risk)
+    STEP 6 LLM decision stage — every shortlisted coin goes to the model with
+           its FULL structured data (one batched request) BEFORE the final
+           gates reject it; verdict LONG/SHORT/NO_TRADE
+    STEP 7 post-LLM deterministic validation — verdict faces the same gates
+           (direction, stop width, R/R, quality); AI-unavailable falls back
+           to the deterministic decision
+    STEP 8 leverage suggestion + position size
+    STEP 9 Telegram alert (BUY/SELL at quality >= ALERT_QUALITY_MIN only,
+           everything else log-only) + signals_log.csv for every signal
 
 Fetching is concurrent and batched per timeframe; a hard per-scan deadline
 (config.SCAN_DEADLINE_SECONDS) guarantees a scan can never bleed into the next
@@ -51,6 +55,7 @@ import scanner
 import scoring
 import telegram_bot
 import ondemand
+import ai_decision
 from ai_decision import (AIDecisionError, nemotron_decision,
                          nemotron_decisions)
 from fallback import explanation_fallback, fallback_decision
@@ -149,7 +154,8 @@ def _summarize_liquidity(liq: dict | None, signal: str) -> str:
 
 
 def _build_sig(symbol: str, d: dict, signal: str, snap5: dict | None,
-               rsi_bounce: bool, funding_rate, last_price: float) -> dict:
+               rsi_bounce: bool, funding_rate, last_price: float,
+               ai_used: bool = False, ai_reason: str | None = None) -> dict:
     """Assemble the alert/log record from a finished decision.decide() result.
 
     The deterministic core owns the verdict and every level (entry/SL/TP/RR/
@@ -191,6 +197,8 @@ def _build_sig(symbol: str, d: dict, signal: str, snap5: dict | None,
     sweep_type = ("bullish" if signal == "BUY" else "bearish") if sweep else ""
 
     reason = explanation_fallback(d)
+    if ai_reason:
+        reason = f"{ai_reason} | {reason}"
     if liquidation_summary.get("available"):
         one_hour = liquidation_summary["windows"]["1h"]
         reason += (f" Liquidations: {one_hour['long_count']} long / "
@@ -218,7 +226,7 @@ def _build_sig(symbol: str, d: dict, signal: str, snap5: dict | None,
         "rsi_bounce_detected": bool(rsi_bounce),
         "indicators": ind_block,
         "reason": reason,
-        "ai_used": False,
+        "ai_used": bool(ai_used),
         # --- structure-first decision evidence (new CSV columns) ---
         "decision": d.get("decision"),
         "setup_quality": round(quality, 1),
@@ -263,6 +271,92 @@ def _build_llm_bundle(cand: dict, d: dict, last_price) -> dict | None:
                                                current_price=current_price,
                                                sr=d.get("sr")),
     }
+
+
+def _build_decision_bundle(cand: dict, d: dict, snap5: dict | None,
+                           last_price) -> dict | None:
+    """Assemble the FULL structured-data bundle for the LLM decision stage.
+
+    Everything the pipeline collected for this shortlisted coin: the three
+    indicator snapshots, the 1H sweep, the websocket liquidation summary, and
+    the deterministic core's complete output (direction, quality, penalties,
+    risk levels, no-trade reasons). The model gets the whole picture BEFORE
+    any final gate rejection is applied to it."""
+    snaps = d.get("snaps") or {}
+    ind_1h, ind_15m = snaps.get("1h"), snaps.get("15m")
+    snap5 = snap5 or snaps.get("5m")
+    if not ind_1h or not snap5:
+        return None
+    current_price = last_price or snap5.get("close") or d.get("entry")
+    if not current_price:
+        return None
+    det = dict(d)
+    det["funding_rate"] = cand.get("fr")
+    return {
+        "symbol": cand["symbol"],
+        "funnel_direction": cand["direction"],
+        "current_price": float(current_price),
+        "entry_price": float(d.get("entry") or snap5.get("close")),
+        "ind_1h": ind_1h,
+        "ind_15m": ind_15m,
+        "ind_5m": snap5,
+        "sweep": (cand.get("feat_1h") or {}).get("sweep"),
+        "liquidation": liquidation.get_summary(cand["symbol"],
+                                               current_price=current_price,
+                                               sr=d.get("sr")),
+        "deterministic": det,
+    }
+
+
+def _apply_llm_verdict(d: dict, verdict: dict | None,
+                       symbol: str = "") -> tuple[dict, str, bool, str | None]:
+    """Apply the LLM decision stage to one deterministic decision.
+
+    Returns (decision, signal, ai_used, ai_reason). The model may confirm,
+    veto (NO_TRADE) or flip the direction — a flip is re-validated by the
+    same deterministic gates via decision.rescore_direction before it can
+    stand. An absent verdict (AI unavailable / budget out) leaves the
+    deterministic result untouched."""
+    if not verdict:
+        return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), False, None
+
+    verdict_signal = verdict.get("signal")
+    if verdict_signal == "NO_TRADE":
+        out = dict(d)
+        out["decision"] = "NO_TRADE"
+        reasons = list(out.get("no_trade_reasons") or [])
+        if "llm_no_trade" not in reasons:
+            reasons.append("llm_no_trade")
+        out["no_trade_reasons"] = reasons
+        return out, "HOLD", True, verdict.get("reason")
+
+    want = "LONG" if verdict_signal == "LONG" else \
+           "SHORT" if verdict_signal == "SHORT" else None
+    if want is None:                      # unusable verdict -> deterministic
+        return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), False, None
+
+    if want != d.get("direction"):
+        out = decision_core.rescore_direction(d, want)
+        if out["decision"] != "NO_TRADE":
+            log.info("%s: LLM flipped direction to %s and the gates confirm it "
+                     "(quality=%.0f rr=%s)", symbol, want,
+                     out.get("setup_quality") or 0.0, out.get("rr"))
+        else:
+            log.info("%s: LLM flipped direction to %s but deterministic gates "
+                     "rejected it (%s)", symbol, want,
+                     ", ".join(out.get("no_trade_reasons") or []))
+        return out, _SIGNAL_MAP.get(out.get("decision"), "HOLD"), True, \
+            verdict.get("reason")
+
+    return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), True, verdict.get("reason")
+
+
+def _emission_kind(signal: str, quality: float) -> str:
+    """Post-LLM emission rule: HOLD log-only; BUY/SELL below ALERT_QUALITY_MIN
+    log-only; at/above the threshold alert + log + cooldown."""
+    if signal == "HOLD":
+        return "hold"
+    return "alert" if quality >= config.ALERT_QUALITY_MIN else "log_only"
 
 
 def run_force_llm(exchange, top_n: int = 3) -> dict:
@@ -384,7 +478,7 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
         funding_rates = {}
     summary = {"scanned": len(symbols), "pass_1h": 0, "pass_15m": 0, "pass_5m": 0,
                "funding_rejected": 0, "duplicates": 0, "gate_rejected": 0,
-               "ai_used": 0, "signals": 0, "holds": 0}
+               "ai_used": 0, "signals": 0, "log_only": 0, "holds": 0}
 
     # --- STEP 1+2: batch-fetch 1H for every symbol; structure funnel ---
     frames_1h = scanner.fetch_timeframe_batch(symbols, "1h", deadline=deadline)
@@ -434,7 +528,7 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
     # --- STEP 5b: batch-fetch 5M (entry TF); run the decision core over all 3 TFs ---
     frames_5m = scanner.fetch_timeframe_batch([c["symbol"] for c in with_15m], "5m",
                                               deadline=deadline)
-    decided = []   # (setup_quality, signal, sig, symbol) for ranked emission
+    analysed = []   # (d, cand, snap5, rsi_bounce, last_price) pre-verdict
     for c in with_15m:
         df_5m = frames_5m.get(c["symbol"])
         if df_5m is None:
@@ -457,32 +551,63 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
         frames = {config.TF_HTF: c["df_1h"], config.TF_SETUP: c["df_15m"],
                   config.TF_ENTRY: df_5m}
         d = decision_core.decide(frames, funding_rate=fr, oi_df=oi_df, symbol=symbol)
-
-        signal = _SIGNAL_MAP.get(d["decision"], "HOLD")
         last_price = ((tickers_last or {}).get(symbol) or d.get("entry")
                       or (snap5 or {}).get("close"))
-        sig = _build_sig(symbol, d, signal, snap5, rsi_bounce, fr, last_price)
+        c["feat_1h"] = c.get("feat_1h") or {}
+        analysed.append((d, c, snap5, rsi_bounce, last_price))
 
-        if signal == "HOLD":
-            summary["gate_rejected"] += 1
-            log.info("%s: NO_TRADE — %s (quality=%.0f)", symbol,
-                     ", ".join(d["no_trade_reasons"]) or "insufficient confluence",
-                     d.get("setup_quality") or 0.0)
-        decided.append((float(d.get("setup_quality") or 0.0), signal, sig, symbol))
-
-    if not decided:
+    if not analysed:
         log.info("Scan complete: %s", summary)
         return summary
 
-    # --- STEP 6-9: rank by setup-quality; alert (BUY/SELL) + log every signal ---
-    # Strongest setups first so the best alerts lead the session; NO_TRADE (HOLD)
-    # rows are logged silently. The LLM explanation layer (optional, cosmetic) is
-    # not called here — the reason text is the local structured explanation.
-    decided.sort(key=lambda t: t[0], reverse=True)
-    for _quality, signal, sig, symbol in decided:
+    # --- STEP 6: LLM decision stage — every shortlisted coin goes to the model
+    # with its FULL structured data BEFORE the final deterministic gates can
+    # reject it. The verdict (LONG/SHORT/NO_TRADE) then faces the same gates.
+    verdicts: dict = {}
+    if config.LLM_DECISION_ENABLED:
+        bundles = [b for b in (_build_decision_bundle(c, d, snap5, last_price)
+                               for d, c, snap5, _rb, last_price in analysed) if b]
+        if bundles:
+            try:
+                verdicts = ai_decision.llm_verdicts(bundles, deadline=deadline)
+            except AIDecisionError as exc:
+                log.warning("LLM decision stage unavailable (%s) — deterministic "
+                            "core decides this scan", exc)
+
+    # --- STEP 7: apply verdicts + post-LLM deterministic validation ---
+    decided = []   # (setup_quality, signal, sig, symbol) for ranked emission
+    for d, c, snap5, rsi_bounce, last_price in analysed:
+        symbol, fr = c["symbol"], c["fr"]
+        verdict = verdicts.get(symbol)
+        d, signal, ai_used, ai_reason = _apply_llm_verdict(d, verdict, symbol)
+        if ai_used:
+            summary["ai_used"] += 1
+
+        sig = _build_sig(symbol, d, signal, snap5, rsi_bounce, fr, last_price,
+                         ai_used=ai_used, ai_reason=ai_reason)
+        quality = float(d.get("setup_quality") or 0.0)
+
         if signal == "HOLD":
+            summary["gate_rejected"] += 1
+            log.info("%s: NO_TRADE — %s (quality=%.0f)%s", symbol,
+                     ", ".join(d["no_trade_reasons"]) or "insufficient confluence",
+                     quality, " [LLM]" if ai_used else "")
+        decided.append((quality, signal, sig, symbol))
+
+    # --- STEP 8-9: rank by setup-quality; alert (BUY/SELL) + log every signal ---
+    # Strongest setups first. Emission rule: HOLD log-only; BUY/SELL below
+    # ALERT_QUALITY_MIN (65) log-only; at/above it alert + cooldown.
+    decided.sort(key=lambda t: t[0], reverse=True)
+    for quality, signal, sig, symbol in decided:
+        kind = _emission_kind(signal, quality)
+        if kind == "hold":
             logger.log_signal(sig)          # NO_TRADE: logged, no alert, no cooldown
             summary["holds"] += 1
+        elif kind == "log_only":
+            logger.log_signal(sig)          # below the Telegram quality threshold
+            summary["log_only"] += 1
+            log.info("%s %s log-only (quality %.0f < %d)", symbol, signal,
+                     quality, config.ALERT_QUALITY_MIN)
         else:
             sent = alerts.send_alert(sig)   # failure logged, bot continues
             logger.log_signal(sig)
@@ -491,7 +616,7 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
                      "lev=%s pos=$%.2f", symbol, signal, sent, sig["entry"],
                      sig["SL"], sig["TP"], sig["RR"], sig["confidence"], sig["leverage"],
                      sig["position_size"])
-            guard.record(symbol, now_ist)   # cooldown only for BUY/SELL, not HOLD
+            guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
 
     log.info("Scan complete: %s", summary)
     return summary
