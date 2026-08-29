@@ -53,7 +53,9 @@ def get_recent_signals_summary(limit: int = 5) -> str:
 def get_bot_status_summary() -> str:
     """Return current bot operational status."""
     now_ist = datetime.now(config.TZ)
-    status = "🟢 ACTIVE (Scanning 24/7)"
+    hhmm = now_ist.strftime("%H:%M")
+    in_session = config.SESSION_START <= hhmm < config.SESSION_END
+    status = "🟢 ACTIVE (Scanning Market)" if in_session else "🌙 SLEEPING (Outside Trading Window)"
 
     # AI budget + OHLCV cache health (best-effort — /status must never break).
     extra = ""
@@ -72,7 +74,7 @@ def get_bot_status_summary() -> str:
 
     return (
         f"Current Time: {now_ist.strftime('%Y-%m-%d %H:%M:%S')} IST\n"
-        "Session Hours: 24/7 (every 5 minutes)\n"
+        f"Session Hours: {config.SESSION_START} to {config.SESSION_END} IST\n"
         f"Status: {status}\n"
         f"Active Model: {config.AI_MODEL}\n"
         f"Volume Filter: >= ${config.VOLUME_MIN_USDT:,} USDT"

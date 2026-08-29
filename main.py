@@ -1,6 +1,6 @@
 """Crypto Signal Bot — entry point + APScheduler timer.
 
-Every 5 minutes, 24/7:
+Every 5 minutes between 18:00 and 23:00 IST (60 scans/session):
 
     STEP 1 full exchange scan (all USDT-M futures perps, $50M volume filter)
     STEP 2 1H context (graded confluence + liquidation sweep) -> fail: skip
@@ -22,7 +22,9 @@ Fetching is concurrent and batched per timeframe; a hard per-scan deadline
 (config.SCAN_DEADLINE_SECONDS) guarantees a scan can never bleed into the next
 5-minute slot: past it the AI stage is skipped and the Python fallback is used.
 
-The scheduler runs continuously; there is no restricted session window.
+Outside 18:00-23:00 IST the scheduler runs nothing: zero activity,
+zero market API calls, zero AI calls. The Telegram chat assistant,
+liquidation websocket and news engine stay live 24/7.
 
 Usage:
     python main.py            # production schedule (APScheduler, IST)
@@ -64,7 +66,8 @@ log = logging.getLogger("main")
 
 
 def _in_session(now_ist: datetime) -> bool:
-    return True
+    hhmm = now_ist.strftime("%H:%M")
+    return config.SESSION_START <= hhmm < config.SESSION_END
 
 
 # decision.decide() speaks LONG/SHORT/NO_TRADE; the alert/log/guard layer speaks
@@ -469,6 +472,11 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
     now_ist = datetime.now(config.TZ)
     deadline = time.monotonic() + config.SCAN_DEADLINE_SECONDS
 
+    if not force and not _in_session(now_ist):
+        log.info("Outside active session (now %s IST) - zero activity",
+                 now_ist.strftime("%H:%M"))
+        return {"scanned": 0}
+
     symbols = scanner.get_active_usdt_symbols(exchange, tickers)
     tickers_last = {}
     if tickers:
@@ -708,28 +716,51 @@ def build_scheduler() -> BlockingScheduler:
                     f"3 scans in a row failed (last: {type(exc).__name__}). "
                     f"Signals may be paused — check the server.")
 
-    # Every five minutes, no hour-boundary overlap.
+    # 18:00:15, 18:05:15 ... 22:55:15 -> 60 scans, no hour-boundary overlap
     scheduler.add_job(
         scan_job,
-        CronTrigger(minute="*/5", second=config.SCAN_SECOND_OFFSET,
+        CronTrigger(hour="18-22", minute="*/5", second=config.SCAN_SECOND_OFFSET,
                     timezone=config.SCHEDULER_TZ),
-        id="scan", name="5-min scan 24/7",
+        id="scan", name="5-min scan 18:00-22:55 IST",
         max_instances=1, misfire_grace_time=config.SCAN_MISFIRE_GRACE_SEC, coalesce=True,
     )
 
-    scheduler.add_job(guard.reset, CronTrigger(hour=0, minute=0, timezone=config.SCHEDULER_TZ),
-                      id="guard_reset", name="reset duplicate tracker midnight")
-
-    def daily_summary() -> None:
-        log.info("24/7 bot daily summary")
-        summary = _daily_summary()
+    def session_start() -> None:
+        session.update(streak=0, scans=0, signals=0)  # fresh counters for the night
+        log.info("6:00 PM IST - Trading session started, beginning 5-minute scans")
         alerts.send_telegram_text(
-            "📊 <b>Daily Bot Report</b>\n\n"
-            f"{summary}\n\n<i>24/7 scanner remains active.</i>"
+            "🟢 <b>Trading Session Started (18:00 IST)</b>\n"
+            "⚡ Scanning all USDT-M Futures pairs every 5 minutes..."
         )
 
-    scheduler.add_job(daily_summary, CronTrigger(hour=23, minute=59, timezone=config.SCHEDULER_TZ),
-                      id="daily_summary", name="daily summary")
+    scheduler.add_job(session_start, CronTrigger(hour=18, minute=0, timezone=config.SCHEDULER_TZ),
+                      id="session_start", name="session start marker")
+
+    scheduler.add_job(guard.reset, CronTrigger(hour=23, minute=0, timezone=config.SCHEDULER_TZ),
+                      id="guard_reset", name="reset duplicate tracker 23:00")
+
+    def session_end() -> None:
+        log.info("11:00 PM IST - session over, bot sleeps until 6:00 PM tomorrow")
+        summary = _daily_summary()
+        # Confirm the bot was alive even on a silent night, so "no alerts" is
+        # never mistaken for a crashed bot (the owner's "koi issue nahi" ask).
+        if session["scans"] == 0:
+            health = ("⚠️ <b>No scans ran this session</b> — please check the server "
+                      "(the schedule may not have fired).")
+        elif session["signals"] == 0:
+            health = (f"✅ <b>Bot healthy</b> — ran {session['scans']} scans; no setup "
+                      f"met the confluence bar today (normal on quiet days).")
+        else:
+            health = f"✅ <b>Bot healthy</b> — ran {session['scans']} scans this session."
+        alerts.send_telegram_text(
+            "🌙 <b>Trading Session Ended (23:00 IST)</b>\n\n"
+            f"{summary}\n\n"
+            f"{health}\n\n"
+            "<i>24/7 AI Chat Assistant remains active!</i>"
+        )
+
+    scheduler.add_job(session_end, CronTrigger(hour=23, minute=1, timezone=config.SCHEDULER_TZ),
+                      id="session_end", name="session end marker")
     return scheduler
 
 
@@ -789,7 +820,7 @@ def main() -> None:
     # Send startup notification to Telegram
     alerts.send_telegram_text(
         f"🚀 <b>Crypto Signal Bot Started</b>\n\n"
-         f"⏰ <b>Schedule:</b> 24/7 (every 5 min)\n"
+         f"⏰ <b>Session:</b> {config.SESSION_START} to {config.SESSION_END} IST (every 5 min)\n"
         f"🤖 <b>AI Model:</b> <code>{config.AI_MODEL}</code>\n"
         f"⚡ <b>Market:</b> Futures (USDT-M Perpetual)\n"
         f"📊 <b>Volume Filter:</b> &gt;= ${config.VOLUME_MIN_USDT:,} USDT\n"
@@ -798,8 +829,9 @@ def main() -> None:
     )
 
     scheduler = build_scheduler()
-    log.info("Scheduler live: scans every 5 min, 24/7; duplicate reset at %s. Ctrl+C to stop.",
-             config.GUARD_RESET_TIME)
+    log.info("Scheduler live: scans every 5 min from %s to %s IST (60 scans), "
+             "duplicate reset at %s. Ctrl+C to stop.",
+             config.SESSION_START, config.SESSION_END, config.GUARD_RESET_TIME)
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

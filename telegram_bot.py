@@ -58,7 +58,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 <b>Welcome to Crypto Signal Bot AI!</b>\n\n"
         "I am your automated crypto market scanning and AI assistant bot.\n\n"
         "🤖 <b>What I do:</b>\n"
-        "• Scan all USDT-M Futures pairs every 5 minutes, <b>24/7</b>\n"
+        "• Scan all USDT-M Futures pairs every 5 min between <b>18:00 - 23:00 IST</b>\n"
         "• Decide LONG/SHORT/<b>NO_TRADE</b> from market structure, S/R, liquidity "
         "sweeps & a risk gate (1H→15M→5M); indicators only confirm\n"
         "• Generate verified BUY/SELL futures alerts with structure-based SL/TP (min 1:2 RR)\n"
