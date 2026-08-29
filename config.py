@@ -176,12 +176,11 @@ AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "50"))  # OpenRouter free tie
 
 # ------------------------------------------------------------------ duplicate guard
 DUPLICATE_COOLDOWN_MIN = 15     # same coin within 15 min -> skip (futures pace faster)
-GUARD_RESET_TIME = "00:00"      # tracker resets at midnight IST
+GUARD_RESET_TIME = "23:00"      # tracker resets at 11:00 PM IST
 
 # ------------------------------------------------------------------ scheduler
-# Retained for compatibility with status/config consumers; scanning is 24/7.
-SESSION_START = "00:00"
-SESSION_END = "24:00"
+SESSION_START = "18:00"         # 6:00 PM IST
+SESSION_END = "23:00"           # 11:00 PM IST
 SCAN_INTERVAL_MIN = 5           # every 5 minutes
 SCHEDULER_TZ = "Asia/Kolkata"
 # Fire a few seconds AFTER the candle boundary: at :00 exactly the just-closed
