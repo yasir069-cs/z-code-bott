@@ -16,12 +16,14 @@ and never imports decision/signal code.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
@@ -125,9 +127,24 @@ class NewsEvent:
         return frozenset(union)
 
 
+def _stem(w: str) -> str:
+    """Crude plural strip so paraphrases match: 'withdrawals' == 'withdrawal',
+    'halts' == 'halt'. Length-guarded to keep 'press'/'btc' intact."""
+    if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
 def _tokens(text: str) -> set:
     words = re.findall(r"[a-z0-9]+", text.lower())
-    return {w for w in words if len(w) > 2 and w not in _STOPWORDS}
+    return {_stem(w) for w in words if len(w) > 2 and w not in _STOPWORDS}
+
+
+def _parse_iso(raw) -> datetime:
+    try:
+        return datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return datetime.now(timezone.utc)
 
 
 def is_official(domain: str) -> bool:
@@ -350,6 +367,71 @@ def format_news_alert(event: NewsEvent, analysis: dict, market: dict,
 
 # ------------------------------------------------------------------- engine
 
+class AlertMemory:
+    """Persistent memory of already-alerted news (claim-token signatures).
+
+    The owner's rule is absolute: news that has alerted once never alerts
+    again. Per-event state cannot enforce that across the paths where the
+    same story returns as a *fresh* event:
+
+      * a bot restart (RSS feeds still list the old articles; seen_urls is
+        empty again),
+      * the 24h event window expiring while outlets keep re-reporting,
+      * heavy paraphrasing clustering into a second event.
+
+    This cross-event, restart-persistent memory catches all three: before a
+    'new' alert is offered, its claim tokens are matched (clustering-grade
+    similarity + shared entity anchor) against everything ever alerted."""
+
+    def __init__(self, path):
+        self._path = Path(path)
+        self._entries: list[dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            self._entries = [e for e in raw.get("entries", [])
+                             if isinstance(e, dict) and e.get("tokens")]
+        except FileNotFoundError:
+            self._entries = []
+        except (OSError, ValueError) as exc:
+            log.warning("Alert memory unreadable (%s); starting fresh", exc)
+            self._entries = []
+        self._prune()
+
+    def _prune(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=config.NEWS_ALERT_MEMORY_DAYS)
+        self._entries = [e for e in self._entries if _parse_iso(e.get("at")) > cutoff]
+
+    def _save(self) -> None:
+        try:
+            self._path.write_text(
+                json.dumps({"entries": self._entries}, ensure_ascii=False),
+                encoding="utf-8")
+        except OSError as exc:
+            log.warning("Alert memory write failed: %s", exc)
+
+    def contains(self, tokens: frozenset) -> Optional[str]:
+        """Headline of an already-alerted story matching these tokens.
+        Stale entries are pruned first so expired memories never suppress."""
+        self._prune()
+        for e in self._entries:
+            et = frozenset(e["tokens"])
+            best = _similarity(tokens, et)
+            shared_anchor = bool(tokens & _ANCHORS & et)
+            if best >= config.NEWS_SIMILARITY_MIN or \
+                    (shared_anchor and best >= _ANCHOR_MERGE_FLOOR):
+                return e.get("headline", "")
+        return None
+
+    def add(self, tokens: frozenset, headline: str) -> None:
+        self._entries.append({"tokens": sorted(tokens), "headline": headline,
+                              "at": datetime.now(timezone.utc).isoformat()})
+        self._prune()
+        self._save()
+
+
 class NewsEngine:
     """Clusters articles into events, verifies them deterministically, and
     publishes only VERIFIED events (via the AI analysis + Telegram)."""
@@ -360,6 +442,7 @@ class NewsEngine:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._seen_urls: set = set()
+        self._alerts = AlertMemory(config.NEWS_ALERT_MEMORY_FILE)
 
     # -- ingestion & clustering -------------------------------------------
     def ingest(self, articles: list) -> list:
@@ -398,17 +481,25 @@ class NewsEngine:
             target.status = compute_status(target)
 
             if target.status == VERIFIED and target.last_alerted_at is None:
-                pending.append((target, "new"))
+                # Owner's rule: news alerts exactly once. The persistent
+                # alert memory catches the same story returning as a fresh
+                # cluster (restart, expired window, paraphrase).
+                dup = self._alerts.contains(target.claim_tokens())
+                if dup:
+                    log.info("News suppressed — already alerted before: '%s'",
+                             (dup or target.headline)[:70])
+                else:
+                    pending.append((target, "new"))
             elif target.status == VERIFIED and target.last_alerted_at is not None:
-                # Duplicate protection: an already-alerted event re-alerts
-                # only for MATERIALLY new verified information, and only
-                # after the cooldown window has fully elapsed.
-                in_cooldown = (now - target.last_alerted_at).total_seconds() \
-                    < config.NEWS_ALERT_COOLDOWN_SECONDS
-                if not in_cooldown:
-                    note = self._material_update_note(target)
-                    if note:
-                        pending.append((target, "update"))
+                # Re-alerts (material updates) are OFF by default per the
+                # owner's once-only rule; available behind the config flag.
+                if config.NEWS_ALLOW_UPDATE_ALERTS:
+                    in_cooldown = (now - target.last_alerted_at).total_seconds() \
+                        < config.NEWS_ALERT_COOLDOWN_SECONDS
+                    if not in_cooldown:
+                        note = self._material_update_note(target)
+                        if note:
+                            pending.append((target, "update"))
         return pending
 
     def _material_update_note(self, event: NewsEvent) -> Optional[str]:
@@ -463,6 +554,8 @@ class NewsEngine:
             event.alerted_claim_tokens = event.claim_tokens()
             event.alerted_official = any(is_official(a.source_domain)
                                          for a in event.articles)
+            # persistent once-only memory: survives restarts and re-clustering
+            self._alerts.add(event.claim_tokens(), event.headline)
         return sent
 
     def process_cycle(self, analyzer=None, market_fn=None, send_fn=None) -> list:

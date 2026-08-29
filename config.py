@@ -336,6 +336,10 @@ NEWS_EVENT_WINDOW_HOURS = 24     # articles older than this cannot join/confirm 
 NEWS_MAX_ARTICLES_PER_CYCLE = 30
 NEWS_SIMILARITY_MIN = 0.35       # token-Jaccard threshold for "same event" clustering
 NEWS_MATERIAL_TOKEN_FRAC = 0.30  # new claim tokens above this fraction = material update
+NEWS_ALLOW_UPDATE_ALERTS = False  # owner's rule: a news story alerts EXACTLY once;
+                                  # flip True for 🔄 update alerts on material changes
+NEWS_ALERT_MEMORY_DAYS = 7        # remember already-alerted news this long (restart-safe)
+NEWS_ALERT_MEMORY_FILE = BASE_DIR / "news_alerted.json"
 NEWS_AI_DAILY_LIMIT = 100        # separate from the trading-prompt budget
 NEWS_RSS_FEEDS = (
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
