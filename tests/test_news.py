@@ -6,6 +6,7 @@ material-update handling, observed-data labeling, causality discipline and
 the news/trading-signal separation.
 """
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,13 @@ from news import (Article, NewsEngine, NewsEvent, compute_status,
                   format_news_alert, is_official)
 
 NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_alert_memory(tmp_path, monkeypatch):
+    """Every test gets its own alert-memory file — the persistent once-only
+    store must never leak state between tests (or into the repo)."""
+    monkeypatch.setattr(config, "NEWS_ALERT_MEMORY_FILE", tmp_path / "alerted.json")
 
 
 def _art(title, domain, url, summary="", when=None):
@@ -166,11 +174,146 @@ def test_atom_entry_parsing_for_social_feeds():
     assert "breakout" in summary.lower()
 
 
+# -------------------------------------------------- once-only alert memory
+
+def _engine_with_memory(tmp_path, articles):
+    """Fresh engine (simulating a restart) with a shared persistent memory."""
+    import news as news_mod
+    engine = news_mod.NewsEngine()
+    engine._alerts = news_mod.AlertMemory(tmp_path / "alerted.json")
+    engine._seen_urls = set()          # restart: URL memory gone
+    pending = engine.ingest(articles)
+    return engine, pending
+
+
+def test_news_alerts_exactly_once_across_restart(tmp_path):
+    """Owner's rule: news that alerted once NEVER alerts again — even after a
+    bot restart, when the RSS feed still lists the same articles and the
+    URL/event state is gone."""
+    arts = [
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ]
+    engine1, pending1 = _engine_with_memory(tmp_path, arts)
+    assert len(pending1) == 1 and pending1[0][1] == "new"
+    engine1.publish(pending1[0][0], "new", analyzer=_ai_ok,
+                    market_fn=lambda a: {"observed": []},
+                    send_fn=lambda m: True)
+
+    # RESTART: brand-new engine, same memory file, same feed articles
+    engine2, pending2 = _engine_with_memory(tmp_path, arts)
+    assert pending2 == []               # already alerted: suppressed forever
+
+
+def test_persistent_memory_catches_paraphrased_recluster(tmp_path):
+    """The same story returning as a different cluster (heavy paraphrase /
+    expired 24h window) is still recognized by claim-token similarity."""
+    arts = [
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ]
+    engine1, pending1 = _engine_with_memory(tmp_path, arts)
+    engine1.publish(pending1[0][0], "new", analyzer=_ai_ok,
+                    market_fn=lambda a: {"observed": []},
+                    send_fn=lambda m: True)
+
+    # "fresh" event: expired-window re-report with different wording
+    engine2, pending2 = _engine_with_memory(tmp_path, [
+        _art("Binance withdrawal halt follows confirmed security incident",
+             "theblock.co", "https://t.com/1", "Withdrawals remain suspended."),
+    ])
+    assert pending2 == []
+
+
+def test_genuinely_different_news_still_alerts(tmp_path):
+    """Once-only must not over-suppress: an unrelated verified story alerts."""
+    arts = [
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ]
+    engine1, pending1 = _engine_with_memory(tmp_path, arts)
+    engine1.publish(pending1[0][0], "new", analyzer=_ai_ok,
+                    market_fn=lambda a: {"observed": []},
+                    send_fn=lambda m: True)
+
+    engine2, pending2 = _engine_with_memory(tmp_path, [
+        _art("Ethereum foundation announces new grant program",
+             "ethereum.org", "https://ethereum.org/g", "Grants announced."),
+        _art("Ethereum foundation announces new grant program",
+             "cointelegraph.com", "https://c.com/2", "Grant program reported."),
+    ])
+    assert len(pending2) == 1 and pending2[0][1] == "new"
+
+
+def test_failed_send_not_recorded_in_memory(tmp_path):
+    """A failed Telegram send must not burn the once-only memory — the story
+    may alert when Telegram recovers."""
+    arts = [
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ]
+    engine1, pending1 = _engine_with_memory(tmp_path, arts)
+    engine1.publish(pending1[0][0], "new", analyzer=_ai_ok,
+                    market_fn=lambda a: {"observed": []},
+                    send_fn=lambda m: False)      # send failed
+    engine2, pending2 = _engine_with_memory(tmp_path, arts)
+    assert len(pending2) == 1 and pending2[0][1] == "new"
+
+
+def test_material_updates_disabled_by_default(tmp_path):
+    """Owner's rule: once-only. Even a material change re-alerts nothing
+    while NEWS_ALLOW_UPDATE_ALERTS is False (default)."""
+    assert config.NEWS_ALLOW_UPDATE_ALERTS is False
+    engine = NewsEngine()
+    engine._alerts = news.AlertMemory(tmp_path / "alerted.json")
+    first = engine.ingest([
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ])
+    engine.publish(first[0][0], "new", analyzer=_ai_ok,
+                   market_fn=lambda a: {"observed": []},
+                   send_fn=lambda m: True)
+    e = first[0][0]
+    from datetime import timedelta as _td
+    e.last_alerted_at -= _td(seconds=config.NEWS_ALERT_COOLDOWN_SECONDS + 3600)
+    updates = engine.ingest([
+        _art("Binance confirms security incident, loss of 40000 BTC estimated",
+             "theblock.co", "https://t.com/2",
+             "Losses estimated at 40000 BTC according to the filing."),
+    ])
+    assert updates == []
+
+
+def test_alert_memory_expires_after_retention(tmp_path):
+    """Memory is long (7 days) but not forever — genuinely old news beyond
+    the retention window is allowed to alert again as a fresh cycle."""
+    mem = news.AlertMemory(tmp_path / "alerted.json")
+    mem.add(frozenset({"binance", "incident", "withdrawals"}),
+            "Binance incident")
+    # age the entry beyond retention
+    from datetime import timedelta as _td
+    mem._entries[0]["at"] = (datetime.now(timezone.utc)
+                             - _td(days=config.NEWS_ALERT_MEMORY_DAYS + 1)).isoformat()
+    assert mem.contains(frozenset({"binance", "incident", "withdrawals"})) is None
+
+
 # ------------------------------------------------------- 20-minute cooldown
 
 def _alerted_engine():
-    """Engine whose first event has already been alerted just now."""
+    """Engine whose first event has already been alerted just now (isolated
+    in-memory alert store — no disk state leaks between tests)."""
     engine = NewsEngine()
+    engine._alerts = news.AlertMemory(Path(config.NEWS_ALERT_MEMORY_FILE))
     first = engine.ingest([
         _art("Binance reports security incident affecting withdrawals",
              "binance.com", "https://binance.com/en/x", "Incident confirmed."),
@@ -184,9 +327,10 @@ def _alerted_engine():
     return engine, e
 
 
-def test_material_update_blocked_inside_cooldown_window():
+def test_material_update_blocked_inside_cooldown_window(monkeypatch):
     """A material update arriving minutes after the alert must NOT re-alert
-    — the 20-minute cooldown suppresses duplicates."""
+    — the cooldown suppresses duplicates (flag on; off would suppress more)."""
+    monkeypatch.setattr(config, "NEWS_ALLOW_UPDATE_ALERTS", True)
     engine, e = _alerted_engine()
     pending = engine.ingest([
         _art("Binance confirms security incident, loss of 40000 BTC estimated",
@@ -198,7 +342,8 @@ def test_material_update_blocked_inside_cooldown_window():
 
 def test_material_update_fires_after_cooldown_expires(monkeypatch):
     """Once 20 minutes have passed, the same new details DO re-alert — the
-    material tokens were held back, not lost."""
+    material tokens were held back, not lost (flag on)."""
+    monkeypatch.setattr(config, "NEWS_ALLOW_UPDATE_ALERTS", True)
     engine, e = _alerted_engine()
     # age the last alert beyond the cooldown
     from datetime import timedelta as _td
@@ -442,6 +587,7 @@ def test_duplicate_event_does_not_duplicate_alert():
 
 
 def test_material_update_creates_update_alert(monkeypatch):
+    monkeypatch.setattr(config, "NEWS_ALLOW_UPDATE_ALERTS", True)
     engine = NewsEngine()
     # round 1: press + official -> VERIFIED, alert goes out
     first = _ingest_cycle(engine, [
