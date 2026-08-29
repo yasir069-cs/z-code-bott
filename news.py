@@ -180,6 +180,18 @@ def _similarity(a: frozenset, b: frozenset) -> float:
     return len(a & b) / len(a | b)
 
 
+def _same_story(a: frozenset, b: frozenset) -> bool:
+    """True when two token sets describe the same story — the same matching
+    rule the clusterer uses, applied as a safety net wherever one story could
+    slip through as two events."""
+    if not a or not b:
+        return False
+    best = _similarity(a, b)
+    if best >= config.NEWS_SIMILARITY_MIN:
+        return True
+    return bool(a & _ANCHORS & b) and best >= _ANCHOR_MERGE_FLOOR
+
+
 def _parse_pubdate(raw: str) -> datetime:
     try:
         return parsedate_to_datetime(raw).astimezone(timezone.utc)
@@ -481,10 +493,20 @@ class NewsEngine:
             target.status = compute_status(target)
 
             if target.status == VERIFIED and target.last_alerted_at is None:
+                # one alert per event per cycle: skip if this exact event is
+                # already queued, or if a SIMILAR event is queued (the same
+                # story split across feeds into two clusters alerts once)
+                if any(p is target for p, _ in pending):
+                    continue
+                tokens = target.claim_tokens()
+                if any(_same_story(tokens, q.claim_tokens()) for q, _ in pending):
+                    log.info("News suppressed — same story already queued "
+                             "this cycle: '%s'", target.headline[:70])
+                    continue
                 # Owner's rule: news alerts exactly once. The persistent
                 # alert memory catches the same story returning as a fresh
                 # cluster (restart, expired window, paraphrase).
-                dup = self._alerts.contains(target.claim_tokens())
+                dup = self._alerts.contains(tokens)
                 if dup:
                     log.info("News suppressed — already alerted before: '%s'",
                              (dup or target.headline)[:70])
@@ -571,6 +593,13 @@ class NewsEngine:
         pending = self.ingest(self._fetch_fn())
         sent = []
         for event, kind in pending:
+            # Re-check the persistent memory right before publishing: an
+            # earlier publish in THIS cycle may have just recorded a similar
+            # story (clustering split one news into two events).
+            if kind == "new" and self._alerts.contains(event.claim_tokens()):
+                log.info("News suppressed — same story alerted earlier this "
+                         "cycle: '%s'", event.headline[:70])
+                continue
             if self.publish(event, kind, analyzer, market_fn, send_fn):
                 sent.append(event.headline)
         if pending:
