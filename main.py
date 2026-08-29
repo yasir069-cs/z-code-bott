@@ -621,6 +621,8 @@ def main() -> None:
     config.setup_logging()
     liquidation.start_listener()  # persistent; scans only read its current cache
     logger.migrate_csv_header()  # reconcile signals_log.csv to the current column set
+    for warning in config.check_exposed_credentials():
+        log.warning("SECURITY: %s", warning)
     log.info("=== Crypto Signal Bot starting (model=%s, telegram=%s, openrouter=%s) ===",
              config.AI_MODEL,
              "configured" if config.TELEGRAM_TOKEN else "NOT configured",
