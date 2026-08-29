@@ -176,6 +176,95 @@ def test_atom_entry_parsing_for_social_feeds():
 
 # -------------------------------------------------- once-only alert memory
 
+def test_same_story_split_across_5_feeds_alerts_once():
+    """THE owner's scenario: one news landing 5 times (cross-feed paraphrases
+    the clusterer splits into separate events) must produce exactly ONE
+    alert. Two safety nets: similar-event dedup inside ingest's pending
+    queue, and a memory re-check right before each publish."""
+    engine = NewsEngine()
+    variants = [
+        ("binance.com", "https://binance.com/en/x",
+         "Binance confirms security incident affecting withdrawals"),
+        ("cointelegraph.com", "https://c.com/1",
+         "Binance halts withdrawals after security incident"),
+        ("theblock.co", "https://t.com/1",
+         "Binance withdrawal halt follows security incident: report"),
+        ("www.coindesk.com", "https://d.com/1",
+         "Binance suspends withdrawals following security incident"),
+        ("decrypt.co", "https://de.com/1",
+         "Security incident at Binance halts withdrawals"),
+    ]
+    # feed the variants one by one (each becomes a fresh VERIFIED cluster if
+    # the clusterer misses the paraphrase — worst case)
+    sent_messages = []
+
+    def send(message):
+        sent_messages.append(message)
+        return True
+
+    for i, (dom, url, title) in enumerate(variants):
+        arts = [Article(title=title, url=url, source_domain=dom,
+                        published_at=NOW, summary="")]
+        # each variant needs a second source to reach VERIFIED
+        arts.append(Article(title=title, url=url + "-b",
+                            source_domain="theblock.co" if dom != "theblock.co"
+                            else "decrypt.co",
+                            published_at=NOW, summary=""))
+        pending = engine.ingest(arts)
+        for event, kind in pending:
+            engine.publish(event, kind, analyzer=_ai_ok,
+                           market_fn=lambda a: {"observed": []},
+                           send_fn=send)
+    # only the very first variant may alert — the rest are the same story
+    assert len(sent_messages) == 1, f"same news alerted {len(sent_messages)}x"
+    assert "security incident" in sent_messages[0].lower()
+
+
+def test_pending_queue_dedupes_similar_events_in_one_cycle():
+    """Two similar VERIFIED events queued in the same ingest -> only one
+    pending entry (the second is suppressed as the same story)."""
+    engine = NewsEngine()
+    pending = engine.ingest([
+        _art("Binance halts withdrawals after security incident",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after security incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+        # different wording, same story, different URL -> may form event #2
+        _art("Binance suspends withdrawals following security incident",
+             "theblock.co", "https://t.com/1", "Withdrawal suspension."),
+        _art("Binance suspends withdrawals following security incident",
+             "decrypt.co", "https://de.com/1", "Binance withdrawal halt."),
+    ])
+    # whether clustering made 1 event or 2, exactly one alert is pending
+    assert len(pending) == 1
+
+
+def test_cycle_recheck_catches_split_story_across_publishes():
+    """process_cycle re-checks memory before each publish, so two similar
+    events pending in ONE cycle still alert exactly once."""
+    engine = NewsEngine()
+    # pre-seed two similar but separately-clustered events
+    e1 = NewsEvent(); e1.articles = [
+        _art("Binance halts withdrawals after security incident",
+             "binance.com", "https://binance.com/en/x", ""),
+        _art("Binance halts withdrawals after security incident",
+             "cointelegraph.com", "https://c.com/1", "")]
+    e1.assets = set(); e1.status = compute_status(e1)
+    e2 = NewsEvent(); e2.articles = [
+        _art("Binance suspends withdrawals following security incident",
+             "theblock.co", "https://t.com/1", ""),
+        _art("Binance suspends withdrawals following security incident",
+             "decrypt.co", "https://de.com/1", "")]
+    e2.assets = set(); e2.status = compute_status(e2)
+    engine._events = [e1, e2]
+
+    sent = engine.process_cycle(
+        analyzer=_ai_ok,
+        market_fn=lambda a: {"observed": [], "unavailable": []},
+        send_fn=lambda m: True)
+    assert len(sent) == 1
+
+
 def _engine_with_memory(tmp_path, articles):
     """Fresh engine (simulating a restart) with a shared persistent memory."""
     import news as news_mod
