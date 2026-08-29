@@ -331,6 +331,7 @@ DECISION_ENABLED = True          # master switch: price-action core decides (vs 
 # ---- news verification engine (VERIFY FIRST — AI never decides what is true)
 NEWS_ENABLED = True              # start the persistent news engine with the bot
 NEWS_POLL_SECONDS = 300          # RSS polling interval
+NEWS_ALERT_COOLDOWN_SECONDS = 1200  # no duplicate/repeat alert for the same event within 20 min
 NEWS_EVENT_WINDOW_HOURS = 24     # articles older than this cannot join/confirm an event
 NEWS_MAX_ARTICLES_PER_CYCLE = 30
 NEWS_SIMILARITY_MIN = 0.35       # token-Jaccard threshold for "same event" clustering
@@ -339,6 +340,15 @@ NEWS_AI_DAILY_LIMIT = 100        # separate from the trading-prompt budget
 NEWS_RSS_FEEDS = (
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
+    # Trump / US-politics crypto feeds: Trump policy news moves BTC and the
+    # broader market, so it gets dedicated discovery feeds.
+    "https://cointelegraph.com/rss/tag/donald-trump",
+    "https://cointelegraph.com/rss/tag/politics",
+    # social/unofficial feeds: discovery + early clustering only — they NEVER
+    # satisfy verification (see NEWS_SOCIAL_DOMAINS and compute_status)
+    "https://www.reddit.com/r/CryptoCurrency/.rss",
+    "https://www.reddit.com/r/Bitcoin/.rss",
+    "https://www.reddit.com/r/ethereum/.rss",
 )
 # Domains that count as PRIMARY/official sources (exchange, regulator, project).
 # An event is VERIFIED only with one of these PLUS an independent confirmation.
@@ -346,6 +356,12 @@ NEWS_OFFICIAL_DOMAINS = frozenset({
     "binance.com", "coinbase.com", "kraken.com", "okx.com", "bybit.com",
     "sec.gov", "treasury.gov", "federalreserve.gov", "ecb.europa.eu",
     "ethereum.org", "bitcoin.org", "solana.com", "ripple.com",
+})
+# Social/community domains: real-time "social truth" for discovery, but a
+# social post is a rumor, not evidence — it can never confirm an event.
+NEWS_SOCIAL_DOMAINS = frozenset({
+    "reddit.com", "old.reddit.com", "np.reddit.com",
+    "twitter.com", "x.com", "nitter.net",
 })
 
 # ------------------------------------------------------------------ files

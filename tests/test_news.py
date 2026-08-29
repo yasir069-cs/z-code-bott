@@ -85,6 +85,180 @@ def test_official_denial_debunks():
     assert compute_status(e) == "DEBUNKED"
 
 
+# ------------------------------------------------ social sources (rumor-stage)
+
+def test_social_never_verifies_an_event():
+    """Any number of social posts cannot lift an event above DEVELOPING —
+    a Reddit thread is a rumor, not evidence."""
+    e = NewsEvent()
+    e.articles = [
+        _art("Huge exchange incident reported", "www.reddit.com", "https://reddit.com/r/1"),
+        _art("Huge exchange incident reported", "www.reddit.com", "https://reddit.com/r/2"),
+        _art("Huge exchange incident reported", "x.com", "https://x.com/u/1"),
+    ]
+    assert compute_status(e) == "DEVELOPING"
+
+
+def test_social_does_not_count_as_independent_confirmation():
+    """Official source + social buzz is still NOT verified: verification
+    needs an independent NEWS outlet, not a Reddit echo."""
+    e = NewsEvent()
+    e.articles = [
+        _art("Exchange X confirms incident", "binance.com", "https://binance.com/1"),
+        _art("Exchange X incident discussed", "www.reddit.com", "https://reddit.com/r/1"),
+    ]
+    assert compute_status(e) == "DEVELOPING"
+
+    # ...but once one news outlet reports it, the event verifies
+    e.articles.append(_art("Exchange X incident reported", "cointelegraph.com",
+                           "https://c.com/1"))
+    assert compute_status(e) == "VERIFIED"
+
+
+def test_social_plus_press_is_not_partial():
+    """Social + one news outlet = the outlet alone (DEVELOPING): the social
+    post adds nothing to corroboration."""
+    e = NewsEvent()
+    e.articles = [
+        _art("Something happened", "cointelegraph.com", "https://c.com/1"),
+        _art("Something happened", "www.reddit.com", "https://reddit.com/r/1"),
+    ]
+    assert compute_status(e) == "DEVELOPING"
+
+
+def test_social_clusters_into_events_and_alert_sources_stay_clean():
+    """Social posts still feed discovery/clustering (early signal), and a
+    VERIFIED alert never lists a social URL as an independent confirmation."""
+    engine = NewsEngine()
+    pending = engine.ingest([
+        _art("Binance reports security incident", "www.reddit.com",
+             "https://reddit.com/r/cc/1", "Users report withdrawal issues."),
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ])
+    assert len(engine._events) == 1                    # social clustered in
+    assert pending[0][0].status == "VERIFIED"
+    confirmations = pending[0][0].independent_confirmations
+    assert all(not news.is_social(a.source_domain) for a in confirmations)
+    assert "cointelegraph.com" in [a.source_domain for a in confirmations]
+
+
+def test_atom_entry_parsing_for_social_feeds():
+    """Reddit .rss is Atom (<entry>/<link href>/<updated>), not RSS 2.0 —
+    the parser must read both formats."""
+    atom = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <title>Bitcoin breaks out</title>
+        <link href="https://www.reddit.com/r/Bitcoin/comments/abc123/breakout/"/>
+        <updated>Sat, 29 Aug 2026 12:00:00 GMT</updated>
+        <content>Discussion of the bitcoin breakout.</content>
+      </entry>
+    </feed>"""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(atom)
+    title, url, updated, summary = news._atom_fields(root.find(
+        "{http://www.w3.org/2005/Atom}entry"))
+    assert title == "Bitcoin breaks out"
+    assert "reddit.com" in url
+    assert updated
+    assert "breakout" in summary.lower()
+
+
+# ------------------------------------------------------- 20-minute cooldown
+
+def _alerted_engine():
+    """Engine whose first event has already been alerted just now."""
+    engine = NewsEngine()
+    first = engine.ingest([
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ])
+    e = first[0][0]
+    engine.publish(e, "new", analyzer=_ai_ok,
+                   market_fn=lambda a: {"observed": []},
+                   send_fn=lambda m: True)
+    return engine, e
+
+
+def test_material_update_blocked_inside_cooldown_window():
+    """A material update arriving minutes after the alert must NOT re-alert
+    — the 20-minute cooldown suppresses duplicates."""
+    engine, e = _alerted_engine()
+    pending = engine.ingest([
+        _art("Binance confirms security incident, loss of 40000 BTC estimated",
+             "theblock.co", "https://t.com/2",
+             "Losses estimated at 40000 BTC according to the filing."),
+    ])
+    assert pending == []                      # inside cooldown: suppressed
+
+
+def test_material_update_fires_after_cooldown_expires(monkeypatch):
+    """Once 20 minutes have passed, the same new details DO re-alert — the
+    material tokens were held back, not lost."""
+    engine, e = _alerted_engine()
+    # age the last alert beyond the cooldown
+    from datetime import timedelta as _td
+    e.last_alerted_at = e.last_alerted_at - _td(
+        seconds=config.NEWS_ALERT_COOLDOWN_SECONDS + 60)
+    pending = engine.ingest([
+        _art("Binance confirms security incident, loss of 40000 BTC estimated",
+             "theblock.co", "https://t.com/2",
+             "Losses estimated at 40000 BTC according to the filing."),
+    ])
+    assert len(pending) == 1 and pending[0][1] == "update"
+
+
+def test_failed_publish_does_not_start_cooldown():
+    """Cooldown protects against duplicate ALERTS, not attempts: if Telegram
+    failed, the event is still un-alerted and may retry."""
+    engine = NewsEngine()
+    first = engine.ingest([
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ])
+    e = first[0][0]
+    engine.publish(e, "new", analyzer=_ai_ok,
+                   market_fn=lambda a: {"observed": []},
+                   send_fn=lambda m: False)     # send failed
+    assert e.last_alerted_at is None           # no cooldown started
+
+
+# ------------------------------------------------------- Trump news handling
+
+def test_trump_news_extracts_assets_and_clusters():
+    """Trump crypto policy news: TRUMP asset extracted, stories about the
+    same announcement cluster into one event."""
+    assets = news.extract_assets("Trump signs executive order on bitcoin reserves")
+    assert "TRUMP" in assets and "BTC" in assets
+
+    engine = NewsEngine()
+    pending = engine.ingest([
+        _art("Trump signs executive order on crypto reserves",
+             "binance.com", "https://binance.com/en/x",
+             "Official announcement confirms the executive order."),
+        _art("Trump signs executive order on crypto reserves",
+             "cointelegraph.com", "https://c.com/t1",
+             "The executive order covers bitcoin reserves."),
+    ])
+    assert len(engine._events) == 1            # one clustered event
+    assert pending[0][0].status == "VERIFIED"
+    assert "TRUMP" in pending[0][0].assets
+
+
+def test_trump_feeds_configured():
+    """Dedicated Trump/politics discovery feeds must be present so Trump
+    market-moving news actually reaches the engine."""
+    feeds = " ".join(config.NEWS_RSS_FEEDS)
+    assert "donald-trump" in feeds
+    assert "politics" in feeds
+
+
 def test_is_official_matches_subdomains():
     assert is_official("binance.com") is True
     assert is_official("www.binance.com") is True
@@ -267,7 +441,7 @@ def test_duplicate_event_does_not_duplicate_alert():
     assert again == []                          # no new/update alert
 
 
-def test_material_update_creates_update_alert():
+def test_material_update_creates_update_alert(monkeypatch):
     engine = NewsEngine()
     # round 1: press + official -> VERIFIED, alert goes out
     first = _ingest_cycle(engine, [
@@ -283,7 +457,10 @@ def test_material_update_creates_update_alert():
                    send_fn=lambda m: True)
     assert e.last_alerted_at is not None
 
-    # round 2: material new verified details (loss figure) -> UPDATE alert
+    # round 2 (after the 20-minute cooldown): material new verified details
+    from datetime import timedelta as _td
+    e.last_alerted_at = e.last_alerted_at - _td(
+        seconds=config.NEWS_ALERT_COOLDOWN_SECONDS + 60)
     updates = _ingest_cycle(engine, [
         _art("Binance confirms security incident, loss of 40000 BTC estimated",
              "theblock.co", "https://t.com/2",
