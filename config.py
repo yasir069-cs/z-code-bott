@@ -344,6 +344,12 @@ NEWS_RSS_FEEDS = (
     # broader market, so it gets dedicated discovery feeds.
     "https://cointelegraph.com/rss/tag/donald-trump",
     "https://cointelegraph.com/rss/tag/politics",
+    # OFFICIAL announcement feeds (primary sources: an announcement here +
+    # one independent news report = VERIFIED). Binance's announcement RSS is
+    # bot-blocked (HTTP 202/empty), so press + regulator coverage is the
+    # practical path for exchange news today.
+    "https://blog.ethereum.org/feed.xml",
+    "https://solana.com/news/rss.xml",
     # social/unofficial feeds: discovery + early clustering only — they NEVER
     # satisfy verification (see NEWS_SOCIAL_DOMAINS and compute_status)
     "https://www.reddit.com/r/CryptoCurrency/.rss",
@@ -370,6 +376,24 @@ LIQUIDATION_BURST_COUNT = 3
 SIGNALS_LOG_FILE = BASE_DIR / "signals_log.csv"
 BOT_LOG_FILE = BASE_DIR / "bot.log"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Credentials known to have been exposed in chat/logs. If one of these is
+# still configured at startup, warn loudly on every boot until rotated.
+_EXPOSED_TELEGRAM_TOKEN = "8851597372:AAFlynes"
+_EXPOSED_OPENROUTER_KEY = "sk-or-v1-5e4bb826af4b"
+
+
+def check_exposed_credentials() -> list[str]:
+    """Return warnings for any still-configured credential that is known to
+    have been leaked publicly. Empty list = clean."""
+    warnings = []
+    if TELEGRAM_TOKEN.startswith(_EXPOSED_TELEGRAM_TOKEN):
+        warnings.append("TELEGRAM_TOKEN was exposed in chat — revoke it via "
+                        "@BotFather /revoke and put the new token in .env")
+    if OPENROUTER_API_KEY.startswith(_EXPOSED_OPENROUTER_KEY):
+        warnings.append("OPENROUTER_API_KEY was exposed in chat — revoke it at "
+                        "openrouter.ai/keys and put the new key in .env")
+    return warnings
 
 CSV_COLUMNS = ["timestamp", "coin", "signal", "entry", "SL", "TP", "RR",
                "leverage", "position_size", "funding_rate", "confidence",
