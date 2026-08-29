@@ -168,7 +168,8 @@ AI_REASONING_ENABLED = False
 # array. This is what keeps the bot inside the free tier's 50 requests/day and
 # collapses ~10s-per-candidate into a single round trip.
 AI_BATCH_ENABLED = True
-AI_BATCH_MAX = 12               # candidates per request; more than this is chunked
+AI_BATCH_MAX = 20               # candidates per request; more than this is chunked
+                               # (20 fits a full scan's shortlist in ONE request)
 AI_RETRY_MAX = 3                # retry 429 / 5xx / timeout / malformed JSON
 AI_RETRY_BACKOFF_BASE = 1.0     # 1s, 2s, 4s
 AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "50"))  # OpenRouter free tier cap
