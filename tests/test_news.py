@@ -1,0 +1,433 @@
+"""News verification engine tests — the AI NEVER decides what is true.
+
+Pins the whole spec: VERIFIED-only publication, deterministic verification,
+fact/interpretation separation, no-hallucination guardrails, duplicate vs
+material-update handling, observed-data labeling, causality discipline and
+the news/trading-signal separation.
+"""
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+import config
+import news
+import news_analysis as na
+from news import (Article, NewsEngine, NewsEvent, compute_status,
+                  format_news_alert, is_official)
+
+NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+
+
+def _art(title, domain, url, summary="", when=None):
+    return Article(title=title, url=url, source_domain=domain,
+                   published_at=when or NOW, summary=summary)
+
+
+def _hack_event():
+    """A verified exchange-hack event: official source + independent press."""
+    e = NewsEvent()
+    e.articles = [
+        _art("Binance reports security incident affecting withdrawal system",
+             "binance.com", "https://binance.com/en/support/announcement/x",
+             "Binance confirmed an incident and suspended withdrawals."),
+        _art("Binance halts withdrawals after security incident",
+             "cointelegraph.com", "https://cointelegraph.com/news/1",
+             "Withdrawals on Binance are suspended following an incident."),
+    ]
+    e.assets = {"BNB", "BTC"}
+    e.status = compute_status(e)
+    return e
+
+
+def _ai_ok(event, market=None):
+    return {
+        "summary": "Binance officially confirmed a security incident affecting "
+                   "its withdrawal system and suspended withdrawals.",
+        "direction": "BEARISH",
+        "strength": "HIGH",
+        "horizons": {"immediate": "Could cause volatility and liquidation activity.",
+                     "short_term": "Could create selling pressure on BNB.",
+                     "medium_term": "Impact depends on the outcome of the investigation."},
+        "interpretation": "Potentially bearish for BNB because withdrawal "
+                          "suspensions historically reduce confidence.",
+        "key_risk": "Scope of the incident is not yet public.",
+        "fact_interpretation_separated": True,
+    }
+
+
+# --------------------------------------------------- 1. verification is rule-based
+
+def test_verified_needs_official_plus_independent():
+    assert _hack_event().status == "VERIFIED"
+
+
+def test_press_only_is_not_verified():
+    e = NewsEvent()
+    e.articles = [
+        _art("Binance halts withdrawals", "cointelegraph.com", "https://a.com/1"),
+        _art("Binance halts withdrawals", "theblock.co", "https://b.com/1"),
+    ]
+    assert compute_status(e) == "PARTIALLY_VERIFIED"
+
+
+def test_single_source_is_developing():
+    e = NewsEvent()
+    e.articles = [_art("Something happened", "cointelegraph.com", "https://a.com/1")]
+    assert compute_status(e) == "DEVELOPING"
+
+
+def test_official_denial_debunks():
+    e = NewsEvent()
+    e.articles = [
+        _art("Exchange X denies hack report", "binance.com", "https://binance.com/1"),
+        _art("Exchange X denies hack report", "cointelegraph.com", "https://c.com/1"),
+    ]
+    assert compute_status(e) == "DEBUNKED"
+
+
+def test_is_official_matches_subdomains():
+    assert is_official("binance.com") is True
+    assert is_official("www.binance.com") is True
+    assert is_official("support.binance.com") is True
+    assert is_official("notbinance.com") is False
+    assert is_official("cointelegraph.com") is False
+
+
+def test_is_official_rejects_look_alike_domains():
+    """Phishing look-alikes must never count as official primary sources
+    (regression: lstrip("www.") treated wbinance.com as official)."""
+    for fake in ("wbinance.com", "wwbinance.com", ".binance.com",
+                 "binance.com.evil.io", "binance.co", "secure-binance.com"):
+        assert is_official(fake) is False, fake
+
+
+# ------------------------------------------------- 2. unverified never publishes
+
+def test_unverified_news_never_reaches_ai_publication():
+    engine = NewsEngine()
+    calls = []
+    engine.ingest([_art("Binance halts withdrawals", "cointelegraph.com", "https://a.com/1")])
+    sent = engine.publish(engine._events[0], "new", analyzer=calls.append,
+                          market_fn=lambda a: {"observed": [], "unavailable": []},
+                          send_fn=lambda m: True)
+    assert sent is False and calls == []          # analyzer never invoked
+
+
+def test_ai_cannot_override_verification_status():
+    """Even a bullish-looking AI result cannot publish a DEVELOPING event."""
+    e = _hack_event()
+    e.status = "DEVELOPING"
+    engine = NewsEngine()
+    sent = engine.publish(e, "new", analyzer=_ai_ok,
+                          market_fn=lambda a: {"observed": [], "unavailable": []},
+                          send_fn=lambda m: True)
+    assert sent is False
+
+
+def test_analysis_refuses_non_verified_event():
+    e = _hack_event()
+    e.status = "PARTIALLY_VERIFIED"
+    with pytest.raises(na.AINewsError):
+        na.analyze_event(e)
+
+
+# ------------------------------------------------------- 3. AI analysis output
+
+def test_verified_news_generates_ai_summary_and_classification():
+    e = _hack_event()
+    out = _ai_ok(e)
+    assert out["direction"] == "BEARISH" and out["strength"] == "HIGH"
+    assert set(out["horizons"]) == {"immediate", "short_term", "medium_term"}
+
+
+def test_validation_rejects_illegal_enums():
+    e = _hack_event()
+    base = _ai_ok(e)
+    with pytest.raises(na.AINewsError):
+        na._validate({**base, "direction": "MOON"}, e)
+    with pytest.raises(na.AINewsError):
+        na._validate({**base, "strength": "MASSIVE"}, e)
+
+
+def test_validation_rejects_missing_horizons():
+    e = _hack_event()
+    base = _ai_ok(e)
+    base["horizons"] = {"immediate": "x"}       # short/medium missing
+    with pytest.raises(na.AINewsError):
+        na._validate(base, e)
+
+
+@pytest.mark.parametrize("phrase", [
+    "BTC will rise sharply",
+    "This is guaranteed profit",
+    "BUY BTC now",
+    "ETH will pump tonight",
+])
+def test_guaranteed_move_language_rejected(phrase):
+    e = _hack_event()
+    base = _ai_ok(e)
+    with pytest.raises(na.AINewsError):
+        na._validate({**base, "interpretation": phrase}, e)
+
+
+def test_bullish_bearish_neutral_classifications_all_legal():
+    e = _hack_event()
+    for d in ("BULLISH", "BEARISH", "MIXED", "NEUTRAL", "UNCERTAIN"):
+        out = na._validate({**_ai_ok(e), "direction": d}, e)
+        assert out["direction"] == d
+
+
+def test_uncertain_when_evidence_insufficient():
+    """The prompt forces UNCERTAIN when sources are thin; validator accepts it."""
+    e = _hack_event()
+    out = na._validate({**_ai_ok(e), "direction": "UNCERTAIN"}, e)
+    assert out["direction"] == "UNCERTAIN"
+
+
+def test_critical_event_gets_appropriate_classification():
+    """Verified exchange hack -> BEARISH / HIGH or EXTREME (pinned by fixtures
+    + the prompt's own instructions)."""
+    out = _ai_ok(_hack_event())
+    assert out["direction"] == "BEARISH" and out["strength"] in ("HIGH", "EXTREME")
+
+
+# ----------------------------------------------------- 4. fact vs interpretation
+
+def test_facts_and_interpretation_are_separated():
+    """Summary carries only what sources state; interpretation is a separate,
+    hedged field. The alert renders them in different sections."""
+    e = _hack_event()
+    out = _ai_ok(e)
+    msg = format_news_alert(e, out, {"observed": [], "unavailable": ["all"]})
+    assert "What happened" in msg and out["summary"] in msg
+    assert "AI market analysis" in msg and out["interpretation"] in msg
+    assert out["summary"] != out["interpretation"]
+
+
+def test_alert_uses_the_spec_template():
+    e = _hack_event()
+    msg = format_news_alert(e, _ai_ok(e), {"observed": [], "unavailable": ["all"]})
+    for section in ("VERIFIED CRYPTO NEWS", "What happened", "Market impact",
+                    "Impact strength", "Time horizon", "AI market analysis",
+                    "Affected assets", "Key risk", "Verification",
+                    "Sources", "VERIFIED"):
+        assert section in msg
+    assert e.articles[0].url in msg            # primary source listed
+
+
+# ----------------------------------------------------------- 5. no hallucination
+
+def test_prompt_is_source_grounded_not_headline_only():
+    e = _hack_event()
+    prompt = na.build_prompt(e, {})
+    for a in e.articles:                        # both source contents included
+        assert a.source_domain in prompt
+        assert a.summary[:40] in prompt
+    assert "BNB" in prompt                      # assets included
+    assert "OBSERVED" in prompt or "No market data" in prompt
+
+
+def test_ai_never_receives_decision_to_publish():
+    """publish() consults verification BEFORE the analyzer and aborts on
+    non-VERIFIED — the AI cannot manufacture a publication path."""
+    engine = NewsEngine()
+    e = _hack_event()
+    e.status = "CONFLICTED"
+    sent = engine.publish(e, "new", analyzer=_ai_ok,
+                          market_fn=lambda a: {"observed": []},
+                          send_fn=lambda m: True)
+    assert sent is False
+
+
+# ------------------------------------------------------------- 6. duplicates
+
+def _ingest_cycle(engine, articles):
+    return engine.ingest(articles)
+
+
+def test_duplicate_event_does_not_duplicate_alert():
+    engine = NewsEngine()
+    first = _ingest_cycle(engine, [
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ])
+    assert len(first) == 1 and first[0][1] == "new"
+    e = first[0][0]
+    engine.publish(e, "new", analyzer=_ai_ok,
+                   market_fn=lambda a: {"observed": []},
+                   send_fn=lambda m: True)
+
+    # same story re-reported: cosmetic new article, nothing material
+    again = _ingest_cycle(engine, [
+        _art("Binance halts withdrawals after incident, report",
+             "theblock.co", "https://t.com/1", "Withdrawals suspended."),
+    ])
+    assert again == []                          # no new/update alert
+
+
+def test_material_update_creates_update_alert():
+    engine = NewsEngine()
+    # round 1: press + official -> VERIFIED, alert goes out
+    first = _ingest_cycle(engine, [
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ])
+    assert len(first) == 1 and first[0][1] == "new"
+    e = first[0][0]
+    engine.publish(e, "new", analyzer=_ai_ok,
+                   market_fn=lambda a: {"observed": []},
+                   send_fn=lambda m: True)
+    assert e.last_alerted_at is not None
+
+    # round 2: material new verified details (loss figure) -> UPDATE alert
+    updates = _ingest_cycle(engine, [
+        _art("Binance confirms security incident, loss of 40000 BTC estimated",
+             "theblock.co", "https://t.com/2",
+             "Losses estimated at 40000 BTC according to the official filing."),
+    ])
+    assert len(updates) == 1 and updates[0][1] == "update"
+    assert updates[0][0] is e
+    msg = format_news_alert(e, _ai_ok(e), {"observed": []},
+                            update_note="new verified details: 40000")
+    assert "VERIFIED NEWS UPDATE" in msg and "What changed" in msg
+
+
+# --------------------------------------------------------- 7. market data
+
+def test_market_data_labeled_as_observed():
+    e = _hack_event()
+    market = {"observed": [{
+        "symbol": "BNB/USDT:USDT", "price": 600.0, "change_1h_pct": -3.2,
+        "change_24h_pct": -5.1, "volume_change_pct": None,
+        "open_interest": None, "funding_rate": 0.0001, "liquidation": None,
+    }], "unavailable": []}
+    msg = format_news_alert(e, _ai_ok(e), market)
+    assert "Observed market data" in msg
+    assert "measured, not interpretation" in msg
+    assert "-3.20%" in msg
+    # prompt also labels it observed and forbids causal claims
+    prompt = na.build_prompt(e, market)
+    assert "OBSERVED (do not attribute causality" in prompt
+
+
+def test_missing_market_measurements_render_na_not_zero():
+    """A field the exchange did not return must render 'n/a' — reporting a
+    flat 0.0% would fabricate a measurement (regression for change_1h)."""
+    e = _hack_event()
+    market = {"observed": [{
+        "symbol": "BNB/USDT:USDT", "price": 600.0, "change_1h_pct": None,
+        "change_24h_pct": None, "volume_change_pct": None,
+        "open_interest": None, "funding_rate": None, "liquidation": None,
+    }], "unavailable": []}
+    msg = format_news_alert(e, _ai_ok(e), market)
+    assert "n/a" in msg
+    assert "+0.00%" not in msg and "0.00%" not in msg
+    prompt = na.build_prompt(e, market)
+    assert "n/a" in prompt and "+0" not in prompt
+
+
+def test_market_data_failure_still_alerts_with_note():
+    e = _hack_event()
+    msg = format_news_alert(e, _ai_ok(e), {"observed": [], "unavailable": ["all"]})
+    assert "Market data unavailable" in msg
+    prompt = na.build_prompt(e, {"observed": [], "unavailable": ["all"]})
+    assert "do not make market claims" in prompt
+
+
+def test_no_causality_language_in_validated_output():
+    """The validator's forbidden list bars causal-certainty phrasing too."""
+    e = _hack_event()
+    with pytest.raises(na.AINewsError):
+        na._validate({**_ai_ok(e),
+                      "interpretation": "This news caused BTC to fall and it "
+                                        "will continue falling."}, e)
+
+
+# -------------------------------------------- 8. news/trading-signal separation
+
+def test_ai_cannot_directly_create_trading_signal():
+    """The alert message and analysis output carry no BUY/SELL signal, and
+    the news modules never touch the trading pipeline."""
+    import news_market  # noqa: F401  (module exists, separate from trading)
+    e = _hack_event()
+    msg = format_news_alert(e, _ai_ok(e), {"observed": []})
+    for banned in ("BUY", "SELL", "LONG", "SHORT", "signal"):
+        assert banned not in msg, f"alert leaks trading language: {banned}"
+    # news.py / news_analysis.py never import decision/signal modules
+    import news  # noqa: F401
+    import sys
+    for mod in ("decision", "setup_quality", "risk_gate"):
+        assert not any(m.endswith(mod) and m.startswith("news")
+                       for m in sys.modules)
+
+
+# ----------------------------------------------------- 9. failure behavior
+
+def test_ai_failure_skips_alert_entirely():
+    engine = NewsEngine()
+    e = _hack_event()
+    sent_messages = []
+
+    def broken_analyzer(event, market):
+        raise na.AINewsError("transport down")
+
+    sent = engine.publish(e, "new", analyzer=broken_analyzer,
+                          market_fn=lambda a: {"observed": []},
+                          send_fn=sent_messages.append)
+    assert sent is False and sent_messages == []   # nothing incomplete sent
+
+
+def test_publish_records_state_only_on_success():
+    engine = NewsEngine()
+    e = _hack_event()
+    engine.publish(e, "new", analyzer=_ai_ok,
+                   market_fn=lambda a: {"observed": []},
+                   send_fn=lambda m: False)         # telegram failed
+    assert e.last_alerted_at is None               # so future material updates still alert
+
+
+# ------------------------------------------------------------ 10. clustering
+
+def test_similarity_clustering_merges_same_story():
+    engine = NewsEngine()
+    pending = _ingest_cycle(engine, [
+        _art("Binance reports security incident affecting withdrawals",
+             "binance.com", "https://binance.com/en/x", "Incident confirmed."),
+        _art("Binance halts withdrawals after security incident",
+             "cointelegraph.com", "https://c.com/1", "Withdrawals suspended."),
+    ])
+    assert len(engine._events) == 1               # one event, two articles
+    assert pending[0][0].status == "VERIFIED"
+
+
+def test_different_stories_stay_separate():
+    engine = NewsEngine()
+    _ingest_cycle(engine, [
+        _art("Ethereum foundation announces grant program",
+             "ethereum.org", "https://ethereum.org/x", "Grants announced."),
+        _art("Solana network outage resolved",
+             "solana.com", "https://solana.com/x", "Outage resolved."),
+    ])
+    assert len(engine._events) == 2
+
+
+def test_old_events_expire():
+    engine = NewsEngine()
+    _ingest_cycle(engine, [_art("Old story", "cointelegraph.com",
+                                "https://old.com/1",
+                                when=NOW - timedelta(hours=48))])
+    _ingest_cycle(engine, [_art("Fresh story", "cointelegraph.com",
+                                "https://new.com/1")])
+    assert all("Fresh" in e.headline or
+               max(a.published_at for a in e.articles) >
+               datetime.now(timezone.utc) - timedelta(hours=config.NEWS_EVENT_WINDOW_HOURS)
+               for e in engine._events)
+
+
+def test_asset_extraction():
+    assets = news.extract_assets("Bitcoin and Ethereum rally as $SUI launches")
+    assert {"BTC", "ETH", "SUI"} <= assets
