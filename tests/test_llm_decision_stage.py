@@ -83,6 +83,20 @@ def test_llm_confirming_verdict_keeps_signal():
     assert signal == "BUY" and out is d and ai_used is True
 
 
+def test_llm_confirming_a_core_rejected_direction_still_validates():
+    """The LLM confirms the SAME direction the core proposed but REJECTED
+    (exhaustion/quality): the hard gates must still re-validate it — a
+    confirming verdict cannot rescue a setup the math rejects."""
+    d = _decide(DOWNTREND)                    # core direction=SHORT, NO_TRADE
+    assert d["direction"] == "SHORT" and d["decision"] == "NO_TRADE"
+    out, signal, ai_used, _ = _apply_llm_verdict(d, _verdict("SHORT"), "T")
+    assert ai_used is True
+    assert out is not d                       # post_llm_validate ran
+    assert signal == "HOLD"                   # gates still reject the short
+    assert out["decision"] == "NO_TRADE"
+    assert "llm_no_trade" not in (out.get("no_trade_reasons") or [])
+
+
 def test_absent_verdict_leaves_deterministic_result():
     d = _decide(DOWNTREND)                    # exhausted short -> NO_TRADE
     out, signal, ai_used, reason = _apply_llm_verdict(d, None, "T")
@@ -90,18 +104,44 @@ def test_absent_verdict_leaves_deterministic_result():
     assert out is d
 
 
-def test_llm_flip_is_rescored_by_the_same_gates():
-    """LLM flips a deterministic LONG to SHORT: rescore_direction re-runs the
-    direction/risk/quality gates for SHORT — the flip only stands if they
-    confirm it (here the 1H structure is bullish, so SHORT must fail)."""
+def test_llm_flip_is_validated_by_post_llm_gates():
+    """LLM flips a deterministic LONG to SHORT: post_llm_validate runs the
+    hard gates for SHORT — the flip only stands if they confirm it (here the
+    1H structure is bullish, so SHORT fails the quality floor)."""
     d = _decide(UPTREND)                      # deterministic LONG
     assert d["decision"] == "LONG"
     out, signal, ai_used, _ = _apply_llm_verdict(d, _verdict("SHORT"), "T")
     assert ai_used is True
-    assert out["direction"] == "SHORT"        # rescored to the LLM's direction
+    assert out["direction"] == "SHORT"        # re-validated for the LLM's direction
     assert signal == "HOLD"                   # ...but the gates rejected it
     assert out["decision"] == "NO_TRADE"
-    assert out["no_trade_reasons"]            # with explicit reasons
+    assert out["no_trade_reasons"]            # with explicit gate reasons
+
+
+def test_post_llm_gates_are_hard_safety_only():
+    """The post-LLM reasons must be hard-safety gates (data/levels/stop/RR/
+    quality) — never opinion vetoes like counter_htf or directional_conflict
+    (those live inside the quality computation as score discounts)."""
+    d = _decide(UPTREND)
+    out = decision.post_llm_validate(d, "SHORT")
+    assert out["decision"] == "NO_TRADE"
+    assert out["no_trade_reasons"]
+    for r in out["no_trade_reasons"]:
+        assert r not in ("counter_htf", "directional_conflict"), r
+
+
+def test_post_llm_validate_confirming_direction_passes():
+    d = _decide(UPTREND)
+    out = decision.post_llm_validate(d, "LONG")
+    assert out["decision"] == "LONG"
+    assert out["no_trade_reasons"] == []
+
+
+def test_post_llm_validate_rejects_invalid_direction():
+    d = _decide(UPTREND)
+    out = decision.post_llm_validate(d, "GARBAGE")
+    assert out["decision"] == "NO_TRADE"
+    assert "invalid_direction" in out["no_trade_reasons"]
 
 
 def test_flip_rejection_reasons_are_deterministic_not_llm_opinion():
@@ -109,12 +149,6 @@ def test_flip_rejection_reasons_are_deterministic_not_llm_opinion():
     out, _, _, _ = _apply_llm_verdict(d, _verdict("SHORT"), "T")
     # every reason is a real gate verdict, never a bare "llm said no"
     assert all(r != "llm_no_trade" for r in out["no_trade_reasons"])
-
-
-def test_rescore_same_direction_is_identity():
-    d = _decide(UPTREND)
-    assert decision.rescore_direction(d, "LONG") is d
-    assert decision.rescore_direction(d, "GARBAGE") is d
 
 
 # ------------------------------------------------------- emission rule (65)
@@ -145,11 +179,50 @@ def test_decision_bundle_carries_full_structured_data():
     assert bundle["ind_1h"] is d["snaps"]["1h"]
     assert "liquidation" in bundle
     prompt = ai_decision.build_decision_prompt(bundle)
-    # the model sees structure, risk, liquidation and the verdict instruction
+    # the model sees the factual evidence and the verdict instruction
     assert "LONG|SHORT|NO_TRADE" in prompt
-    assert "Setup quality" in prompt and "Risk (Python structural)" in prompt
+    assert "MEASURED MARKET FACTS" in prompt
+    assert "Calculated structural levels" in prompt
+    assert "Structure (setup TF)" in prompt
+    assert "1H range position" in prompt
     assert "WEBSOCKET LIQUIDATION DATA" in prompt
     assert "Liquidation data is context only" in prompt
+
+
+def test_prompt_contains_no_python_verdict_or_reasons():
+    """THE anti-rubber-stamp test: the LLM must never see Python's
+    preliminary NO_TRADE verdict, its reasons, its quality scores, its
+    penalty narratives or the funnel's directional hint — anything Python
+    'decided' would bias the model before it evaluates the data itself."""
+    d = _decide(DOWNTREND)               # core rejected this exhausted short
+    assert d["decision"] == "NO_TRADE" and d["no_trade_reasons"]
+    cand = {"symbol": "TEST/USDT:USDT", "direction": "SELL", "fr": None,
+            "feat_1h": {"sweep": None}}
+    bundle = _build_decision_bundle(cand, d, d["snaps"]["5m"], None)
+    assert bundle is not None
+    prompt = ai_decision.build_decision_prompt(bundle)
+    for banned in ("Python core direction", "Python NO_TRADE reasons",
+                   "Setup quality:", "Quality penalties", "MTF notes",
+                   "insufficient_primary_evidence", "poor_rr",
+                   "low_setup_quality", "directional_conflict",
+                   "counter_htf", "Funnel direction", "REJECTED",
+                   "penalized"):
+        assert banned not in prompt, f"prompt leaks Python verdict: {banned}"
+    # the batched prompt is equally clean
+    batch_prompt = ai_decision._build_batch_decision_prompt([bundle])
+    for banned in ("Python core", "no_trade_reasons", "Setup quality",
+                   "penalized", "Funnel direction"):
+        assert banned not in batch_prompt, f"batch prompt leaks: {banned}"
+
+
+def test_prompt_instructions_declare_independence():
+    d = _decide(UPTREND)
+    cand = {"symbol": "TEST/USDT:USDT", "direction": "BUY", "fr": None,
+            "feat_1h": {"sweep": None}}
+    bundle = _build_decision_bundle(cand, d, d["snaps"]["5m"], None)
+    prompt = ai_decision.build_decision_prompt(bundle)
+    assert "NO preliminary verdict" in prompt
+    assert "first decision-maker" in prompt
 
 
 def test_bundle_skips_incomplete_snapshots():

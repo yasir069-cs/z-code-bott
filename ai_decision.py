@@ -702,25 +702,36 @@ _VERDICT_MAP = {"LONG": "LONG", "SHORT": "SHORT", "NO_TRADE": "NO_TRADE",
 _VERDICT_JSON_SHAPE = ('{"symbol": "...", "signal": "LONG|SHORT|NO_TRADE", '
                        '"confidence": 0, "reason": "short explanation"}')
 
-_DECISION_INSTRUCTIONS = """You are the decision stage of a crypto futures signal bot.
-The Python pipeline has collected and structured all the data below for one
-shortlisted coin. Consider EVERY factor — market structure, S/R zones,
-liquidity/sweep, price action, multi-timeframe alignment, futures context
-(open interest, funding), indicators, AND the websocket liquidation data.
+_DECISION_INSTRUCTIONS = """You are the INDEPENDENT decision stage of a crypto futures signal bot.
+The data pipeline collected and structured the FACTUAL evidence below for one
+shortlisted coin. There is NO preliminary verdict from Python — you are the
+first decision-maker. Consider EVERY factor — market structure, S/R zones,
+liquidity and sweep data, price action, multi-timeframe alignment, futures
+context (open interest, funding), indicators, and the websocket liquidation
+data — then choose LONG, SHORT, or NO_TRADE entirely on the evidence.
 
-You may AGREE with the deterministic Python core or DISAGREE with it, but:
-- Judge the setup on its merits; the Python quality score and reasons are
-  evidence, not orders.
+- Judge the setup strictly on the data provided; derive your own read of the
+  structure, location and momentum.
 - Liquidation data is context only — never decide on a liquidation spike alone.
 - Do NOT fabricate facts or data that is not provided.
-- After your verdict, deterministic gates (stop width, R/R, setup quality)
-  re-validate it, so a verdict without a real tradable structure will be
-  rejected anyway. NO_TRADE is a fully acceptable answer.
+- After your decision, hard safety gates (data validity, stop width, minimum
+  R/R, setup quality) re-validate it, so a verdict without a tradable
+  structure will be rejected anyway. NO_TRADE is a fully acceptable answer.
 Return ONLY JSON."""
 
 
-def _evidence_block(det: dict) -> str:
-    """Render the deterministic core's structured evidence for the prompt."""
+def _fmt_lvl(v) -> str:
+    return f"{v:.6g}" if isinstance(v, (int, float)) else "n/a"
+
+
+def _facts_block(det: dict) -> str:
+    """Render FACTUAL evidence only — never a preliminary verdict.
+
+    The LLM must choose LONG/SHORT/NO_TRADE independently, so nothing here may
+    carry Python's decision, its NO_TRADE reasons, its quality scores or its
+    penalty narratives. What the model gets: measured structure events, zones,
+    liquidity, price action, MTF biases, futures context, the calculated
+    structural levels and data warnings."""
     structure = det.get("structure") or {}
     sr = det.get("sr") or {}
     liq = det.get("liquidity") or {}
@@ -728,67 +739,87 @@ def _evidence_block(det: dict) -> str:
     tl = det.get("trendline") or {}
     fut = det.get("futures") or {}
     risk = det.get("risk") or {}
-    quality = det.get("quality") or {}
     mtf = det.get("mtf") or {}
+    warnings = det.get("data_warnings") or []
+    fr = det.get("funding_rate")
 
     lines = [
-        f"Python core direction: {det.get('direction') or 'n/a'} "
-        f"(decision: {det.get('decision')})",
-        f"Setup quality: {det.get('setup_quality', 0):.1f}/100 "
-        f"(primary {det.get('primary', 0):.1f})",
         f"HTF bias: {det.get('htf_bias', 'n/a')}",
-        f"Structure: trend={structure.get('trend', 'n/a')}, "
+        f"Structure (setup TF): trend={structure.get('trend', 'n/a')}, "
         f"bias={structure.get('bias', 'n/a')}, "
-        f"bos={(structure.get('bos') or {}).get('dir', 'none')}, "
-        f"choch={(structure.get('choch') or {}).get('dir', 'none')}, "
+        f"BOS={(structure.get('bos') or {}).get('dir', 'none')}, "
+        f"CHoCH={(structure.get('choch') or {}).get('dir', 'none')}, "
         f"displacement={(structure.get('displacement') or {}).get('dir', 'none')}, "
         f"retest={(structure.get('retest') or {}).get('dir', 'none')}",
-        f"S/R: at_zone={(sr.get('at_zone') or {}).get('side', 'none')}"
-        f"{'(major)' if (sr.get('at_zone') or {}).get('major') else ''}",
-        f"Liquidity: long_ready={liq.get('long_ready')}, "
-        f"short_ready={liq.get('short_ready')}, "
-        f"equal_lows={len(liq.get('equal_lows') or [])}, "
-        f"equal_highs={len(liq.get('equal_highs') or [])}",
-        f"Price action signals: {pa.get('signals') or {}}",
+        f"MTF biases: HTF={mtf.get('htf_bias', 'n/a')}, "
+        f"setup={mtf.get('setup_bias', 'n/a')}, entry={mtf.get('entry_bias', 'n/a')}"
+        + (", fresh CHoCH against the standing HTF trend" if mtf.get("choch_reversal") else ""),
+        f"S/R: price at {(sr.get('at_zone') or {}).get('side', 'no zone')}"
+        f"{' (major)' if (sr.get('at_zone') or {}).get('major') else ''}",
+        f"Liquidity: confirmed buy-side sweep={liq.get('long_ready')}, "
+        f"confirmed sell-side sweep={liq.get('short_ready')}, "
+        f"equal lows={len(liq.get('equal_lows') or [])}, "
+        f"equal highs={len(liq.get('equal_highs') or [])}",
+        f"Price-action signals: bullish={(pa.get('signals') or {}).get('bullish', 0)}, "
+        f"bearish={(pa.get('signals') or {}).get('bearish', 0)}",
         f"Trendline break: {(tl.get('break') or {}).get('dir', 'none')}",
         f"Futures context: available={fut.get('available')}, "
         f"bias={fut.get('bias', 'n/a')}, conviction={fut.get('conviction', 'n/a')}",
-        f"Risk (Python structural): sl={risk.get('sl')}, tp={risk.get('tp')}, "
-        f"rr={risk.get('rr')}{' REJECTED: ' + ', '.join(risk.get('reasons') or []) if risk.get('reasons') else ''}",
-        f"Funding rate: {det.get('funding_rate') if det.get('funding_rate') is not None else 'n/a'}",
+        f"Funding rate: {fr if fr is not None else 'n/a'}",
+        f"Calculated structural levels: entry={_fmt_lvl(det.get('entry'))}, "
+        f"ATR={_fmt_lvl(structure.get('atr'))}, "
+        f"SL={_fmt_lvl(risk.get('sl'))}, TP={_fmt_lvl(risk.get('tp'))}, "
+        f"RR={_fmt_lvl(risk.get('rr'))}",
     ]
-    if mtf.get("notes"):
-        lines.append(f"MTF notes: {'; '.join(mtf['notes'])}")
-    if det.get("no_trade_reasons"):
-        lines.append(f"Python NO_TRADE reasons: {', '.join(det['no_trade_reasons'])}")
-    if quality.get("penalties"):
-        lines.append(f"Quality penalties: {'; '.join(quality['penalties'])}")
+    if warnings:
+        lines.append(f"Data warnings: {', '.join(warnings)}")
     return "\n".join(lines)
 
 
+def _sweep_fact(bundle: dict) -> str:
+    """Neutral sweep rendering for the decision prompt (no verdict framing)."""
+    sweep = bundle.get("sweep")
+    if sweep is None:
+        return "Liquidation sweep: none detected in recent 1H candles"
+    return (f"Liquidation sweep: {sweep['direction']} side, "
+            f"{sweep['age_candles']} candles ago, swept level={sweep['level']:.6g}, "
+            f"wick={sweep['wick']:.6g} ({sweep['wick_body_ratio']:.1f}x body), "
+            f"volume={sweep['volume_ratio']:.1f}x avg20")
+
+
+def _range_line(ind: dict) -> str:
+    """1H range location — a factual feature the model reads for itself."""
+    rp = (ind or {}).get("range_pos")
+    rp_s = f"{rp:.3f}" if isinstance(rp, (int, float)) else "n/a"
+    return (f"1H range position: {rp_s} (0.000 = 20-candle low, 1.000 = high); "
+            f"swing low/high (20): {_fmt_lvl((ind or {}).get('swing_low_20'))} / "
+            f"{_fmt_lvl((ind or {}).get('swing_high_20'))}")
+
+
 def build_decision_prompt(bundle: dict) -> str:
-    """Single-setup prompt for the LLM decision stage: the FULL structured
-    data (funnel indicators + deterministic evidence + liquidation)."""
+    """Single-setup prompt for the LLM decision stage: factual structured
+    evidence only (indicators, location, sweep, liquidation, measured market
+    facts, calculated levels, warnings) — no Python verdict is included."""
     det = bundle["deterministic"]
     return f"""{_DECISION_INSTRUCTIONS}
 
 Coin: {bundle['symbol']}
 Current price: {bundle['current_price']:.6g}
-Funnel direction (1H structure): {bundle['funnel_direction']}
 
 === INDICATORS ===
 1H: {_fmt_snap(bundle['ind_1h'])}
+{_range_line(bundle['ind_1h'])}
 15M: {_fmt_snap(bundle['ind_15m'])}
 5M: {_fmt_snap(bundle['ind_5m'])}
 
-=== 1H LIQUIDITY SWEEP ===
-{_sweep_line(bundle)}
+=== 1H LIQUIDITY SWEEP (candle-based) ===
+{_sweep_fact(bundle)}
 
 === WEBSOCKET LIQUIDATION DATA ===
 {_liquidation_line(bundle)}
 
-=== DETERMINISTIC PYTHON CORE OUTPUT ===
-{_evidence_block(det)}
+=== MEASURED MARKET FACTS ===
+{_facts_block(det)}
 
 === YOUR VERDICT ===
 Return exactly this JSON object:
@@ -801,13 +832,14 @@ def _build_batch_decision_prompt(chunk: list) -> str:
         det = b["deterministic"]
         blocks.append(f"""--- {b['symbol']} ---
 Current price: {b['current_price']:.6g}
-Funnel direction: {b['funnel_direction']}
 1H: {_fmt_snap(b['ind_1h'])}
+{_range_line(b['ind_1h'])}
 15M: {_fmt_snap(b['ind_15m'])}
 5M: {_fmt_snap(b['ind_5m'])}
-Sweep: {_sweep_line(b)}
+Sweep: {_sweep_fact(b)}
 Liquidation: {_liquidation_line(b)}
-Python core: {_evidence_block(det)}""")
+Measured facts:
+{_facts_block(det)}""")
     return f"""{_DECISION_INSTRUCTIONS}
 
 Setups ({len(chunk)}):
