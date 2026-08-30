@@ -16,7 +16,9 @@ import news_analysis as na
 from news import (Article, NewsEngine, NewsEvent, compute_status,
                   format_news_alert, is_official)
 
-NOW = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+# Dynamic "now": a hardcoded date goes stale once real time passes it + the
+# 24h event window, silently expiring every fixture article (bit us once).
+NOW = datetime.now(timezone.utc)
 
 
 @pytest.fixture(autouse=True)

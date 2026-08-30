@@ -211,21 +211,32 @@ def decide(frames: dict, funding_rate: Optional[float] = None,
     }
 
 
-def rescore_direction(d: dict, direction: str, cfg=config) -> dict:
-    """Re-run every deterministic gate for a DIFFERENT direction on the same evidence.
+def post_llm_validate(d: dict, direction: str, cfg=config) -> dict:
+    """Hard safety validation of an LLM-chosen direction (post-decision).
 
-    The LLM decision stage may return a direction opposite to the one the
-    structure proposed. Before that verdict can stand, the same validation the
-    core applies — directional confirmation, risk/reward (stop width, target
-    distance, structure stop), setup quality with all exhaustion penalties —
-    must pass for the NEW direction. An LLM opinion never bypasses a gate.
+    The LLM decides independently from factual evidence (it never saw a Python
+    verdict); this function then applies ONLY the gates that can never be
+    bypassed:
 
-    Returns a decision dict shaped like decide()'s with the flipped direction
-    (decision becomes NO_TRADE when any gate rejects it). Pure: reuses the
-    evidence and snapshots stored in `d`.
+      * data validity (indicator snapshots present, entry computable)
+      * mathematically invalid levels / stop width / minimum R:R
+        (risk_gate, run for the CHOSEN direction)
+      * the setup-quality threshold (the existing computation, run for the
+        chosen direction — disagreement with the measured evidence shows up
+        as a low score, never as an opinionated veto)
+
+    Duplicate protection and the Telegram alert floor live in the scan
+    pipeline (funnel + emission rule), unchanged.
+
+    Returns a decision dict shaped like decide()'s: the chosen direction when
+    every gate passes, else NO_TRADE with the exact gate reasons. Pure:
+    reuses the evidence and snapshots stored in `d`.
     """
-    if direction not in ("LONG", "SHORT") or direction == d.get("direction"):
-        return d
+    if direction not in ("LONG", "SHORT"):
+        out = dict(d)
+        out.update({"decision": "NO_TRADE",
+                    "no_trade_reasons": ["invalid_direction"]})
+        return out
 
     snaps = d.get("snaps") or {}
     mtf = d.get("mtf") or {}
@@ -235,36 +246,32 @@ def rescore_direction(d: dict, direction: str, cfg=config) -> dict:
     pa = d.get("price_action") or {}
     tl = d.get("trendline") or {}
     futures = d.get("futures") or {}
-    indicator_conf = d.get("indicators") or {}
     entry = d.get("entry")
     atr = structure.get("atr") or (sr or {}).get("atr")
+    htf_snap, setup_snap, entry_snap = snaps.get("1h"), snaps.get("15m"), snaps.get("5m")
 
-    # HTF alignment for the NEW direction (mtf.combine's counter_htf was
-    # computed for the original one)
-    want_bias = "bullish" if direction == "LONG" else "bearish"
-    htf_bias = mtf.get("htf_bias", "neutral")
-    counter = htf_bias not in (want_bias, "neutral")
+    reasons: list[str] = []
+    if entry is None or not htf_snap or not setup_snap:
+        reasons.append("invalid_data")
 
-    dir_check = direction_gate.confirm(direction, snaps.get("1h"), snaps.get("15m"),
-                                       snaps.get("5m"), structure, liq, mtf, cfg)
+    # indicator confirmation is direction-specific: recompute for the CHOSEN
+    # direction instead of reusing the one computed for the core's direction
+    indicator_conf = scoring.indicator_confirmation(setup_snap, direction, cfg)
+    dir_check = direction_gate.confirm(direction, htf_snap, setup_snap,
+                                       entry_snap, structure, liq, mtf, cfg)
     risk = risk_gate.evaluate(direction, entry, structure, sr, atr, cfg)
     quality = setup_quality.score(direction, structure, sr, liq, pa, mtf, tl,
                                   futures, indicator_conf, cfg,
-                                  htf_snap=snaps.get("1h"), risk=risk,
+                                  htf_snap=htf_snap, risk=risk,
                                   direction_factor=dir_check["factor"],
                                   direction_reasons=dir_check["reasons"])
 
-    reasons: list[str] = []
-    if cfg.MTF_REQUIRE_HTF_ALIGN and counter:
-        reasons.append("counter_htf")
-    if dir_check["status"] == "conflict":
-        reasons.append("directional_conflict")
+    if not risk["ok"]:
+        reasons.extend(risk["reasons"])
     if not quality["primary_floor_ok"]:
         reasons.append("insufficient_primary_evidence")
     elif not quality["passes"]:
         reasons.append("low_setup_quality")
-    if not risk["ok"]:
-        reasons.extend(risk["reasons"])
 
     out = dict(d)
     out.update({
