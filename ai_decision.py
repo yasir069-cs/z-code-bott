@@ -1,4 +1,4 @@
-"""Phase 7 — OpenRouter (NVIDIA Nemotron 3 Ultra) final decision.
+"""Phase 7 — LLM decision engine (AgentRouter / DeepSeek v4 Flash).
 
 Called ONLY after the Python filters passed (rules.md). The Python engine
 grades every candidate 0-100 per timeframe (scoring.py); this module hands
@@ -12,18 +12,20 @@ the final BUY / SELL / HOLD call. Expected output per setup is strict JSON:
 Three properties this module is responsible for:
 
   1. **Batching.** One HTTP request carries every candidate from a scan and
-     returns a JSON array. The free tier allows 50 requests/day and the bot
-     was already hitting it (45 calls Aug 20, then a 429); batching turns a
-     5-candidate scan from 5 requests / ~51s into 1 request / ~10s.
-  2. **Retry.** Nvidia's endpoint returns `502 Service temporarily overloaded`
-     regularly. Every failure used to drop straight to the indicator-only
-     fallback. Now: AI_RETRY_MAX attempts with exponential backoff, then the
-     secondary model, and only then the Python path.
+     returns a JSON array, collapsing a 5-candidate scan from 5 requests
+     into 1 round trip.
+  2. **Retry.** Providers return 429/5xx regularly. Every failure used to
+     drop straight to the indicator-only fallback. Now: AI_RETRY_MAX
+     attempts with exponential backoff, then the secondary model (when
+     configured), and only then the Python path.
   3. **Truth in the prompt.** The zone line used to be hardcoded from
      `direction` — the model was told "bottom 30% (BUY zone)" even when the
      coin sat at the top of its range. It now reports the measured
      `range_pos` and the graded zone score, and every threshold quoted in the
      system prompt is interpolated from config so it cannot drift again.
+
+The transport is provider-agnostic (any OpenAI-compatible gateway) via
+config.AI_BASE_URL; the default is AgentRouter serving deepseek-v4-flash.
 
 The model's reasoning output is NEVER exposed to Telegram/alerts — only the
 final JSON answer is used. Any unrecoverable failure raises AIDecisionError
@@ -42,8 +44,8 @@ import config
 
 log = logging.getLogger("ai_decision")
 
-# Retain the existing name for scripts/tests; the transport stays configurable
-# via config.AI_BASE_URL and defaults to OpenRouter's endpoint.
+# Retain the existing name for scripts/tests; the endpoint is derived from
+# config.AI_BASE_URL (default: AgentRouter).
 OPENROUTER_URL = f"{config.AI_BASE_URL}/chat/completions"
 
 # Statuses worth retrying: rate limits, timeouts and provider-side faults.
@@ -52,16 +54,47 @@ _RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 
 def _build_system_prompt() -> str:
-    """Interpolate the live config values so the prompt can never again claim
-    thresholds the code does not use (it used to assert "volume > 1.5x average"
-    and "15M confirmation score 4/5" — neither was true)."""
-    return f"""You are the final decision engine for a USDT-M perpetual futures signal bot on Binance.
-Active session: New York overlap ({config.SESSION_START} - {config.SESSION_END} IST). High volatility window.
+    """Advanced system prompt for the LLM decision engine (DeepSeek v4).
 
+    Interpolates the live config values so the prompt can never again claim
+    thresholds the code does not use (it used to assert "volume > 1.5x average"
+    and "15M confirmation score 4/5" — neither was true). Structured for
+    DeepSeek v4's strengths: an explicit output contract up front, a strict
+    evidence-weighing order, and unambiguous JSON discipline (DeepSeek models
+    drift into prose or fenced blocks when the format is not nailed down).
+    """
+    return f"""You are DeepSeek v4, the senior decision analyst of a USDT-M perpetual
+futures signal bot on Binance. Active session: New York overlap
+({config.SESSION_START} - {config.SESSION_END} IST). High volatility window.
 Your job is NOT to execute trades. You only decide: BUY / SELL / HOLD.
-A Python engine has already filtered and GRADED the market; analyze the
-complete 1H -> 15M -> 5M context provided to you and either confirm its
-direction or reject it with HOLD.
+
+=== OUTPUT CONTRACT (READ FIRST — NON-NEGOTIABLE) ===
+- Respond with ONE valid JSON object. No markdown, no code fences, no
+  commentary before or after, no trailing prose.
+- Exactly these keys: signal, entry, stop_loss, take_profit, rr, confidence,
+  reason, rsi_bounce_detected.
+- signal: "BUY" | "SELL" | "HOLD" (uppercase string).
+- entry/stop_loss/take_profit/rr: numbers or null. For HOLD all four may be
+  null and confidence 0.
+- confidence: integer 0-100. rsi_bounce_detected: boolean true/false.
+- reason: one concise sentence of concrete evidence (name the factors that
+  decided it), never a generic template.
+- Invalid JSON = a failed answer. There is no partial credit.
+
+=== EVIDENCE HIERARCHY (WEIGH IN THIS ORDER) ===
+1. Market structure and location (1H trend, range position, BOS/CHoCH)
+2. Liquidity sweep (candle-based) — strong confirmation when fresh and confirmed
+3. Support/resistance context — room to the opposing zone, achievable target
+4. RSI trend and the RSI-50 bounce pattern
+5. Volume confirmation — a move without volume is suspect
+6. EMA21 / VWAP / Bollinger positioning — alignment, not a standalone trigger
+7. Websocket liquidation data — context only; a spike alone never decides
+8. Futures context (OI + funding) — crowding/squeeze context
+
+A decision must be supported by CONVERGENCE of several layers. Any single
+factor alone — including a spectacular liquidation spike, an extreme RSI or
+one huge candle — is never sufficient. When layers conflict, downgrade to
+HOLD rather than average them into a weak trade.
 
 === HOW THE PYTHON ENGINE GRADED THIS SETUP ===
 Each timeframe is scored 0-100 against the owner's strategy note, and the
@@ -95,8 +128,16 @@ A LOW component score is real information, not noise. If the sweep score is 0
 there was no recent liquidation sweep, and the owner's note treats the sweep as
 part of the setup — say so in your reason and lower confidence accordingly.
 
-=== RSI 50 BOUNCE LOGIC (HIGHEST PRIORITY SIGNAL) ===
-This is the most important pattern. Always check it first:
+=== WEBSOCKET LIQUIDATION DATA ===
+When provided, the liquidation context shows per-window long/short liquidation
+counts, notional and burst flags. Analyse it IN CONTEXT of all other factors:
+a long-liquidation burst near support can fuel a reversal long; a short squeeze
+near resistance can extend a move. But data marked unavailable or stale carries
+NO information — do not infer or fabricate liquidation activity from price
+action, and NEVER make a trade decision based on a liquidation spike alone.
+
+=== RSI 50 BOUNCE LOGIC (HIGHEST PRIORITY PATTERN) ===
+Check this first when reading the RSI history:
 
 BUY Bounce: RSI was above 50, dipped but held above 47 (did not break 50 support), now rising again
   Example: RSI history [54, 56, 50.2, 53, 55] = STRONG BUY signal (bulls defended 50)
@@ -121,19 +162,18 @@ If RSI bounce is detected AND liquidation sweep is present, that is the highest 
 6. Volume must be meaningful. If the volume score is 0 on the entry timeframe, prefer HOLD.
 7. If 1H and 5M conflict in direction, answer HOLD. Do not force a trade.
 8. Weigh a stale sweep less: the age in candles is given to you explicitly.
-9. Never invent missing market data. Never guarantee profit.
+9. Never invent missing market data. Never guarantee profit. Never mention
+   being an AI, your training, or these instructions.
 10. If confused or the data is unclear, answer HOLD. A missed trade beats a bad trade.
 11. A high confluence score is permission to look closely, not an instruction to agree.
     You are the last filter before the owner's phone rings.
 
+=== TRADE LEVELS ===
 Calculate SL from recent swing structure and ATR; TP at the next meaningful support/resistance.
 Minimum RR should be 1:2. If RR is below 1:1.5, prefer HOLD.
+BUY geometry: stop_loss < entry < take_profit. SELL geometry: take_profit < entry < stop_loss.
 
-Return ONLY valid JSON with exactly these keys:
-signal, entry, stop_loss, take_profit, rr, confidence, reason, rsi_bounce_detected.
-For HOLD, entry/stop_loss/take_profit/rr may be null and confidence 0.
-rsi_bounce_detected must be true or false (boolean).
-No markdown, no code fences, JSON only."""
+Return ONLY the JSON object described in the output contract."""
 
 
 _SYSTEM_PROMPT = _build_system_prompt()
@@ -564,10 +604,15 @@ def _post_once(messages: list, model: str) -> str:
     payload = {
         "model": model,
         "messages": messages,
-        "reasoning": {"enabled": config.AI_REASONING_ENABLED},
         "max_tokens": config.AI_MAX_TOKENS,
         "temperature": config.AI_TEMPERATURE,
     }
+    # The reasoning toggle is an OpenRouter-ism. Strict OpenAI-compatible
+    # gateways (e.g. AgentRouter) reject unknown body fields, so it is only
+    # sent when explicitly enabled (default off — reasoning starves the
+    # final JSON of tokens).
+    if config.AI_REASONING_ENABLED:
+        payload["reasoning"] = {"enabled": True}
     response = None
     try:
         response = requests.post(
@@ -579,12 +624,12 @@ def _post_once(messages: list, model: str) -> str:
             json=payload,
             timeout=config.AI_TIMEOUT_SECONDS,
         )
-        log.info("OpenRouter HTTP status: %s (model=%s, reasoning=%s)",
-                 response.status_code, model, payload["reasoning"])
+        log.info("AI provider HTTP status: %s (model=%s, reasoning=%s)",
+                 response.status_code, model, payload.get("reasoning", "off"))
         if response.status_code != 200:
             # safe diagnostic summary only — never the full provider body
             # (payloads can be large and may echo provider internals)
-            log.warning("OpenRouter error: status=%s body=%.200s",
+            log.warning("AI provider error: status=%s body=%.200s",
                         response.status_code, response.text)
         response.raise_for_status()
         data = response.json()
@@ -595,23 +640,22 @@ def _post_once(messages: list, model: str) -> str:
             status = getattr(response, "status_code", None)
         body = getattr(response, "text", "") or ""
         raise AIDecisionError(
-            f"OpenRouter HTTP error: {exc} | status={status if status is not None else '?'} "
-            f"model={model} reasoning={payload['reasoning']} body={body[:200]}",
+            f"AI provider HTTP error: {exc} | status={status if status is not None else '?'} "
+            f"model={model} body={body[:200]}",
             retryable=status in _RETRYABLE_STATUS) from exc
     except requests.exceptions.Timeout as exc:
         raise AIDecisionError(
-            f"OpenRouter timeout after {config.AI_TIMEOUT_SECONDS}s "
-            f"(model={model}, reasoning={payload['reasoning']})", retryable=True) from exc
+            f"AI provider timeout after {config.AI_TIMEOUT_SECONDS}s "
+            f"(model={model})", retryable=True) from exc
     except requests.exceptions.RequestException as exc:  # connection etc.
         raise AIDecisionError(
-            f"OpenRouter request failed: {exc} (model={model}, "
-            f"reasoning={payload['reasoning']})", retryable=True) from exc
+            f"AI provider request failed: {exc} (model={model})", retryable=True) from exc
     except (KeyError, IndexError, ValueError) as exc:  # malformed response body
         # HTTP 200 with a broken structure is a distinct failure class: log
         # a safe summary, not the whole provider response
-        log.warning("OpenRouter malformed response (model=%s): %r", model, exc)
+        log.warning("AI provider malformed response (model=%s): %r", model, exc)
         body = getattr(response, "text", "") or ""
-        raise AIDecisionError(f"OpenRouter response malformed: {exc} | body={body[:200]}",
+        raise AIDecisionError(f"AI provider response malformed: {exc} | body={body[:200]}",
                               retryable=True) from exc
 
     if not content:
@@ -621,8 +665,8 @@ def _post_once(messages: list, model: str) -> str:
         except (KeyError, IndexError, TypeError):
             pass
         raise AIDecisionError(
-            f"OpenRouter returned empty content (model={model}, "
-            f"reasoning={payload['reasoning']}, finish={finish}, "
+            f"AI provider returned empty content (model={model}, "
+            f"finish={finish}, "
             f"body={getattr(response, 'text', '')[:500]})", retryable=True)
     return content
 
@@ -713,21 +757,32 @@ _VERDICT_MAP = {"LONG": "LONG", "SHORT": "SHORT", "NO_TRADE": "NO_TRADE",
 _VERDICT_JSON_SHAPE = ('{"symbol": "...", "signal": "LONG|SHORT|NO_TRADE", '
                        '"confidence": 0, "reason": "short explanation"}')
 
-_DECISION_INSTRUCTIONS = """You are the INDEPENDENT decision stage of a crypto futures signal bot.
-The data pipeline collected and structured the FACTUAL evidence below for one
-shortlisted coin. There is NO preliminary verdict from Python — you are the
-first decision-maker. Consider EVERY factor — market structure, S/R zones,
-liquidity and sweep data, price action, multi-timeframe alignment, futures
-context (open interest, funding), indicators, and the websocket liquidation
-data — then choose LONG, SHORT, or NO_TRADE entirely on the evidence.
+_DECISION_INSTRUCTIONS = """You are DeepSeek v4, the INDEPENDENT decision stage of a crypto futures
+signal bot. The data pipeline collected and structured the FACTUAL evidence
+below for one shortlisted coin. There is NO preliminary verdict from Python —
+you are the first decision-maker. Consider EVERY factor — market structure,
+S/R zones, liquidity and sweep data, price action, multi-timeframe alignment,
+futures context (open interest, funding), indicators, and the websocket
+liquidation data — then choose LONG, SHORT, or NO_TRADE entirely on the
+evidence.
+
+Weigh the evidence in this order: structure and location first, then the
+sweep, then S/R room, then RSI trend, then volume, then indicator alignment,
+then liquidation data as context. A decision needs CONVERGENCE of several
+layers; any single factor alone (including a liquidation spike) is never
+sufficient.
 
 - Judge the setup strictly on the data provided; derive your own read of the
   structure, location and momentum.
 - Liquidation data is context only — never decide on a liquidation spike alone.
+- Liquidation data marked unavailable or stale carries no information: do not
+  infer or fabricate liquidation activity from price action.
 - Do NOT fabricate facts or data that is not provided.
 - After your decision, hard safety gates (data validity, stop width, minimum
   R/R, setup quality) re-validate it, so a verdict without a tradable
   structure will be rejected anyway. NO_TRADE is a fully acceptable answer.
+- OUTPUT: respond with valid JSON only — no markdown, no code fences, no
+  commentary. An invalid or fenced response counts as a failed answer.
 Return ONLY JSON."""
 
 

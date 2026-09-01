@@ -6,7 +6,7 @@ Allows users to chat with the bot in Telegram and ask questions about:
   - Recent signal performance and logs from signals_log.csv
   - General cryptocurrency trading, risk management, and market insights
 
-Uses OpenRouter (NVIDIA Nemotron or configured model) with rich context.
+Uses the configured AI provider (AgentRouter/DeepSeek v4 by default) with rich context.
 """
 import csv
 from datetime import datetime

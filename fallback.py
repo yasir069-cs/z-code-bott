@@ -1,4 +1,4 @@
-"""Python-only fallbacks when the AI (OpenRouter/Nemotron) is unavailable.
+"""Python-only fallbacks when the AI provider (AgentRouter/DeepSeek v4) is unavailable.
 
 Two independent fallbacks live here:
 

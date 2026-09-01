@@ -96,7 +96,7 @@ _SIGNAL_MAP = {"LONG": "BUY", "SHORT": "SELL", "NO_TRADE": "HOLD"}
 
 
 def _decide(bundle: dict) -> dict:
-    """OpenRouter/Nemotron decision with Python fallback (single-candidate).
+    """AI decision with Python fallback (single-candidate).
 
     Kept for on-demand single lookups, tests and scripts/e2e_demo.py. The
     scheduled scan uses the batched path (nemotron_decisions) instead.
