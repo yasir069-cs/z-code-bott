@@ -179,15 +179,11 @@ async def cmd_scan_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     import threading
     def _start_in_thread():
-        import scanner as sc
-        import duplicate_guard as dg
-        from main import run_scan
-        result = ondemand.start_ondemand_scan(
-            run_scan_fn=run_scan,
-            make_exchange_fn=sc.make_exchange,
-            fetch_funding_fn=sc.fetch_funding_rates,
-            DuplicateGuardClass=dg.DuplicateGuard,
-        )
+        # Delegate to main's wiring so the on-demand scans share the SAME
+        # DuplicateGuard (via the coordinator) as scheduled scans — a
+        # per-path guard let the same coin be re-alerted across paths.
+        from main import start_ondemand_scan as main_start_ondemand
+        result = main_start_ondemand()
         status = result.get("status")
         if status == "started":
             msg = (
