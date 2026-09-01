@@ -84,7 +84,6 @@ def _health_lines() -> str:
         _add("Liquidations", f"UNAVAILABLE ({type(exc).__name__})")
 
     try:
-        from scan_coordinator import AIOpinionWorker  # noqa: F401 (docstring)
         from main import _ai_worker
         s = _ai_worker.status()
         _add("AI", f"{s['last_status']}"
@@ -116,20 +115,13 @@ def get_bot_status_summary() -> str:
     in_session = config.SESSION_START <= hhmm < config.SESSION_END
     status = "🟢 ACTIVE (Scanning Market)" if in_session else "🌙 SLEEPING (Outside Trading Window)"
 
-    # AI budget + liquidation stream + OHLCV cache health (best-effort —
-    # /status must never break).
+    # AI budget + OHLCV cache health (best-effort — /status must never break).
+    # Liquidation stream health already has its own line in _health_lines().
     extra = ""
     try:
         from ai_decision import budget_status
         b = budget_status()
         extra += f"\nAI Budget: {b['used']}/{b['limit']} used today ({b['remaining']} left)"
-    except Exception:
-        pass
-    try:
-        from liquidation import stream_status
-        s = stream_status()
-        age = f", {s['age_s']:.0f}s since last event" if s.get("age_s") else ""
-        extra += f"\nLiquidation stream: {s['status']}{age}"
     except Exception:
         pass
 

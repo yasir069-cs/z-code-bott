@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 bot.log*
 signals_log*.csv
+ai_opinions.csv
 backtest_report*
 backtest_strategy_report*
 news_alerted.json
