@@ -150,14 +150,16 @@ RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2.0"))  # max 2% ris
 LEV_ATR_LOW = 0.01               # ATR < 1% of price -> high leverage OK
 LEV_ATR_HIGH = 0.03              # ATR > 3% of price -> low leverage only
 
-# ------------------------------------------------------------------ AI (OpenRouter / Nemotron)
-# AI_BASE_URL keeps the transport configurable (any OpenAI-compatible provider)
-# but defaults to OpenRouter.
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-# Secondary free model, tried when the primary fails every retry. Only then does
-# the run fall back to the pure-Python indicator decision.
-AI_MODEL_FALLBACK = os.getenv("AI_MODEL_FALLBACK", "deepseek/deepseek-chat-v3.1:free")
+# ------------------------------------------------------------------ AI (AgentRouter / DeepSeek v4)
+# AI_BASE_URL keeps the transport configurable (any OpenAI-compatible
+# provider). Primary: AgentRouter serving deepseek-v4-flash.
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://agentrouter.org/v1").rstrip("/")
+AI_MODEL = os.getenv("AI_MODEL", "deepseek-v4-flash")
+# Secondary model, tried when the primary fails every retry. Empty by default:
+# the AgentRouter key only serves the primary model. Set AI_MODEL_FALLBACK in
+# .env when the provider offers a second usable model. Only after both paths
+# fail does the run fall back to the pure-Python indicator decision.
+AI_MODEL_FALLBACK = os.getenv("AI_MODEL_FALLBACK", "").strip()
 AI_MAX_TOKENS = 2000            # was 300: truncated single answers mid-"reason"
                                 # (finish_reason=length) and cannot hold a batch
 AI_TIMEOUT_SECONDS = 60.0
@@ -168,14 +170,14 @@ AI_TEMPERATURE = 0.1
 AI_REASONING_ENABLED = False
 
 # Batching: one request carries every candidate from a scan and returns a JSON
-# array. This is what keeps the bot inside the free tier's 50 requests/day and
-# collapses ~10s-per-candidate into a single round trip.
+# array. This collapses ~10s-per-candidate into a single round trip and keeps
+# the request count low whatever the provider's daily cap is.
 AI_BATCH_ENABLED = True
 AI_BATCH_MAX = 20               # candidates per request; more than this is chunked
-                               # (20 fits a full scan's shortlist in ONE request)
+                                # (20 fits a full scan's shortlist in ONE request)
 AI_RETRY_MAX = 3                # retry 429 / 5xx / timeout / malformed JSON
 AI_RETRY_BACKOFF_BASE = 1.0     # 1s, 2s, 4s
-AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "50"))  # OpenRouter free tier cap
+AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "50"))  # advisory daily request cap
 
 # ------------------------------------------------------------------ duplicate guard
 DUPLICATE_COOLDOWN_MIN = 15     # same coin within 15 min -> skip (futures pace faster)

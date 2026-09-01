@@ -125,10 +125,15 @@ def test_valid_buy_json(monkeypatch):
     assert out["signal"] == "BUY" and out["ai_used"] is True
     assert out["sl"] == 98.5 and out["tp"] == 103.0 and out["rr"] == 2.0
     assert out["confidence"] == 82
-    # request shape: OpenRouter endpoint, model, reasoning per config, token budget
+    # request shape: provider endpoint, model, token budget; the OpenRouter
+    # "reasoning" field is OMITTED when disabled (strict gateways reject
+    # unknown body fields) and only sent when AI_REASONING_ENABLED.
     assert calls["url"] == ai_decision.OPENROUTER_URL
     assert calls["payload"]["model"] == config.AI_MODEL
-    assert calls["payload"]["reasoning"] == {"enabled": config.AI_REASONING_ENABLED}
+    if config.AI_REASONING_ENABLED:
+        assert calls["payload"]["reasoning"] == {"enabled": True}
+    else:
+        assert "reasoning" not in calls["payload"]
     assert calls["payload"]["max_tokens"] == config.AI_MAX_TOKENS
     assert "Authorization" not in calls["payload"]  # key only in headers
 
@@ -245,19 +250,32 @@ def test_reasoning_never_leaks_into_signal(monkeypatch):
     assert "internal chain of thought" not in json.dumps(out)
 
 
-# ---------------------------------------------------- OpenRouter transport
-def test_llm_transport_defaults_to_openrouter(monkeypatch):
-    """The AI layer talks to OpenRouter by default: key from
-    OPENROUTER_API_KEY, endpoint derived from AI_BASE_URL."""
+# ------------------------------------------------------ AI provider transport
+def test_llm_transport_defaults_to_agentrouter(monkeypatch):
+    """The AI layer talks to AgentRouter by default: key from
+    OPENROUTER_API_KEY, endpoint derived from AI_BASE_URL, model deepseek-v4-flash."""
     import importlib
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.delenv("AI_BASE_URL", raising=False)
+    monkeypatch.delenv("AI_MODEL", raising=False)
+    monkeypatch.delenv("AI_MODEL_FALLBACK", raising=False)
     cfg = importlib.reload(config)
     assert cfg.OPENROUTER_API_KEY == "sk-or-test"
-    assert cfg.AI_BASE_URL == "https://openrouter.ai/api/v1"
-    assert cfg.AI_MODEL == "nvidia/nemotron-3-ultra-550b-a55b:free"
-    assert ai_decision.OPENROUTER_URL == "https://openrouter.ai/api/v1/chat/completions"
+    assert cfg.AI_BASE_URL == "https://agentrouter.org/v1"
+    assert cfg.AI_MODEL == "deepseek-v4-flash"
+    assert ai_decision.OPENROUTER_URL == "https://agentrouter.org/v1/chat/completions"
+
+
+def test_empty_fallback_model_disables_the_second_model(monkeypatch):
+    """With AI_MODEL_FALLBACK empty (the AgentRouter default — the key serves
+    one model) the retry ladder stops after the primary model's attempts."""
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr(config, "AI_MODEL_FALLBACK", "")
+    state = _counting_post(monkeypatch, [_Resp(status=503, text="down")])
+    with pytest.raises(ai_decision.AIDecisionError):
+        ai_decision.nemotron_decision(_bundle())
+    assert state["n"] == config.AI_RETRY_MAX, "primary only, no fallback model"
 
 
 # ------------------------------------------------------- Phase 3: zone truth
@@ -366,16 +384,18 @@ def test_truncated_json_is_retried(monkeypatch):
 
 
 def test_retries_are_bounded_then_the_fallback_model_is_tried(monkeypatch):
+    monkeypatch.setattr(config, "AI_MODEL_FALLBACK", "deepseek/deepseek-chat-v3.1:free")
     state = _counting_post(monkeypatch, [_Resp(status=503, text="down")])
     monkeypatch.setattr("config.OPENROUTER_API_KEY", "sk-or-test")
     with pytest.raises(ai_decision.AIDecisionError):
         ai_decision.nemotron_decision(_bundle())
     assert state["n"] == config.AI_RETRY_MAX * 2, "primary then fallback, AI_RETRY_MAX each"
-    assert config.AI_MODEL_FALLBACK in state["models"]
+    assert "deepseek/deepseek-chat-v3.1:free" in state["models"]
 
 
 def test_a_bad_request_is_not_retried_on_the_same_model(monkeypatch):
-    """400 means the request is wrong; retrying it only burns free-tier budget."""
+    """400 means the request is wrong; retrying it only burns budget."""
+    monkeypatch.setattr(config, "AI_MODEL_FALLBACK", "deepseek/deepseek-chat-v3.1:free")
     state = _counting_post(monkeypatch, [_Resp(status=400, text="bad model name")])
     monkeypatch.setattr("config.OPENROUTER_API_KEY", "sk-or-test")
     with pytest.raises(ai_decision.AIDecisionError):
