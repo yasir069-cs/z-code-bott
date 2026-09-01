@@ -48,6 +48,33 @@ def test_missing_or_disconnected_data_degrades_without_values():
     assert result["windows"]["1h"]["long_count"] == 0
 
 
+def test_freshly_connected_stream_is_not_stale_before_first_message(monkeypatch):
+    """A just-connected socket with no event yet reports FRESH (grace period),
+    not STALE — Binance's forceOrder snapshot stream throttles to one event
+    per second and a quiet first minute is normal. Regression for the watchdog
+    logging 'STALE — no message for since start' 60s after every restart."""
+    now = 1_000_000.0
+    monkeypatch.setattr(liquidation.time, "time", lambda: now)
+    cache = liquidation.LiquidationCache()
+    assert cache.stream_status()["status"] == "DISCONNECTED"
+    cache.set_connection(True)                     # socket opens, no message yet
+    assert cache.stream_status()["status"] == "FRESH"
+    # still inside the threshold with zero messages -> FRESH, not STALE
+    monkeypatch.setattr(liquidation.time, "time",
+                        lambda: now + config.LIQ_STALE_SECONDS - 1)
+    assert cache.stream_status()["status"] == "FRESH"
+    # past the threshold with zero messages -> STALE
+    monkeypatch.setattr(liquidation.time, "time",
+                        lambda: now + config.LIQ_STALE_SECONDS + 1)
+    assert cache.stream_status()["status"] == "STALE"
+    # one event resets the baseline to the message time
+    monkeypatch.setattr(liquidation.time, "time", lambda: now)
+    cache.add_event(_event(now))
+    monkeypatch.setattr(liquidation.time, "time",
+                        lambda: now + config.LIQ_STALE_SECONDS - 1)
+    assert cache.stream_status()["status"] == "FRESH"
+
+
 def test_stale_stream_degrades_available_but_keeps_history(monkeypatch):
     """Connected socket + no message for > LIQ_STALE_SECONDS: the summary is
     unavailable-with-warning (never presented as a fresh reading) while the
