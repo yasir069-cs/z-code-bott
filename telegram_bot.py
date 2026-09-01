@@ -41,6 +41,12 @@ _bot_app: Optional[Application] = None
 _bot_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
+def _listener_running() -> bool:
+    """Listener health for /status: thread alive AND its loop running."""
+    return bool(_bot_thread and _bot_thread.is_alive()
+                and _bot_loop and _bot_loop.is_running())
+
+
 def _get_history(chat_id: int) -> list[dict]:
     return _CHAT_HISTORIES.setdefault(chat_id, [])
 

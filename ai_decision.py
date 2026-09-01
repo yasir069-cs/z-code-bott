@@ -297,17 +297,23 @@ def _sweep_line(bundle: dict) -> str:
 
 
 def _liquidation_line(bundle: dict) -> str:
-    """Render cached websocket data without implying availability when absent."""
+    """Render cached websocket data without implying availability when absent.
+
+    Windows come from the summary itself (config-driven via
+    config.LIQUIDATION_WINDOWS), each with long/short notional+count and the
+    burst flag — the same fields the cache aggregates."""
     summary = bundle.get("liquidation") or {}
     if not summary.get("available"):
         warning = summary.get("warning") or "no liquidation events in cache"
         return f"Liquidation stream: unavailable ({warning}) — do not infer or fabricate liquidation data"
     windows = summary.get("windows") or {}
     parts = []
-    for window in ("5m", "15m", "1h"):
-        data = windows.get(window, {})
-        parts.append(f"{window}: long {data.get('long_count', 0)} / "
-                     f"short {data.get('short_count', 0)}")
+    for window, data in windows.items():
+        parts.append(f"{window}: long {data.get('long_count', 0)} "
+                     f"(${data.get('long_notional', 0) or 0:.0f}) / "
+                     f"short {data.get('short_count', 0)} "
+                     f"(${data.get('short_notional', 0) or 0:.0f})"
+                     + (" — BURST" if data.get("burst") else ""))
     return ("Websocket liquidation context: " + "; ".join(parts) +
             f"; latest={summary.get('latest_event_timestamp')}; "
             f"freshness={summary.get('freshness_seconds')}s; "
@@ -576,8 +582,10 @@ def _post_once(messages: list, model: str) -> str:
         log.info("OpenRouter HTTP status: %s (model=%s, reasoning=%s)",
                  response.status_code, model, payload["reasoning"])
         if response.status_code != 200:
-            # never hide the API error: log status + full body (contains no key)
-            log.error("OpenRouter error body: %s", response.text[:2000])
+            # safe diagnostic summary only — never the full provider body
+            # (payloads can be large and may echo provider internals)
+            log.warning("OpenRouter error: status=%s body=%.200s",
+                        response.status_code, response.text)
         response.raise_for_status()
         data = response.json()
         content = (data["choices"][0]["message"].get("content") or "").strip()
@@ -588,7 +596,7 @@ def _post_once(messages: list, model: str) -> str:
         body = getattr(response, "text", "") or ""
         raise AIDecisionError(
             f"OpenRouter HTTP error: {exc} | status={status if status is not None else '?'} "
-            f"model={model} reasoning={payload['reasoning']} body={body[:500]}",
+            f"model={model} reasoning={payload['reasoning']} body={body[:200]}",
             retryable=status in _RETRYABLE_STATUS) from exc
     except requests.exceptions.Timeout as exc:
         raise AIDecisionError(
@@ -599,8 +607,11 @@ def _post_once(messages: list, model: str) -> str:
             f"OpenRouter request failed: {exc} (model={model}, "
             f"reasoning={payload['reasoning']})", retryable=True) from exc
     except (KeyError, IndexError, ValueError) as exc:  # malformed response body
+        # HTTP 200 with a broken structure is a distinct failure class: log
+        # a safe summary, not the whole provider response
+        log.warning("OpenRouter malformed response (model=%s): %r", model, exc)
         body = getattr(response, "text", "") or ""
-        raise AIDecisionError(f"OpenRouter response malformed: {exc} | body={body[:500]}",
+        raise AIDecisionError(f"OpenRouter response malformed: {exc} | body={body[:200]}",
                               retryable=True) from exc
 
     if not content:

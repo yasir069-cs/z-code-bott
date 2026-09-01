@@ -29,6 +29,8 @@ CANDLE_LIMIT = 50               # last 50 candles per timeframe (strategy window
 INDICATOR_WARMUP = 250          # extra closed candles so pandas-ta values converge
                                 # to TradingView (Wilder/EMA recursions need warm-up)
 FETCH_RETRY_MAX = 3             # exchange fetch fails -> retry 3x -> skip coin
+FETCH_TIMEOUT_MS = 15000        # explicit per-request ccxt timeout: no request
+                                # may hang indefinitely, whatever the deadline
 TIMEFRAMES = ("1h", "15m", "5m")
 
 # Stablecoin / fiat-proxy bases can never be a valid momentum setup, but they
@@ -195,6 +197,15 @@ SCAN_MISFIRE_GRACE_SEC = 120
 # into the next 5-minute slot.
 SCAN_DEADLINE_SECONDS = 240
 
+# ---- hardening: bounded services, watchdogs, isolation
+LIQ_STALE_SECONDS = 1800        # no forceOrder message for 30 min -> stream
+                                # STALE (quiet markets go minutes between
+                                # liquidations; shorter would false-alarm)
+NEWS_429_COOLDOWN_SECONDS = 600     # per-feed backoff after HTTP 429
+NEWS_TIMEOUT_COOLDOWN_SECONDS = 300  # per-feed backoff after timeout/conn error
+AI_WORKER_MAX_PENDING = 2       # background AI queue depth; beyond it the
+                                # oldest pending batch is dropped (UNAVAILABLE)
+
 # ==================================================================
 # PRICE-ACTION & MARKET-CONTEXT-FIRST DECISION SYSTEM
 # ==================================================================
@@ -338,7 +349,7 @@ LLM_DECISION_ENABLED = True      # False -> pure deterministic core (previous be
 ALERT_QUALITY_MIN = 65           # Telegram alert floor; a BUY/SELL below this is log-only
 
 # ---- news verification engine (VERIFY FIRST — AI never decides what is true)
-NEWS_ENABLED = True              # start the persistent news engine with the bot
+NEWS_ENABLED = False             # news engine OFF (owner's call, 2026-08-30)
 NEWS_POLL_SECONDS = 300          # RSS polling interval
 NEWS_ALERT_COOLDOWN_SECONDS = 1200  # no duplicate/repeat alert for the same event within 20 min
 NEWS_EVENT_WINDOW_HOURS = 24     # articles older than this cannot join/confirm an event
@@ -386,6 +397,11 @@ NEWS_SOCIAL_DOMAINS = frozenset({
 # ------------------------------------------------------------------ files
 LIQUIDATION_RECONNECT_SECONDS = 5
 LIQUIDATION_BURST_COUNT = 3
+# Lookback windows (name -> seconds) for the websocket liquidation summary.
+# The cache keeps events for the largest window; summaries expose one block
+# per window with long/short notional+count, latest event time, burst flag,
+# price-vs-current context and freshness.
+LIQUIDATION_WINDOWS = {"5m": 300, "15m": 900, "1h": 3600}
 SIGNALS_LOG_FILE = BASE_DIR / "signals_log.csv"
 BOT_LOG_FILE = BASE_DIR / "bot.log"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -408,7 +424,7 @@ def check_exposed_credentials() -> list[str]:
                         "openrouter.ai/keys and put the new key in .env")
     return warnings
 
-CSV_COLUMNS = ["timestamp", "coin", "signal", "entry", "SL", "TP", "RR",
+CSV_COLUMNS = ["timestamp", "signal_id", "coin", "signal", "entry", "SL", "TP", "RR",
                "leverage", "position_size", "funding_rate", "confidence",
                "confluence", "score_1h", "score_15m", "score_5m",
                 "sweep", "sweep_age", "rsi_bounce", "reason", "ai_used",
@@ -416,6 +432,12 @@ CSV_COLUMNS = ["timestamp", "coin", "signal", "entry", "SL", "TP", "RR",
                # structure-first decision core (Phase 6): the primary evidence
                "decision", "setup_quality", "htf_bias", "structure",
                "sr_zone", "liquidity", "no_trade_reason", "data_warnings"]
+
+# Background AI opinions audit log (signal_id keyed; never blocks a scan)
+AI_OPINIONS_LOG_FILE = BASE_DIR / "ai_opinions.csv"
+AI_OPINION_COLUMNS = ["timestamp", "scan_id", "signal_id", "symbol",
+                      "deterministic_decision", "ai_opinion", "ai_status",
+                      "ai_confidence", "ai_reason", "final_decision"]
 
 
 def setup_logging() -> None:

@@ -16,7 +16,27 @@ import config
 log = logging.getLogger("liquidation")
 
 _STREAM_URL = "wss://fstream.binance.com/ws/!forceOrder@arr"
-_WINDOWS = {"5m": 300, "15m": 900, "1h": 3600}
+_DEFAULT_WINDOWS = {"5m": 300, "15m": 900, "1h": 3600}
+
+
+def _configured_windows() -> dict:
+    """Lookback windows (name -> seconds) from config, validated.
+
+    Invalid entries are dropped; a wholly invalid/empty mapping falls back to
+    the defaults so a bad override can never produce empty summaries."""
+    raw = getattr(config, "LIQUIDATION_WINDOWS", None)
+    if isinstance(raw, dict) and raw:
+        windows = {}
+        for name, seconds in raw.items():
+            try:
+                seconds = int(seconds)
+            except (TypeError, ValueError):
+                continue
+            if seconds > 0:
+                windows[str(name)] = seconds
+        if windows:
+            return windows
+    return dict(_DEFAULT_WINDOWS)
 
 
 def _norm(symbol: str) -> str:
@@ -31,9 +51,11 @@ def _norm(symbol: str) -> str:
 class LiquidationCache:
     """Thread-safe rolling cache of normalized force-order events."""
 
-    def __init__(self, max_age_seconds: int = 3600):
+    def __init__(self, max_age_seconds: int | None = None):
         self._events = defaultdict(deque)
-        self._max_age = max_age_seconds
+        # Retention defaults to the largest configured window: every event a
+        # summary might still count must stay in the rolling cache.
+        self._max_age = max_age_seconds or max(_configured_windows().values())
         self._lock = threading.RLock()
         self._connected = False
         self._last_message_at = None
@@ -67,6 +89,27 @@ class LiquidationCache:
         with self._lock:
             return self._connected
 
+    def stream_status(self) -> dict:
+        """Application-level stream health: an open socket is not health.
+
+        FRESH      — connected and messages arriving within the threshold
+        STALE      — connected but no message for > LIQ_STALE_SECONDS (the
+                     ping/pong keepalive proves the TRANSPORT is alive while
+                     the feed itself has gone quiet — old events must not be
+                     presented as current information)
+        DISCONNECTED — no socket at all
+        """
+        with self._lock:
+            connected = self._connected
+            last = self._last_message_at
+        if not connected:
+            return {"status": "DISCONNECTED", "age_s": None}
+        if last is None:
+            return {"status": "STALE", "age_s": None}
+        age = max(0.0, time.time() - last)
+        status = "FRESH" if age <= config.LIQ_STALE_SECONDS else "STALE"
+        return {"status": status, "age_s": round(age, 1)}
+
     def _prune_locked(self, now: float) -> None:
         cutoff = now - self._max_age
         for symbol, events in list(self._events.items()):
@@ -76,16 +119,21 @@ class LiquidationCache:
                 del self._events[symbol]
 
     def summary(self, symbol: str, current_price=None, sr=None) -> dict:
-        """Return honest per-window aggregates; never estimate missing data."""
+        """Return honest per-window aggregates; never estimate missing data.
+
+        A STALE stream downgrades availability: cached events keep their
+        per-window numbers (they are historical facts), but the summary is
+        marked unavailable-with-warning so downstream logic cannot treat
+        'no recent events' as a fresh reading of the market."""
         symbol = _norm(symbol)
         now = time.time()
+        stream = self.stream_status()
         with self._lock:
             self._prune_locked(now)
             events = list(self._events.get(symbol, ()))
-            connected = self._connected
             stream_warning = self._warning
         windows = {}
-        for name, seconds in _WINDOWS.items():
+        for name, seconds in _configured_windows().items():
             recent = [e for e in events if now - e["timestamp"] <= seconds]
             long_events = [e for e in recent if e["side"] == "SELL"]
             short_events = [e for e in recent if e["side"] == "BUY"]
@@ -97,10 +145,18 @@ class LiquidationCache:
                 "burst": len(recent) >= config.LIQUIDATION_BURST_COUNT,
             }
         latest = max(events, key=lambda e: e["timestamp"], default=None)
-        available = bool(events) and connected
-        warning = "" if available else (stream_warning or "no liquidation events in cache")
-        if events and not connected:
-            warning = stream_warning or "liquidation stream disconnected"
+        stream_ok = stream["status"] == "FRESH"
+        available = bool(events) and stream_ok
+        warning = ""
+        if not available:
+            if stream["status"] == "STALE":
+                age = f"({stream['age_s']:.0f}s since last message)" if stream["age_s"] \
+                    else "(no message since start)"
+                warning = f"liquidation stream stale {age}"
+            elif stream["status"] == "DISCONNECTED":
+                warning = stream_warning or "liquidation stream disconnected"
+            elif not events:
+                warning = "no liquidation events in cache"
         price_context = []
         if available and current_price:
             for event in events:
@@ -118,7 +174,9 @@ class LiquidationCache:
                                    "distance": zone.get("distance")})
             price_context.append({"nearby_sr": levels})
         freshness = round(max(0.0, now - latest["timestamp"]), 1) if latest else None
-        return {"available": available, "warning": warning, "connected": connected,
+        return {"available": available, "warning": warning,
+                "connected": stream["status"] != "DISCONNECTED",
+                "stream_status": stream["status"],
                 "freshness_seconds": freshness,
                 "latest_event_timestamp": latest["timestamp"] if latest else None,
                 "windows": windows, "event_price_context": price_context}
@@ -182,7 +240,26 @@ class LiquidationListener:
             return
         self._thread = threading.Thread(target=self._run, daemon=True, name="BinanceLiquidations")
         self._thread.start()
+        self._start_watchdog()
         log.info("Binance liquidation listener started")
+
+    def _start_watchdog(self) -> None:
+        """Log (once per transition) when the stream goes stale, so a quiet
+        socket cannot silently masquerade as live liquidation data."""
+        def _watch():
+            warned = False
+            while not self._stop.is_set():
+                status = self.cache.stream_status()
+                if status["status"] == "STALE" and not warned:
+                    age = f"{status['age_s']:.0f}s" if status["age_s"] else "since start"
+                    log.warning("Liquidation stream STALE — no message for %s; "
+                                "summaries degrade to unavailable", age)
+                    warned = True
+                elif status["status"] == "FRESH":
+                    warned = False
+                self._stop.wait(60)
+        threading.Thread(target=_watch, daemon=True,
+                         name="LiquidationWatchdog").start()
 
     def stop(self) -> None:
         self._stop.set()
@@ -194,6 +271,11 @@ _listener = LiquidationListener()
 def start_listener() -> LiquidationCache:
     _listener.start()
     return _listener.cache
+
+
+def stream_status() -> dict:
+    """Stream-level health for /status (FRESH/STALE/DISCONNECTED + age)."""
+    return _listener.cache.stream_status()
 
 
 def get_summary(symbol: str, current_price=None, sr=None) -> dict:

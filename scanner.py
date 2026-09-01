@@ -43,8 +43,16 @@ _LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
 
 def make_exchange() -> ccxt.Exchange:
-    """Binance USDT-M Futures public market data. No keys, no trading endpoints."""
-    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "future"}})
+    """Binance USDT-M Futures public market data. No keys, no trading endpoints.
+
+    The explicit per-request timeout is the hardening requirement: the scan
+    deadline alone cannot stop a request that starts near it from hanging
+    indefinitely — every HTTP call is bounded on its own."""
+    return ccxt.binance({
+        "enableRateLimit": True,
+        "timeout": config.FETCH_TIMEOUT_MS,
+        "options": {"defaultType": "future"},
+    })
 
 
 # --------------------------------------------------------------- rate limiting

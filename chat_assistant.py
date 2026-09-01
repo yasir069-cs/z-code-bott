@@ -50,6 +50,65 @@ def get_recent_signals_summary(limit: int = 5) -> str:
         return "Could not load signals log."
 
 
+def _health_lines() -> str:
+    """Subsystem health block for /status. Best-effort per line — one broken
+    subsystem must never take the whole /status down."""
+    lines = []
+
+    def _add(label: str, value: str):
+        lines.append(f"{label}: {value}")
+
+    try:
+        from main import get_coordinator
+        h = get_coordinator().health()
+        _add("Scheduler", "HEALTHY" if h["error_streak"] < 3
+             else f"DEGRADED ({h['error_streak']} errors in a row)")
+        _add("Active scan", f"YES ({h['active_scan_id']})" if h["active"] else "NO")
+        if h["last_scan_at"]:
+            _add("Last scan", f"{h['last_scan_at']} ({h['last_duration_s']}s, "
+                              f"{h['last_signals']} signal(s))")
+    except Exception as exc:
+        _add("Coordinator", f"UNAVAILABLE ({type(exc).__name__})")
+
+    try:
+        import liquidation
+        s = liquidation.stream_status()
+        if s["status"] == "FRESH":
+            _add("Liquidations", "HEALTHY")
+        elif s["status"] == "STALE":
+            age = f" ({s['age_s']:.0f}s)" if s["age_s"] else ""
+            _add("Liquidations", f"STALE{age}")
+        else:
+            _add("Liquidations", "DISCONNECTED")
+    except Exception as exc:
+        _add("Liquidations", f"UNAVAILABLE ({type(exc).__name__})")
+
+    try:
+        from scan_coordinator import AIOpinionWorker  # noqa: F401 (docstring)
+        from main import _ai_worker
+        s = _ai_worker.status()
+        _add("AI", f"{s['last_status']}"
+             + (f" ({s['pending']} pending)" if s["pending"] else ""))
+    except Exception as exc:
+        _add("AI", f"UNAVAILABLE ({type(exc).__name__})")
+
+    try:
+        import telegram_bot
+        _add("Telegram", "HEALTHY" if telegram_bot._listener_running()
+             else "LISTENER DOWN")
+    except Exception:
+        _add("Telegram", "UNKNOWN")
+
+    try:
+        from scanner import cache_stats
+        c = cache_stats()
+        _add("OHLCV cache", f"{c['entries']} frames, {c['hit_rate']:.0%} hits")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
 def get_bot_status_summary() -> str:
     """Return current bot operational status."""
     now_ist = datetime.now(config.TZ)
@@ -57,7 +116,8 @@ def get_bot_status_summary() -> str:
     in_session = config.SESSION_START <= hhmm < config.SESSION_END
     status = "🟢 ACTIVE (Scanning Market)" if in_session else "🌙 SLEEPING (Outside Trading Window)"
 
-    # AI budget + OHLCV cache health (best-effort — /status must never break).
+    # AI budget + liquidation stream + OHLCV cache health (best-effort —
+    # /status must never break).
     extra = ""
     try:
         from ai_decision import budget_status
@@ -66,18 +126,23 @@ def get_bot_status_summary() -> str:
     except Exception:
         pass
     try:
-        from scanner import cache_stats
-        c = cache_stats()
-        extra += f"\nOHLCV Cache: {c['entries']} frames, {c['hit_rate']:.0%} hit rate"
+        from liquidation import stream_status
+        s = stream_status()
+        age = f", {s['age_s']:.0f}s since last event" if s.get("age_s") else ""
+        extra += f"\nLiquidation stream: {s['status']}{age}"
     except Exception:
         pass
 
+    health = _health_lines()
+
     return (
+        f"🟢 BOT HEALTH\n\n"
         f"Current Time: {now_ist.strftime('%Y-%m-%d %H:%M:%S')} IST\n"
         f"Session Hours: {config.SESSION_START} to {config.SESSION_END} IST\n"
         f"Status: {status}\n"
         f"Active Model: {config.AI_MODEL}\n"
-        f"Volume Filter: >= ${config.VOLUME_MIN_USDT:,} USDT"
+        f"Volume Filter: >= ${config.VOLUME_MIN_USDT:,} USDT\n\n"
+        f"{health}"
         f"{extra}"
     )
 
