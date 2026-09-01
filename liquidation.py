@@ -191,19 +191,32 @@ class LiquidationListener:
         self._thread = None
 
     def _on_message(self, _ws, raw: str) -> None:
+        # Binance's !forceOrder@arr wraps EVERY event in a JSON array:
+        # [{"e": "forceOrder", "E": ..., "o": {...}}]. A bare object is
+        # accepted too, so both stream shapes feed the cache.
         try:
             payload = json.loads(raw)
-            orders = payload.get("o") if isinstance(payload, dict) else None
-            if not orders:
-                return
-            side = orders.get("S", "")
+        except json.JSONDecodeError as exc:
+            log.warning("Invalid liquidation message: %s", exc)
+            return
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            self._ingest_order(item.get("o"))
+
+    def _ingest_order(self, orders) -> None:
+        if not isinstance(orders, dict) or not orders:
+            return
+        try:
+            side = str(orders.get("S", "")).upper()
             price = float(orders.get("ap") or orders.get("p") or 0)
             quantity = float(orders.get("z") or orders.get("q") or 0)
             self.cache.add_event({"symbol": orders.get("s"), "side": side,
                                   "price": price, "quantity": quantity,
                                   "notional": price * quantity,
                                   "timestamp": float(orders.get("T", 0)) / 1000 or time.time()})
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (TypeError, ValueError) as exc:
             log.warning("Invalid liquidation event: %s", exc)
 
     def _on_open(self, _ws) -> None:

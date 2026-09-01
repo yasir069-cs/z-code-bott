@@ -84,6 +84,53 @@ def test_ccxt_symbol_finds_binance_stream_events(monkeypatch):
     assert result["windows"]["5m"]["long_count"] == 1
 
 
+def test_listener_parses_binance_array_wire_payload(monkeypatch):
+    """Binance's !forceOrder@arr wraps EVERY event in a JSON array:
+    [{"e": "forceOrder", "o": {...}}]. The listener must unwrap it, or the
+    cache stays empty forever and every summary degrades to unavailable
+    (exactly what the server logs showed: connected + STALE forever)."""
+    now = 1_000_000.0
+    monkeypatch.setattr(liquidation.time, "time", lambda: now + 10)
+    listener = liquidation.LiquidationListener()
+    raw = json.dumps([{
+        "e": "forceOrder", "E": int(now * 1000),
+        "o": {"s": "BTCUSDT", "S": "SELL", "o": "LIMIT", "f": "IOC",
+              "q": "0.5", "p": "9910", "ap": "9910", "X": "FILLED",
+              "l": "0.5", "z": "0.5", "L": "0",
+              "T": int(now * 1000), "A": "123456", "c": "sYu02KRZ"},
+    }])
+    listener._on_message(None, raw)
+    listener.cache.set_connection(True)
+    result = listener.cache.summary("BTCUSDT", current_price=9910.0)
+    assert result["available"] is True
+    # SELL force order = a LONG position liquidated
+    assert result["windows"]["5m"]["long_count"] == 1
+    assert result["windows"]["5m"]["long_notional"] == 9910.0 * 0.5
+    assert result["freshness_seconds"] == 10.0
+
+    # a bare object payload is accepted too (both stream shapes feed the cache)
+    listener2 = liquidation.LiquidationListener()
+    listener2._on_message(None, json.dumps({
+        "e": "forceOrder", "E": int(now * 1000),
+        "o": {"s": "ETHUSDT", "S": "BUY", "q": "2", "p": "50", "ap": "50",
+              "z": "2", "T": int(now * 1000)}}))
+    listener2.cache.set_connection(True)
+    eth = listener2.cache.summary("ETHUSDT", current_price=50.0)
+    assert eth["available"] is True
+    assert eth["windows"]["5m"]["short_count"] == 1  # BUY fill = short liquidated
+
+
+def test_listener_ignores_malformed_messages(monkeypatch):
+    """Garbage on the wire is skipped (logged) — never crashes the listener,
+    never fabricates an event."""
+    listener = liquidation.LiquidationListener()
+    for bad in ("not json", "[]", "123", '"str"', '{"e":"forceOrder"}',
+                '[{"e":"forceOrder","o":null}]', '[{"e":"other","o":{"s":"X"}}]'):
+        listener._on_message(None, bad)
+    assert listener.cache.summary("BTCUSDT")["available"] is False
+    assert listener.cache.summary("BTCUSDT")["windows"]["5m"]["long_count"] == 0
+
+
 def test_lookback_windows_are_config_driven(monkeypatch):
     """LIQUIDATION_WINDOWS in config.py controls which windows the summary
     aggregates — and an invalid override falls back to the defaults instead
