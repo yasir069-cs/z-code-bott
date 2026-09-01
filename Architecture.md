@@ -58,7 +58,7 @@ STEP 4 — decision.decide(frames, funding, oi)   [deterministic core, look-ahea
   7 OI + funding via futures_context (contextual; safe-degrade, no fabricated data)
   9 indicators fold in as a BOUNDED secondary sub-score (scoring.indicator_confirmation)
   → setup_quality: primary < QUALITY_PRIMARY_FLOOR(45) → NO_TRADE("insufficient_primary_evidence")
-                   quality  < QUALITY_MIN(55)          → NO_TRADE("low_setup_quality")
+                   quality  < QUALITY_MIN(50)          → NO_TRADE("low_setup_quality")
   8 risk_gate (mandatory): structure SL, target off nearest opposing zone
       rr < MIN_RR(1.5) / stop > 3·ATR / opposing zone < 1·ATR / wide spread → NO_TRADE(reason)
   → LONG / SHORT / NO_TRADE + entry/SL/TP/RR + setup_quality + full evidence + no_trade_reasons
@@ -75,10 +75,11 @@ STEP 7 — Sizing
   funding-rate-aware leverage + position size = RISK_PER_TRADE_PCT of ACCOUNT_BALANCE
 
 STEP 8 — Confidence cap
-  no sweep → confidence capped at NO_SWEEP_CONFIDENCE_CAP (69, just below HIGH)
+  no sweep → confidence capped at NO_SWEEP_CONFIDENCE_CAP (69, just below STRONG)
 
-STEP 9 — Alert + log
+STEP 9 — Alert + log (owner's tier system)
   BUY/SELL → Telegram (via the long-lived listener Bot); HOLD → silent
+  quality < 50 → log-only (ignored); 50-60 NORMAL · 60-70 HIGH · 70+ STRONG
   every decision → signals_log.csv (28 columns, append-only)
 
   Hard deadline: past SCAN_DEADLINE_SECONDS (240) the scan stops AI work,
@@ -103,8 +104,8 @@ BEARISH: upper wick pierces the 20-candle swing high, body closes back BELOW it,
 ```
 
 With no fresh sweep the alert's confidence is **capped at 69**
-(`NO_SWEEP_CONFIDENCE_CAP`, just below HIGH) and labelled in the alert — see the
-sanctioned-deviations table in strategy_spec.md.
+(`NO_SWEEP_CONFIDENCE_CAP`, just below the STRONG tier) and labelled in the
+alert — see the sanctioned-deviations table in strategy_spec.md.
 
 ## Timeliness architecture
 

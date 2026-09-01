@@ -57,7 +57,7 @@
 - Look-ahead-safe: detectors see only closed candles ≤ the decision bar.
 - NO_TRADE gates (each a named constant): no directional bias, `counter_htf` when
   `MTF_REQUIRE_HTF_ALIGN`, primary `< QUALITY_PRIMARY_FLOOR` (45), quality
-  `< QUALITY_MIN` (55), and risk-gate fails (`rr < MIN_RR` 1.5, stop
+  `< QUALITY_MIN` (50), and risk-gate fails (`rr < MIN_RR` 1.5, stop
   `> RISK_MAX_STOP_ATR`, opposing zone `< RISK_MIN_TARGET_ATR`, spread too wide).
 - `setup_quality` weights (sum 100): structure 25 · S/R 20 · liquidity 20 ·
   price action 15 · MTF 10 · trendline 5 · futures 5. Indicators add only a
@@ -69,9 +69,12 @@
 - Repurposed as `indicator_confirmation(snap, direction, cfg) → {score, agrees, notes}`.
 - The graded component fns (zone / RSI / volume / Bollinger / sweep) are reused as
   a bounded confirmation sub-score — they **no longer hard-gate** a coin.
-- Legacy sweep scoring: absence caps confidence at `NO_SWEEP_CONFIDENCE_CAP` (69)
-  and is labelled in the alert. The **primary** sweep logic lives in `liquidity.py`
+- Legacy sweep scoring: absence caps confidence at `NO_SWEEP_CONFIDENCE_CAP` (69,
+  just below the STRONG tier) and is labelled in the alert. The **primary** sweep
+  logic lives in `liquidity.py`
   (sweep + reclaim + mandatory confirmation, `LIQ_CONFIRM_REQUIRED`).
+- Alert tiers (owner's rule, 2026-09-01): quality < 50 → ignored (log-only);
+  50-60 → NORMAL alert; 60-70 → HIGH alert; 70+ → STRONGEST alert.
 
 ## AI rules (ai_decision.py — explanation only)
 - The LLM **never decides** and never returns signal/levels. It turns a finished

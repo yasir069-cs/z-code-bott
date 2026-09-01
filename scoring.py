@@ -254,11 +254,11 @@ def confluence(score_1h_val: float, score_15m_val: float, score_5m_val: float) -
 
 
 def apply_sweep_confidence_cap(confidence: float, sweep: Optional[dict]) -> float:
-    """Sweep is required for a FULL-confidence alert (owner's decision).
+    """Sweep is required for the STRONGEST alert tier (owner's decision).
 
-    Without a sweep the confidence is capped just below the HIGH band used by
-    alerts._conf_label(), so a no-sweep setup can still alert but can never
-    present itself as a high-confidence one.
+    Without a sweep the confidence is capped just below ALERT_TIER_STRONG_MIN,
+    so a no-sweep setup can still alert (NORMAL/HIGH) but can never present
+    itself as a STRONG one.
     """
     if sweep:
         return confidence

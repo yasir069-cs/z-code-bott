@@ -92,7 +92,7 @@ def test_populated_alert_renders_confidence_confluence_indicators_sweep():
         rsi_bounce_detected=True,
     )
     text = alerts.format_alert(sig)
-    assert "HIGH" in text                       # confidence 85 -> HIGH band
+    assert "STRONG" in text                      # confidence 85 -> STRONG tier (70+)
     assert "Confluence" in text and "78/100" in text
     for part in ("1H 82", "15M 74", "5M 76"):   # per-timeframe breakdown
         assert part in text
@@ -104,12 +104,12 @@ def test_populated_alert_renders_confidence_confluence_indicators_sweep():
 
 def test_no_sweep_alert_caps_confidence_and_labels_it():
     """Without a sweep, run_scan caps confidence at NO_SWEEP_CONFIDENCE_CAP
-    (just below HIGH) and the alert must say so — 'sweep required for full
-    confidence' is a visible label, not a hidden number."""
+    (just below the STRONG tier) and the alert must say so — 'sweep required
+    for the strongest alert' is a visible label, not a hidden number."""
     sig = _sig(confidence=config.NO_SWEEP_CONFIDENCE_CAP, confluence=66.0,
                sweep=dict(detected=False))
     text = alerts.format_alert(sig)
-    assert "MEDIUM" in text                      # 69.0 -> below the 70 HIGH gate
+    assert "HIGH" in text                       # 69.0 -> below the 70 STRONG gate
     assert "Not detected" in text and "capped" in text
 
 

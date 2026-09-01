@@ -21,10 +21,14 @@ _FALLBACK_TAG = "AI Unavailable — Indicator based signal"
 # is NOT the legacy "AI unavailable" fallback — the verdict never depended on it.
 _LOCAL_EXPLANATION_FOOTER = "Decision by deterministic core · explanation generated locally"
 
-# Confidence display mapping
+# Alert-level display mapping — tiers read from the signal's confidence
+# (setup-quality after the no-sweep cap), per the owner's rule:
+#   70-100 STRONG (strongest alert) · 60-70 HIGH · 50-60 NORMAL · below 50 LOW
+#   (below ALERT_QUALITY_MIN never alerts at all; LOW is defensive only)
 _CONF_META = {
-    "high":   ("🔥", "HIGH"),
-    "medium": ("⚡", "MEDIUM"),
+    "strong": ("🏆", "STRONG"),
+    "high":   ("⚡", "HIGH"),
+    "normal": ("✅", "NORMAL"),
     "low":    ("⚠️", "LOW"),
 }
 
@@ -33,10 +37,12 @@ def _conf_label(confidence) -> tuple[str, str]:
     """Return (emoji, label) for a confidence value (float 0-100 or string)."""
     try:
         val = float(confidence)
-        if val >= 70:
+        if val >= config.ALERT_TIER_STRONG_MIN:
+            return _CONF_META["strong"]
+        if val >= config.ALERT_TIER_HIGH_MIN:
             return _CONF_META["high"]
-        if val >= 45:
-            return _CONF_META["medium"]
+        if val >= config.ALERT_TIER_NORMAL_MIN:
+            return _CONF_META["normal"]
         return _CONF_META["low"]
     except (TypeError, ValueError):
         key = str(confidence).lower()
@@ -121,7 +127,11 @@ def format_alert(sig: dict) -> str:
     else:
         sweep_text = "➖ <b>Liq Sweep:</b> Not detected <i>(confidence capped)</i>"
 
-    # Confidence
+    # Alert level: tier from confidence (quality after the no-sweep cap)
+    try:
+        conf_num = f" <code>({float(sig.get('confidence', 0)):.1f}/100)</code>"
+    except (TypeError, ValueError):
+        conf_num = ""
     conf_emoji, conf_label = _conf_label(sig.get("confidence", 0))
 
     # Confluence line — present when run_scan forwards the scored context
@@ -165,7 +175,7 @@ def format_alert(sig: dict) -> str:
         f"├ SL:     {sl_str}\n"
         f"├ TP:     {tp_str}\n"
         f"└ RR:     {rr_str}\n\n"
-        f"{conf_emoji} <b>Confidence:</b> {conf_label}\n"
+        f"{conf_emoji} <b>Alert Level:</b> {conf_label}{conf_num}\n"
         f"{conf_line}"
         f"📝 <i>{reason_text}</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"

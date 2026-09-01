@@ -110,7 +110,7 @@ ALL USDT-M FUTURES PAIRS (fetch_tickers, dynamic)
   short); a touch alone is not an entry (`liquidity.py`, `LIQ_CONFIRM_REQUIRED`).
 - The legacy graded **zone/sweep** scorer in `scoring.py` is retained as part of
   the **secondary** indicator layer: with no fresh sweep the alert's confidence
-  is **capped at 69** (`NO_SWEEP_CONFIDENCE_CAP`, just below HIGH) and labelled
+  is **capped at 69** (`NO_SWEEP_CONFIDENCE_CAP`, just below the STRONG tier) and labelled
   "Not detected (confidence capped)".
 
 ## Timeliness (never late)

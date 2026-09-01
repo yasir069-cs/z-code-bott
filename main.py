@@ -374,8 +374,10 @@ def _apply_llm_verdict(d: dict, verdict: dict | None,
 
 
 def _emission_kind(signal: str, quality: float) -> str:
-    """Post-LLM emission rule: HOLD log-only; BUY/SELL below ALERT_QUALITY_MIN
-    log-only; at/above the threshold alert + log + cooldown."""
+    """Post-LLM emission rule (owner's tier system): HOLD log-only; BUY/SELL
+    below ALERT_QUALITY_MIN (50) log-only; at/above it alert + log + cooldown.
+    The alert's tier (NORMAL 50-60 / HIGH 60-70 / STRONG 70+) is labelled by
+    alerts._conf_label from the computed confidence."""
     if signal == "HOLD":
         return "hold"
     return "alert" if quality >= config.ALERT_QUALITY_MIN else "log_only"
@@ -662,10 +664,11 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         })
 
     # --- STEP 8-9: rank by setup-quality; PERSIST FIRST, then alert ---
-    # Strongest setups first. Emission rule: HOLD log-only; BUY/SELL below
-    # ALERT_QUALITY_MIN (65) log-only; at/above it alert + cooldown. The CSV
-    # row is written BEFORE the Telegram send: delivery failure can never
-    # cost the signal its persistence.
+    # Strongest setups first. Emission rule (owner's tier system): HOLD
+    # log-only; BUY/SELL below ALERT_QUALITY_MIN (50) log-only; at/above it
+    # alert + cooldown with the tier label (NORMAL 50-60 / HIGH 60-70 /
+    # STRONG 70+). The CSV row is written BEFORE the Telegram send: delivery
+    # failure can never cost the signal its persistence.
     decided.sort(key=lambda t: t[0], reverse=True)
     with _coordinator.stage("persist"):
         for quality, signal, sig, symbol in decided:
