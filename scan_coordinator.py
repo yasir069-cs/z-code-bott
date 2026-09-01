@@ -112,7 +112,6 @@ class AIOpinionWorker:
     def _run(self, scan_id: str, records: list, bundles: list) -> None:
         """Fetch verdicts and write the audit rows. AI failure states map to
         distinct statuses; malformed responses surface as FAILED, not crash."""
-        by_symbol = {b["symbol"]: b for b in bundles}
         verdicts: dict = {}
         try:
             verdicts = self._verdicts_fn(bundles)
@@ -122,19 +121,13 @@ class AIOpinionWorker:
             self._write_rows(scan_id, records, {}, status, str(exc)[:300])
             raise
 
-        rows = []
+        self._write_rows(scan_id, records, verdicts, "SUCCESS", "")
         for rec in records:
             verdict = verdicts.get(rec["symbol"])
-            if verdict is None:
-                rows.append((rec, None, "UNAVAILABLE", None, ""))
-            else:
-                rows.append((rec, verdict, "SUCCESS", verdict.get("confidence"),
-                             verdict.get("reason") or ""))
-        self._write_rows(scan_id, records, verdicts, "SUCCESS", "")
-        for rec, verdict, status, conf, reason in rows:
             log.info("AI opinion %s: deterministic=%s ai=%s status=%s",
                      rec["symbol"], rec["deterministic_decision"],
-                     (verdict or {}).get("signal"), status)
+                     (verdict or {}).get("signal"),
+                     "SUCCESS" if verdict else "UNAVAILABLE")
 
     def _write_rows(self, scan_id: str, records: list, verdicts: dict,
                     status: str, error: str) -> None:
@@ -147,6 +140,15 @@ class AIOpinionWorker:
                     writer.writeheader()
                 for rec in records:
                     verdict = verdicts.get(rec["symbol"]) or {}
+                    has_verdict = bool(verdict)
+                    # SUCCESS batch: an unanswered record is UNAVAILABLE (the
+                    # old `status if verdict else status` no-op mislabeled it
+                    # SUCCESS with an empty opinion). A failed/timed-out batch
+                    # labels every record with the batch-level status.
+                    if status == "SUCCESS":
+                        ai_status = "SUCCESS" if has_verdict else "UNAVAILABLE"
+                    else:
+                        ai_status = status
                     writer.writerow({
                         "timestamp": datetime.now(config.TZ).isoformat(timespec="seconds"),
                         "scan_id": scan_id,
@@ -154,7 +156,7 @@ class AIOpinionWorker:
                         "symbol": rec["symbol"],
                         "deterministic_decision": rec["deterministic_decision"],
                         "ai_opinion": verdict.get("signal", ""),
-                        "ai_status": status if verdict else status,
+                        "ai_status": ai_status,
                         "ai_confidence": verdict.get("confidence", ""),
                         "ai_reason": (verdict.get("reason") or error or "")[:300],
                         "final_decision": rec["deterministic_decision"],

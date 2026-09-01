@@ -1,7 +1,6 @@
 """Liquidation websocket cache and integration tests."""
 import json
 import csv
-import time
 
 import alerts
 import ai_decision
