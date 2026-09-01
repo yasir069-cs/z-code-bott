@@ -58,6 +58,7 @@ class LiquidationCache:
         self._max_age = max_age_seconds or max(_configured_windows().values())
         self._lock = threading.RLock()
         self._connected = False
+        self._connected_at = None
         self._last_message_at = None
         self._warning = "liquidation stream has not connected"
 
@@ -83,6 +84,9 @@ class LiquidationCache:
         with self._lock:
             self._connected = connected
             self._warning = warning
+            if connected:
+                # Freshness baseline until the first event arrives.
+                self._connected_at = time.time()
 
     @property
     def connected(self) -> bool:
@@ -98,15 +102,24 @@ class LiquidationCache:
                      the feed itself has gone quiet — old events must not be
                      presented as current information)
         DISCONNECTED — no socket at all
+
+        Before the FIRST message, age is measured from the moment the socket
+        opened: Binance throttles the forceOrder snapshot stream (at most one
+        event per second) and a quiet minute is normal, so a freshly
+        connected stream must not be branded STALE. The old code reported
+        STALE instantly, which the watchdog then logged 60s after every
+        restart ("no message for since start").
         """
         with self._lock:
             connected = self._connected
             last = self._last_message_at
+            connected_at = self._connected_at
         if not connected:
             return {"status": "DISCONNECTED", "age_s": None}
-        if last is None:
+        baseline = last if last is not None else connected_at
+        if baseline is None:
             return {"status": "STALE", "age_s": None}
-        age = max(0.0, time.time() - last)
+        age = max(0.0, time.time() - baseline)
         status = "FRESH" if age <= config.LIQ_STALE_SECONDS else "STALE"
         return {"status": status, "age_s": round(age, 1)}
 
