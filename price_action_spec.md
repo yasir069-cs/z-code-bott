@@ -53,7 +53,7 @@ frames = { "1h": HTF, "15m": setup, "5m": entry }   # config.TF_HTF / TF_SETUP /
 4. Indicators (sec.)   scoring.indicator_confirmation(snap, direction) -> {score, agrees, notes}
 5. Setup quality       setup_quality.score(...) -> primary (0-100) + bounded indicator term
    └─ primary < QUALITY_PRIMARY_FLOOR (45)              -> NO_TRADE("insufficient_primary_evidence")
-   └─ quality  < QUALITY_MIN (55)                       -> NO_TRADE("low_setup_quality")
+   └─ quality  < QUALITY_MIN (50)                       -> NO_TRADE("low_setup_quality")
 6. MTF alignment       MTF_REQUIRE_HTF_ALIGN and entry opposes HTF -> NO_TRADE("counter_htf")
 7. Risk/reward gate     risk_gate.evaluate(...) -> structure SL, target off nearest opposing zone, RR
    └─ rr < MIN_RR (1.5) / stop > RISK_MAX_STOP_ATR (3.0)

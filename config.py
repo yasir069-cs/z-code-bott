@@ -120,8 +120,9 @@ CONFLUENCE_W_1H = 0.40          # weights must sum to 1.0
 CONFLUENCE_W_15M = 0.30
 CONFLUENCE_W_5M = 0.30
 
-# Sweep is required for a FULL-confidence alert: without it the confidence is
-# capped below the HIGH band and the alert is labelled "no sweep".
+# Sweep is required for the STRONGEST alert tier: without it the confidence is
+# capped just below ALERT_TIER_STRONG_MIN (70) and the alert is labelled
+# "no sweep" — a no-sweep setup can reach HIGH but never STRONG.
 NO_SWEEP_CONFIDENCE_CAP = 69.0
 
 # ------------------------------------------------------------------ liquidation sweep
@@ -289,7 +290,8 @@ QUALITY_W_FUTURES = 5
 QUALITY_PRIMARY_FLOOR = 45       # primary score below this -> NO_TRADE (indicators cannot rescue)
 IND_CONFIRM_BONUS_MAX = 10       # aligned indicators add at most this (cannot trigger alone)
 IND_CONFLICT_PENALTY_MAX = 15    # opposing indicators shave at most this (secondary yields)
-QUALITY_MIN = 55                 # final setup-quality gate for a tradable setup
+QUALITY_MIN = 50                 # final setup-quality gate for a tradable setup (owner's
+                                 # tier system: below 50 is ignored, 50+ is alertable)
 
 # ---- setup-quality exhaustion & location penalties
 # A score that only asks "how strongly does each layer agree with the
@@ -346,7 +348,14 @@ DECISION_ENABLED = True          # master switch: price-action core decides (vs 
 # verdict then faces the SAME deterministic validation (direction gates,
 # stop width, R:R, quality floor) before an alert can go out.
 LLM_DECISION_ENABLED = True      # False -> pure deterministic core (previous behaviour)
-ALERT_QUALITY_MIN = 65           # Telegram alert floor; a BUY/SELL below this is log-only
+# ---- alert tier system (owner's rule, 2026-09-01) ----
+# Below 50: ignored (log-only, never alerts). 50-60: NORMAL alert.
+# 60-70: HIGH alert. 70-100: STRONGEST alert. The tier is read from the
+# confidence the pipeline computed (setup-quality after the no-sweep cap).
+ALERT_QUALITY_MIN = 50           # Telegram alert floor; a BUY/SELL below this is log-only
+ALERT_TIER_NORMAL_MIN = 50       # 50.0-59.9 -> NORMAL
+ALERT_TIER_HIGH_MIN = 60         # 60.0-69.9 -> HIGH
+ALERT_TIER_STRONG_MIN = 70       # 70.0+     -> STRONG
 
 # ---- news verification engine (VERIFY FIRST — AI never decides what is true)
 NEWS_ENABLED = False             # news engine OFF (owner's call, 2026-08-30)
