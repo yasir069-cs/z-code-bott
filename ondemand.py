@@ -20,10 +20,14 @@ _ondemand_guard = None
 
 
 def start_ondemand_scan(run_scan_fn, make_exchange_fn, fetch_funding_fn,
-                        DuplicateGuardClass) -> dict:
+                        guard_fn=None) -> dict:
     """Start on-demand 5-minute scans anytime outside 18:00-23:00 IST.
 
     Parameters are injected from main.py to avoid circular imports.
+    *guard_fn* supplies the SHARED DuplicateGuard so on-demand and scheduled
+    scans respect each other's cooldowns (separate guards used to let a coin
+    alerted by one path be re-alerted by the other). The scan itself is
+    additionally serialized by the ScanCoordinator inside run_scan.
     Returns a status dict: {'status': 'started' | 'already_running'}.
     """
     global _ondemand_scheduler, _ondemand_exchange, _ondemand_guard
@@ -33,7 +37,7 @@ def start_ondemand_scan(run_scan_fn, make_exchange_fn, fetch_funding_fn,
         return {"status": "already_running"}
 
     _ondemand_exchange = make_exchange_fn()
-    _ondemand_guard = DuplicateGuardClass()
+    _ondemand_guard = guard_fn() if guard_fn else None
     _ondemand_scheduler = BackgroundScheduler(timezone=config.SCHEDULER_TZ)
 
     def ondemand_job() -> None:

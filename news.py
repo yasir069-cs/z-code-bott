@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -33,6 +34,9 @@ import requests
 import config
 
 log = logging.getLogger("news")
+
+# per-feed cooldown timestamps (time.monotonic()), shared across cycles
+_feed_cooldowns: dict[str, float] = {}
 
 # statuses, in precedence order (highest first)
 DEBUNKED = "DEBUNKED"
@@ -235,9 +239,21 @@ def fetch_rss_articles(feeds=config.NEWS_RSS_FEEDS,
     Handles both RSS 2.0 (CoinDesk/Cointelegraph <item>) and Atom (Reddit
     .rss <entry>) so social discovery feeds work without extra deps.
     `limit` applies PER FEED so later feeds (Trump/politics/social) are not
-    starved by the first big feed hitting a global cap."""
+    starved by the first big feed hitting a global cap.
+
+    Per-source backoff: a feed that answered 429 or timed out goes on a
+    cooldown and is simply skipped until it expires — a throttling source is
+    never immediately re-hammered, and its failure never affects the other
+    feeds or the market scanner (the news engine runs on its own thread)."""
     articles: list[Article] = []
+    now = time.monotonic()
     for feed in feeds:
+        # cooldown check (module-level so the background engine's cycles
+        # share it; tests can reset it)
+        until = _feed_cooldowns.get(feed, 0.0)
+        if now < until:
+            log.debug("news feed %s cooling down (%.0fs left)", feed, until - now)
+            continue
         feed_count = 0
         try:
             resp = requests.get(feed, timeout=timeout,
@@ -266,6 +282,20 @@ def fetch_rss_articles(feeds=config.NEWS_RSS_FEEDS,
                 feed_count += 1
                 if feed_count >= limit:
                     break
+        except requests.exceptions.HTTPError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 429:
+                _feed_cooldowns[feed] = time.monotonic() + config.NEWS_429_COOLDOWN_SECONDS
+                log.warning("news feed %s rate-limited (429) — cooling down %ds",
+                            feed, config.NEWS_429_COOLDOWN_SECONDS)
+            else:
+                _feed_cooldowns[feed] = time.monotonic() + config.NEWS_TIMEOUT_COOLDOWN_SECONDS
+                log.warning("news feed %s HTTP %s — cooling down %ds",
+                            feed, status, config.NEWS_TIMEOUT_COOLDOWN_SECONDS)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            _feed_cooldowns[feed] = time.monotonic() + config.NEWS_TIMEOUT_COOLDOWN_SECONDS
+            log.warning("news feed %s timed out (%s) — cooling down %ds",
+                        feed, type(exc).__name__, config.NEWS_TIMEOUT_COOLDOWN_SECONDS)
         except Exception as exc:
             log.warning("RSS feed %s failed: %s", feed, exc)
     return articles

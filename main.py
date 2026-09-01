@@ -57,6 +57,7 @@ import filter_1h
 import filter_5m
 import logger
 import liquidation
+import scan_coordinator
 import scanner
 import scoring
 import telegram_bot
@@ -67,6 +68,21 @@ from ai_decision import (AIDecisionError, nemotron_decision,
 from fallback import explanation_fallback, fallback_decision
 
 log = logging.getLogger("main")
+
+# THE single-scan gate + shared guard + background AI worker. Every path
+# (scheduled job, /scan_on session, --once) enters run_scan, which claims the
+# coordinator before touching the network.
+_coordinator = scan_coordinator.ScanCoordinator(duplicate_guard.DuplicateGuard)
+_ai_worker = scan_coordinator.AIOpinionWorker(ai_decision.llm_verdicts)
+
+
+def get_coordinator() -> scan_coordinator.ScanCoordinator:
+    """Shared coordinator (telegram_bot /status, ondemand wiring, tests)."""
+    return _coordinator
+
+
+def _new_scan_id(now_ist: datetime) -> str:
+    return now_ist.strftime("%Y%m%d-%H%M%S")
 
 
 def _in_session(now_ist: datetime) -> bool:
@@ -206,10 +222,13 @@ def _build_sig(symbol: str, d: dict, signal: str, snap5: dict | None,
     reason = explanation_fallback(d)
     if ai_reason:
         reason = f"{ai_reason} | {reason}"
-    if liquidation_summary.get("available"):
-        one_hour = liquidation_summary["windows"]["1h"]
-        reason += (f" Liquidations: {one_hour['long_count']} long / "
-                   f"{one_hour['short_count']} short events in 1h.")
+    # Liquidation context joins the reason text only when the websocket
+    # summary is available AND the window it quotes is actually configured —
+    # a missing window must not fabricate a "0 events in 1h" reading.
+    one_hour_liq = (liquidation_summary.get("windows") or {}).get("1h")
+    if liquidation_summary.get("available") and one_hour_liq:
+        reason += (f" Liquidations: {one_hour_liq.get('long_count', 0)} long / "
+                   f"{one_hour_liq.get('short_count', 0)} short events in 1h.")
     return {
         "coin": symbol,
         "signal": signal,
@@ -454,30 +473,58 @@ def run_force_llm(exchange, top_n: int = 3) -> dict:
             "answered": len(results)}
 
 
-def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
+def run_scan(exchange, guard: duplicate_guard.DuplicateGuard | None = None,
              tickers: dict | None = None,
              funding_rates: dict | None = None,
              force: bool = False) -> dict:
-    """One full scan cycle. `force=True` runs it regardless of the session
-    window (DEMO/TEST mode) — production scans are only ever scheduled
-    inside 18:00-23:00 IST.
+    """One full scan cycle, coordinated: only ONE scan may run at a time.
+
+    `force=True` runs it regardless of the session window (DEMO/TEST mode) —
+    production scans are only ever scheduled inside 18:00-23:00 IST. If
+    another scan is active (scheduled + on-demand overlap), this call skips
+    immediately and says so.
+
+    Critical path = universe -> funding -> OHLCV -> deterministic decision ->
+    risk gate -> persist -> Telegram, all stage-timed and deadline-bounded.
+    AI runs in the BACKGROUND afterwards (audit-only, never blocks the scan
+    and never changes an already-persisted signal).
 
     *tickers* is the raw dict from exchange.fetch_tickers(); when provided it
     is forwarded to the scanner so fetch_tickers() is called once per cycle.
     *funding_rates* is the {symbol: rate} dict for funding-rate filtering.
-
-    Fetching is batched per timeframe and bounded by a hard deadline so the
-    scan can never overrun its 5-minute slot.
     """
     now_ist = datetime.now(config.TZ)
-    deadline = time.monotonic() + config.SCAN_DEADLINE_SECONDS
+    scan_id = _new_scan_id(now_ist)
 
     if not force and not _in_session(now_ist):
         log.info("Outside active session (now %s IST) - zero activity",
                  now_ist.strftime("%H:%M"))
         return {"scanned": 0}
 
-    symbols = scanner.get_active_usdt_symbols(exchange, tickers)
+    # THE single-scan gate: scheduled, /scan_on and --once all pass here.
+    if not _coordinator.try_begin(scan_id):
+        log.warning("Scan %s skipped — scan %s already active", scan_id,
+                    _coordinator.scan_id)
+        return {"scanned": 0, "skipped": "scan already active"}
+    try:
+        return _run_scan_locked(exchange, guard, tickers, funding_rates,
+                                now_ist, scan_id)
+    except Exception as exc:
+        # the scan slot must never stay claimed because one scan blew up
+        log.error("Scan %s failed: %s: %s", scan_id, type(exc).__name__, exc)
+        _coordinator.end({"error": str(exc)[:200], "scanned": 0})
+        return {"scanned": 0, "error": str(exc)[:200]}
+
+
+def _run_scan_locked(exchange, guard, tickers, funding_rates,
+                     now_ist, scan_id) -> dict:
+    """The scan body — only reached with the coordinator slot claimed."""
+    deadline = time.monotonic() + config.SCAN_DEADLINE_SECONDS
+    # one shared guard across every scan path (was: per-path instances)
+    guard = guard or _coordinator.get_guard()
+
+    with _coordinator.stage("universe"):
+        symbols = scanner.get_active_usdt_symbols(exchange, tickers)
     tickers_last = {}
     if tickers:
         tickers_last = {s: t.get("last") for s, t in tickers.items()
@@ -486,44 +533,48 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
         funding_rates = {}
     summary = {"scanned": len(symbols), "pass_1h": 0, "pass_15m": 0, "pass_5m": 0,
                "funding_rejected": 0, "duplicates": 0, "gate_rejected": 0,
-               "ai_used": 0, "llm_vetoed": 0, "signals": 0, "log_only": 0, "holds": 0}
+               "ai_used": 0, "llm_vetoed": 0, "signals": 0, "log_only": 0,
+               "holds": 0, "telegram_failed": 0, "ai_status": "QUEUED"}
 
     # --- STEP 1+2: batch-fetch 1H for every symbol; structure funnel ---
-    frames_1h = scanner.fetch_timeframe_batch(symbols, "1h", deadline=deadline)
+    with _coordinator.stage("ohlcv_1h"):
+        frames_1h = scanner.fetch_timeframe_batch(symbols, "1h", deadline=deadline)
     candidates = []  # survivors of the 1H structure funnel + funding + duplicate guard
-    for symbol, df_1h in frames_1h.items():
-        feat = filter_1h.analyze_1h(df_1h)
-        if feat is None or feat["direction"] is None:
-            continue                       # ranging / undecided HTF -> not worth LTF fetch
-        summary["pass_1h"] += 1
-        direction = feat["direction"]
+    with _coordinator.stage("filter_1h"):
+        for symbol, df_1h in frames_1h.items():
+            feat = filter_1h.analyze_1h(df_1h)
+            if feat is None or feat["direction"] is None:
+                continue                   # ranging / undecided HTF -> not worth LTF fetch
+            summary["pass_1h"] += 1
+            direction = feat["direction"]
 
-        # STEP 3: funding rate — reject when the market is overleveraged
-        fr = funding_rates.get(symbol)
-        if fr is not None:
-            if direction == "BUY" and fr > config.FUNDING_RATE_MAX_LONG:
-                log.info("%s: BUY rejected — funding %.4f%% > %.4f%% (longs overleveraged)",
-                         symbol, fr * 100, config.FUNDING_RATE_MAX_LONG * 100)
-                summary["funding_rejected"] += 1
+            # STEP 3: funding rate — reject when the market is overleveraged
+            fr = funding_rates.get(symbol)
+            if fr is not None:
+                if direction == "BUY" and fr > config.FUNDING_RATE_MAX_LONG:
+                    log.info("%s: BUY rejected — funding %.4f%% > %.4f%% (longs overleveraged)",
+                             symbol, fr * 100, config.FUNDING_RATE_MAX_LONG * 100)
+                    summary["funding_rejected"] += 1
+                    continue
+                if direction == "SELL" and fr < config.FUNDING_RATE_MIN_SHORT:
+                    log.info("%s: SELL rejected — funding %.4f%% < %.4f%% (shorts overleveraged)",
+                             symbol, fr * 100, config.FUNDING_RATE_MIN_SHORT * 100)
+                    summary["funding_rejected"] += 1
+                    continue
+
+            # STEP 4: duplicate guard FIRST — a cooling-down coin costs zero LTF fetches
+            if guard.is_duplicate(symbol, now_ist):
+                summary["duplicates"] += 1
+                log.debug("%s: duplicate within cooldown - skipped before LTF fetch", symbol)
                 continue
-            if direction == "SELL" and fr < config.FUNDING_RATE_MIN_SHORT:
-                log.info("%s: SELL rejected — funding %.4f%% < %.4f%% (shorts overleveraged)",
-                         symbol, fr * 100, config.FUNDING_RATE_MIN_SHORT * 100)
-                summary["funding_rejected"] += 1
-                continue
 
-        # STEP 4: duplicate guard FIRST — a cooling-down coin costs zero LTF fetches
-        if guard.is_duplicate(symbol, now_ist):
-            summary["duplicates"] += 1
-            log.debug("%s: duplicate within cooldown - skipped before LTF fetch", symbol)
-            continue
-
-        candidates.append({"symbol": symbol, "direction": direction,
-                           "df_1h": df_1h, "fr": fr})
+            candidates.append({"symbol": symbol, "direction": direction,
+                               "df_1h": df_1h, "fr": fr})
 
     # --- STEP 5a: batch-fetch 15M (setup TF) for the survivors ---
-    frames_15m = scanner.fetch_timeframe_batch([c["symbol"] for c in candidates], "15m",
-                                               deadline=deadline)
+    with _coordinator.stage("ohlcv_15m"):
+        frames_15m = scanner.fetch_timeframe_batch(
+            [c["symbol"] for c in candidates], "15m", deadline=deadline)
     with_15m = []
     for c in candidates:
         df_15m = frames_15m.get(c["symbol"])
@@ -534,125 +585,138 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard,
         with_15m.append(c)
 
     # --- STEP 5b: batch-fetch 5M (entry TF); run the decision core over all 3 TFs ---
-    frames_5m = scanner.fetch_timeframe_batch([c["symbol"] for c in with_15m], "5m",
-                                              deadline=deadline)
-    analysed = []   # (d, cand, snap5, rsi_bounce, last_price) pre-verdict
-    for c in with_15m:
-        df_5m = frames_5m.get(c["symbol"])
-        if df_5m is None:
-            continue
-        summary["pass_5m"] += 1
-        symbol, direction, fr = c["symbol"], c["direction"], c["fr"]
+    with _coordinator.stage("ohlcv_5m"):
+        frames_5m = scanner.fetch_timeframe_batch(
+            [c["symbol"] for c in with_15m], "5m", deadline=deadline)
+    analysed = []   # (d, cand, snap5, rsi_bounce, last_price) pre-LLM
+    with _coordinator.stage("oi"), _coordinator.stage("decision"):
+        for c in with_15m:
+            df_5m = frames_5m.get(c["symbol"])
+            if df_5m is None:
+                continue
+            summary["pass_5m"] += 1
+            symbol, direction, fr = c["symbol"], c["direction"], c["fr"]
 
-        # entry-TF features: the 5M snapshot + RSI-bounce badge (never gates)
-        entry_feat = filter_5m.entry_5m(df_5m, direction)
-        snap5 = (entry_feat or {}).get("indicators")
-        rsi_bounce = bool((entry_feat or {}).get("rsi_bounce_detected"))
+            # entry-TF features: the 5M snapshot + RSI-bounce badge (never gates)
+            entry_feat = filter_5m.entry_5m(df_5m, direction)
+            snap5 = (entry_feat or {}).get("indicators")
+            rsi_bounce = bool((entry_feat or {}).get("rsi_bounce_detected"))
 
-        # crypto-futures context: OI history (safe-degrade to None past the deadline)
-        oi_df = None
-        if config.OI_FETCH_ENABLED and time.monotonic() < deadline:
-            oi_df = scanner.fetch_open_interest_history(
-                exchange, symbol, config.OI_HISTORY_TIMEFRAME, config.OI_HISTORY_LIMIT)
+            # crypto-futures context: OI history (safe-degrade to None past the
+            # deadline; bounded per-request by the ccxt timeout + retries)
+            oi_df = None
+            if config.OI_FETCH_ENABLED and time.monotonic() < deadline:
+                oi_df = scanner.fetch_open_interest_history(
+                    exchange, symbol, config.OI_HISTORY_TIMEFRAME,
+                    config.OI_HISTORY_LIMIT)
 
-        # THE decision evidence: deterministic core over HTF/setup/entry frames.
-        frames = {config.TF_HTF: c["df_1h"], config.TF_SETUP: c["df_15m"],
-                  config.TF_ENTRY: df_5m}
-        d = decision_core.decide(frames, funding_rate=fr, oi_df=oi_df, symbol=symbol)
-        last_price = ((tickers_last or {}).get(symbol) or d.get("entry")
-                      or (snap5 or {}).get("close"))
-        c["feat_1h"] = c.get("feat_1h") or {}
-        analysed.append((d, c, snap5, rsi_bounce, last_price))
+            # THE decision evidence: deterministic core over HTF/setup/entry frames.
+            frames = {config.TF_HTF: c["df_1h"], config.TF_SETUP: c["df_15m"],
+                      config.TF_ENTRY: df_5m}
+            d = decision_core.decide(frames, funding_rate=fr, oi_df=oi_df,
+                                     symbol=symbol)
+            last_price = ((tickers_last or {}).get(symbol) or d.get("entry")
+                          or (snap5 or {}).get("close"))
+            c["feat_1h"] = c.get("feat_1h") or {}
+            analysed.append((d, c, snap5, rsi_bounce, last_price))
 
-        # (1) pre-LLM candidate facts — operator-side only; the LLM prompt
-        # never carries this verdict context
-        _struct = d.get("structure") or {}
-        _rr = d.get("rr")
-        log.info("PRE-LLM %s: funnel=%s structure=%s/%s htf=%s quality=%.0f rr=%s",
-                 symbol, direction, _struct.get("trend", "n/a"),
-                 _struct.get("bias", "n/a"), d.get("htf_bias", "n/a"),
-                 d.get("setup_quality") or 0.0,
-                 f"{_rr:.2f}" if _rr is not None else "n/a")
+            # per-symbol diagnostics live at DEBUG — the INFO funnel stays
+            # one concise summary per scan
+            _struct = d.get("structure") or {}
+            _rr = d.get("rr")
+            log.debug("PRE-LLM %s: funnel=%s structure=%s/%s htf=%s quality=%.0f rr=%s",
+                      symbol, direction, _struct.get("trend", "n/a"),
+                      _struct.get("bias", "n/a"), d.get("htf_bias", "n/a"),
+                      d.get("setup_quality") or 0.0,
+                      f"{_rr:.2f}" if _rr is not None else "n/a")
 
     if not analysed:
-        log.info("Scan complete: %s", summary)
+        log.info("Scan %s complete: %s", scan_id, summary)
+        _coordinator.end(summary)
         return summary
 
-    # --- STEP 6: LLM decision stage — every shortlisted coin goes to the model
-    # with its FULL structured data BEFORE the final deterministic gates can
-    # reject it. The verdict (LONG/SHORT/NO_TRADE) then faces the same gates.
-    verdicts: dict = {}
+    # --- STEP 6: deterministic emission (critical path) ---
+    # Signals are built from the deterministic core, PERSISTED and alerted
+    # now. The AI opinion stage runs afterwards in the background (audit
+    # only) so a slow/failing model can never delay or block this scan.
+    decided = []   # (setup_quality, signal, sig, symbol) for ranked emission
+    ai_records = []   # audit rows for the background AI worker
+    for d, c, snap5, rsi_bounce, last_price in analysed:
+        symbol, fr = c["symbol"], c["fr"]
+        signal = _SIGNAL_MAP.get(d.get("decision"), "HOLD")
+        quality = float(d.get("setup_quality") or 0.0)
+        if signal == "HOLD":
+            summary["gate_rejected"] += 1
+            gates = ", ".join(d.get("no_trade_reasons") or []) or "insufficient confluence"
+            log.debug("GATE %s: %s blocked — %s (quality=%.0f)", symbol,
+                      d.get("direction") or "n/a", gates, quality)
+
+        sig = _build_sig(symbol, d, signal, snap5, rsi_bounce, fr, last_price)
+        base = symbol.split("/")[0].split(":")[0]
+        sig["signal_id"] = f"{scan_id}-{base}-{signal}"
+        decided.append((quality, signal, sig, symbol))
+        ai_records.append({
+            "symbol": symbol,
+            "signal_id": sig["signal_id"],
+            "deterministic_decision": d.get("decision") or "NO_TRADE",
+        })
+
+    # --- STEP 8-9: rank by setup-quality; PERSIST FIRST, then alert ---
+    # Strongest setups first. Emission rule: HOLD log-only; BUY/SELL below
+    # ALERT_QUALITY_MIN (65) log-only; at/above it alert + cooldown. The CSV
+    # row is written BEFORE the Telegram send: delivery failure can never
+    # cost the signal its persistence.
+    decided.sort(key=lambda t: t[0], reverse=True)
+    with _coordinator.stage("persist"):
+        for quality, signal, sig, symbol in decided:
+            kind = _emission_kind(signal, quality)
+            if kind == "hold":
+                logger.log_signal(sig)      # NO_TRADE: logged, no alert, no cooldown
+                summary["holds"] += 1
+            elif kind == "log_only":
+                logger.log_signal(sig)      # below the Telegram quality threshold
+                summary["log_only"] += 1
+                log.debug("%s %s log-only (quality %.0f < %d)", symbol, signal,
+                          quality, config.ALERT_QUALITY_MIN)
+            else:
+                logger.log_signal(sig)      # PERSISTED before delivery
+                with _coordinator.stage("telegram"):
+                    sent = alerts.send_alert(sig)   # bounded (20s), failure logged
+                if not sent:
+                    summary["telegram_failed"] += 1
+                summary["signals"] += 1
+                log.info("%s %s alert_sent=%s entry=%.6g sl=%.6g tp=%.6g rr=%s conf=%.0f "
+                         "lev=%s pos=$%.2f", symbol, signal, sent, sig["entry"],
+                         sig["SL"], sig["TP"], sig["RR"], sig["confidence"],
+                         sig["leverage"], sig["position_size"])
+                guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
+
+    # --- STEP 7 (background): AI opinions, off the critical path ---
     if config.LLM_DECISION_ENABLED:
         bundles = [b for b in (_build_decision_bundle(c, d, snap5, last_price)
                                for d, c, snap5, _rb, last_price in analysed) if b]
-        if bundles:
-            try:
-                verdicts = ai_decision.llm_verdicts(bundles, deadline=deadline)
-            except AIDecisionError as exc:
-                log.warning("LLM decision stage unavailable (%s) — deterministic "
-                            "core decides this scan", exc)
+        if _ai_worker.submit(scan_id, ai_records, bundles):
+            summary["ai_status"] = "QUEUED"
 
-    # --- STEP 7: apply verdicts + post-LLM hard safety validation ---
-    decided = []   # (setup_quality, signal, sig, symbol) for ranked emission
-    for d, c, snap5, rsi_bounce, last_price in analysed:
-        symbol, fr = c["symbol"], c["fr"]
-        verdict = verdicts.get(symbol)
-        # (2) the LLM's independent decision
-        if verdict is not None:
-            log.info("LLM %s: %s (confidence=%.0f)", symbol, verdict.get("signal"),
-                     verdict.get("confidence") or 0.0)
-        else:
-            log.info("LLM %s: no verdict — deterministic result applies", symbol)
-        d, signal, ai_used, ai_reason = _apply_llm_verdict(d, verdict, symbol)
-        if ai_used:
-            summary["ai_used"] += 1
-        quality = float(d.get("setup_quality") or 0.0)
-
-        # (3) post-LLM outcome — the exact gate that blocked it, if any
-        if signal == "HOLD":
-            if verdict is not None and verdict.get("signal") == "NO_TRADE":
-                summary["llm_vetoed"] += 1
-                log.info("POST-LLM %s: NO_TRADE — LLM decision", symbol)
-            else:
-                summary["gate_rejected"] += 1
-                gates = ", ".join(r for r in (d.get("no_trade_reasons") or [])
-                                  if r != "llm_no_trade") or "insufficient confluence"
-                log.info("POST-LLM %s: %s blocked by safety gates — %s (quality=%.0f)",
-                         symbol, d.get("direction") or "n/a", gates, quality)
-        else:
-            log.info("POST-LLM %s: %s stands (quality=%.0f) — %s", symbol, signal,
-                     quality, _emission_kind(signal, quality))
-
-        sig = _build_sig(symbol, d, signal, snap5, rsi_bounce, fr, last_price,
-                         ai_used=ai_used, ai_reason=ai_reason)
-        decided.append((quality, signal, sig, symbol))
-
-    # --- STEP 8-9: rank by setup-quality; alert (BUY/SELL) + log every signal ---
-    # Strongest setups first. Emission rule: HOLD log-only; BUY/SELL below
-    # ALERT_QUALITY_MIN (65) log-only; at/above it alert + cooldown.
-    decided.sort(key=lambda t: t[0], reverse=True)
-    for quality, signal, sig, symbol in decided:
-        kind = _emission_kind(signal, quality)
-        if kind == "hold":
-            logger.log_signal(sig)          # NO_TRADE: logged, no alert, no cooldown
-            summary["holds"] += 1
-        elif kind == "log_only":
-            logger.log_signal(sig)          # below the Telegram quality threshold
-            summary["log_only"] += 1
-            log.info("%s %s log-only (quality %.0f < %d)", symbol, signal,
-                     quality, config.ALERT_QUALITY_MIN)
-        else:
-            sent = alerts.send_alert(sig)   # failure logged, bot continues
-            logger.log_signal(sig)
-            summary["signals"] += 1
-            log.info("%s %s alert_sent=%s entry=%.6g sl=%.6g tp=%.6g rr=%s conf=%.0f "
-                     "lev=%s pos=$%.2f", symbol, signal, sent, sig["entry"],
-                     sig["SL"], sig["TP"], sig["RR"], sig["confidence"], sig["leverage"],
-                     sig["position_size"])
-            guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
-
-    log.info("Scan complete: %s", summary)
+    _log_funnel_summary(scan_id, summary)
+    _coordinator.end(summary)
     return summary
+
+
+def _log_funnel_summary(scan_id: str, summary: dict) -> None:
+    """One concise INFO block per scan (per-symbol detail stays at DEBUG)."""
+    stages = _coordinator.stages
+    critical_ms = sum(v for k, v in stages.items() if k != "telegram")
+    log.info(
+        "SCAN #%s COMPLETE | universe %d | 1H %d | funnel %d/%d/%d | "
+        "gate_rejected %d | signals %d (log_only %d, holds %d) | "
+        "telegram_failed %d | critical %.1fs | AI %s",
+        scan_id, summary.get("scanned", 0), summary.get("pass_1h", 0),
+        summary.get("pass_15m", 0), summary.get("pass_5m", 0),
+        summary.get("pass_5m", 0), summary.get("gate_rejected", 0),
+        summary.get("signals", 0), summary.get("log_only", 0),
+        summary.get("holds", 0), summary.get("telegram_failed", 0),
+        critical_ms / 1000.0, summary.get("ai_status", "OFF"))
 
 
 def start_ondemand_scan() -> dict:
@@ -661,7 +725,7 @@ def start_ondemand_scan() -> dict:
         run_scan_fn=run_scan,
         make_exchange_fn=scanner.make_exchange,
         fetch_funding_fn=scanner.fetch_funding_rates,
-        DuplicateGuardClass=duplicate_guard.DuplicateGuard,
+        guard_fn=get_coordinator().get_guard,   # SAME guard as scheduled scans
     )
 
 
@@ -717,7 +781,9 @@ def build_scheduler() -> BlockingScheduler:
     few seconds AFTER the candle close so the just-closed 5M candle exists.
     """
     exchange = scanner.make_exchange()
-    guard = duplicate_guard.DuplicateGuard()
+    # the ONE guard: shared with /scan_on sessions and --once via the
+    # coordinator, so cooldowns are respected across every scan path
+    guard = _coordinator.get_guard()
     scheduler = BlockingScheduler(timezone=config.SCHEDULER_TZ)
     # Per-session health tracking: consecutive-failure streak (health warning)
     # and scan/signal counts so an empty session reads as confirmed-healthy
