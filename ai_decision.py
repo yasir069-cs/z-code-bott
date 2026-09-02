@@ -598,6 +598,58 @@ def _backoff_sleep(attempt: int, deadline: Optional[float] = None) -> None:
         time.sleep(delay)
 
 
+def _join_sse_deltas(body: str) -> str:
+    """Join the content deltas of an SSE (text/event-stream) chat-completion
+    body into one string. Some OpenAI-compatible gateways stream even when
+    `stream` was not requested; an SSE body is not JSON, so without this the
+    response looks like 'Expecting value: line 1 column 1'."""
+    parts: list[str] = []
+    for line in (body or "").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(data)
+            delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                parts.append(piece)
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            continue
+    return "".join(parts)
+
+
+def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
+    """Pull the assistant content out of a provider response.
+
+    Handles the three body shapes seen in the wild: a plain OpenAI JSON
+    object, an SSE stream (joined into one string) and — with a precise
+    diagnostic — anything else (empty/non-JSON bodies). Returns
+    (content, parsed_json_or_None)."""
+    headers = getattr(response, "headers", None) or {}
+    ctype = (headers.get("Content-Type") or "").lower()
+    body = getattr(response, "text", "") or ""
+    if "event-stream" in ctype or body.lstrip().startswith("data:"):
+        content = _join_sse_deltas(body).strip()
+        if not content:
+            raise AIDecisionError(
+                f"AI provider streamed an empty response (model={model}, "
+                f"content-type={ctype or 'unknown'}, body={body[:200]!r})",
+                retryable=True)
+        return content, None
+    try:
+        data = response.json()
+    except ValueError as exc:  # requests' JSONDecodeError is a ValueError
+        raise AIDecisionError(
+            f"AI provider returned a non-JSON body (model={model}, "
+            f"content-type={ctype or 'unknown'}): {exc} | body={body[:200]!r}",
+            retryable=True) from exc
+    return (data["choices"][0]["message"].get("content") or "").strip(), data
+
+
 def _post_once(messages: list, model: str) -> str:
     """One HTTP round trip. Returns the message content, or raises AIDecisionError
     tagged with whether another attempt is worth making."""
@@ -606,6 +658,9 @@ def _post_once(messages: list, model: str) -> str:
         "messages": messages,
         "max_tokens": config.AI_MAX_TOKENS,
         "temperature": config.AI_TEMPERATURE,
+        # Ask for a plain JSON body explicitly: a few gateways default to
+        # SSE streaming, which then fails json parsing ("Expecting value...").
+        "stream": False,
     }
     # The reasoning toggle is an OpenRouter-ism. Strict OpenAI-compatible
     # gateways (e.g. AgentRouter) reject unknown body fields, so it is only
@@ -620,6 +675,7 @@ def _post_once(messages: list, model: str) -> str:
             headers={
                 "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
+                "Accept": "application/json",
             },
             json=payload,
             timeout=config.AI_TIMEOUT_SECONDS,
@@ -632,8 +688,9 @@ def _post_once(messages: list, model: str) -> str:
             log.warning("AI provider error: status=%s body=%.200s",
                         response.status_code, response.text)
         response.raise_for_status()
-        data = response.json()
-        content = (data["choices"][0]["message"].get("content") or "").strip()
+        content, data = _extract_content(response, model)
+    except AIDecisionError:
+        raise
     except requests.exceptions.HTTPError as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if status is None:
@@ -663,7 +720,7 @@ def _post_once(messages: list, model: str) -> str:
         try:
             finish = data["choices"][0].get("finish_reason")
         except (KeyError, IndexError, TypeError):
-            pass
+            pass  # includes the SSE path, where data is None
         raise AIDecisionError(
             f"AI provider returned empty content (model={model}, "
             f"finish={finish}, "
