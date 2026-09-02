@@ -102,6 +102,17 @@ explanation transport below is retained for a later phase.
 | `python backtest.py --strategy BTC/USDT:USDT` | Replays the **live decision core** over recent 1H/15M/5M history (look-ahead-safe) → `backtest_strategy_report.txt` |
 | `python -m pytest tests/ -q` | Full unit test suite (no network needed) |
 
+## Tuning the floors without editing code
+
+Every strategy floor is `.env`-overridable (`MIN_RR`, `QUALITY_MIN`,
+`QUALITY_PRIMARY_FLOOR`, `ALERT_QUALITY_MIN`, `ALERT_TIER_*`, `MIN_SCORE_1H/15M/5M`,
+`MIN_CONFLUENCE`, `RISK_MIN_TARGET_ATR`, `RISK_MAX_STOP_ATR`). The **defaults are the
+spec values**, and `config.check_config_warnings()` prints a `CONFIG:` line at startup
+for an override that empties a rule (out-of-band floor, `ALERT_QUALITY_MIN` above
+`QUALITY_MIN`, or RR enforced nowhere) — so an experiment is visible in the journal
+instead of looking like a silent regression. A non-numeric override raises at startup
+rather than being ignored.
+
 ## Required `.env` variables
 
 Values are read raw — no quotes, no angle brackets, and **never paste a URL out of
@@ -236,7 +247,7 @@ OHLCV cache + concurrency + exclusions + OI history). **Decision core:**
 `ai_decision.py` (batch + retry + budget), `fallback.py` (local explanation),
 `duplicate_guard.py`, `alerts.py`, `telegram_bot.py` (chat listener),
 `chat_assistant.py`, `logger.py`, `backtest.py` (logged-signal + `--strategy`
-replay), `requirements.txt`. Plus `tests/` (517 tests) and `scripts/`.
+replay), `requirements.txt`. Plus `tests/` (533 tests) and `scripts/`.
 Spec docs live in the repo root; **[price_action_spec.md](price_action_spec.md)**
 is the primary authority, **[strategy_spec.md](strategy_spec.md)** the secondary
 indicator layer, and `memory.md` tracks progress.
