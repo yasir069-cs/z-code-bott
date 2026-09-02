@@ -57,10 +57,11 @@ def evaluate(direction: str, entry: float, structure: dict, sr: dict, atr: float
     sl = _structure_stop(direction, entry, structure, atr, cfg)
     tp = _opposing_target(direction, entry, sr, atr, cfg)
 
-    if sl is None:
-        reasons.append("no_structure_stop")
-    if tp is None:
-        reasons.append("no_clear_target")
+    # Soften gate: missing stop/target doesn't block (quality already checks RR)
+    # if sl is None:
+    #     reasons.append("no_structure_stop")
+    # if tp is None:
+    #     reasons.append("no_clear_target")
 
     risk = abs(entry - sl) if sl is not None else None
     reward = abs(tp - entry) if tp is not None else None
@@ -70,8 +71,9 @@ def evaluate(direction: str, entry: float, structure: dict, sr: dict, atr: float
         reasons.append("stop_too_wide")
     if reward is not None and reward < cfg.RISK_MIN_TARGET_ATR * atr:
         reasons.append("target_too_close")
-    if rr is not None and rr < cfg.MIN_RR:
-        reasons.append("poor_rr")
+    # RR validation moved post-signal, not a gate blocker
+    # if rr is not None and rr < cfg.MIN_RR:
+    #     reasons.append("poor_rr")
 
     # already pressing into the opposing zone -> no room, skip
     at = sr.get("at_zone")
