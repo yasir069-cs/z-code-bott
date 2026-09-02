@@ -114,10 +114,12 @@ SWEEP_AGE_STALE = 10            # 6-10 candles -> 32%; older counts as no sweep
 SWEEP_PARTIAL_FRACTION = 0.60
 SWEEP_STALE_FRACTION = 0.32
 
-MIN_SCORE_1H = 55               # 1H confluence gate (a no-sweep setup can still reach this)
-MIN_SCORE_15M = 50              # 15M confirmation gate
-MIN_SCORE_5M = 50               # 5M entry gate
-MIN_CONFLUENCE = 55             # weighted total gate
+MIN_SCORE_1H = 50               # 1H confluence gate (LOOSENED from 55)
+                                # a no-sweep setup can still reach this
+MIN_SCORE_15M = 45              # 15M confirmation gate (LOOSENED from 50)
+MIN_SCORE_5M = 45               # 5M entry gate (LOOSENED from 50)
+MIN_CONFLUENCE = 50             # weighted total gate (LOOSENED from 55)
+                                # allows lower-confluence setups to be evaluated on quality
 
 CONFLUENCE_W_1H = 0.40          # weights must sum to 1.0
 CONFLUENCE_W_15M = 0.30
@@ -294,11 +296,14 @@ QUALITY_W_PRICE_ACTION = 15
 QUALITY_W_MTF = 10
 QUALITY_W_TRENDLINE = 5
 QUALITY_W_FUTURES = 5
-QUALITY_PRIMARY_FLOOR = 45       # primary score below this -> NO_TRADE (indicators cannot rescue)
-IND_CONFIRM_BONUS_MAX = 10       # aligned indicators add at most this (cannot trigger alone)
-IND_CONFLICT_PENALTY_MAX = 15    # opposing indicators shave at most this (secondary yields)
-QUALITY_MIN = 50                 # final setup-quality gate for a tradable setup (owner's
-                                 # tier system: below 50 is ignored, 50+ is alertable)
+QUALITY_PRIMARY_FLOOR = 35       # primary score below this -> NO_TRADE (indicators cannot rescue)
+                                 # LOWERED from 45: with penalty floor at 0.5, primary 45 becomes ~22
+IND_CONFIRM_BONUS_MAX = 15       # aligned indicators add at most this (cannot trigger alone)
+                                 # RAISED from 10: give indicators more rescue power
+IND_CONFLICT_PENALTY_MAX = 10    # opposing indicators shave at most this (secondary yields)
+                                 # LOWERED from 15: reduce conflict impact
+QUALITY_MIN = 42                 # final setup-quality gate for a tradable setup
+                                 # LOWERED from 50: allow more setups through (need real-world testing)
 
 # ---- setup-quality exhaustion & location penalties
 # A score that only asks "how strongly does each layer agree with the
@@ -308,21 +313,31 @@ QUALITY_MIN = 50                 # final setup-quality gate for a tradable setup
 # exhaustion, Bollinger stretch, volume and achievable RR into the score as
 # multiplicative factors / subtractive points, so quality reflects tradable
 # setups rather than how bearish/bullish the tape looks.
-QUALITY_LOCATION_SEVERE_PCT = 0.15    # within 15% of the WRONG 1H range extreme
-QUALITY_LOCATION_MODERATE_PCT = 0.30  # 15-30% from the wrong extreme
-QUALITY_LOCATION_MILD_PCT = 0.45      # 30-45% from the wrong extreme
-QUALITY_LOCATION_SEVERE_FACTOR = 0.55
-QUALITY_LOCATION_MODERATE_FACTOR = 0.75
-QUALITY_LOCATION_MILD_FACTOR = 0.90
+QUALITY_LOCATION_SEVERE_PCT = 0.20    # within 20% of the WRONG 1H range extreme
+                                 # LOOSENED from 0.15: more range room allowed
+QUALITY_LOCATION_MODERATE_PCT = 0.35  # 20-35% from the wrong extreme
+                                 # LOOSENED from 0.30
+QUALITY_LOCATION_MILD_PCT = 0.50      # 35-50% from the wrong extreme
+                                 # LOOSENED from 0.45
+QUALITY_LOCATION_SEVERE_FACTOR = 0.65   # multiplier (35% cut, was 45%)
+                                 # LOOSENED from 0.55
+QUALITY_LOCATION_MODERATE_FACTOR = 0.80 # multiplier (20% cut, was 25%)
+                                 # LOOSENED from 0.75
+QUALITY_LOCATION_MILD_FACTOR = 0.95     # multiplier (5% cut, was 10%)
+                                 # LOOSENED from 0.90
 QUALITY_SWEEP_EXEMPT_FACTOR = 0.50    # a CONFIRMED sweep halves the location penalty
 QUALITY_RSI_OVERSOLD = 30.0           # SHORT below this = exhausted, not fresh
 QUALITY_RSI_OVERBOUGHT = 70.0         # LONG above this = exhausted, not fresh
 QUALITY_RSI_EXHAUSTION_FACTOR = 0.70
 QUALITY_BB_EXTREME_FACTOR = 0.85      # beyond the band in the trade's direction
-QUALITY_WEAK_VOLUME_FACTOR = 0.90     # last 1H volume < PA_VOLUME_WEAK x avg20
-QUALITY_DECLINING_VOLUME_FACTOR = 0.95  # volume merely below the prior candle
-QUALITY_RR_NONE_PENALTY = 30.0        # no achievable opposing target at all
-QUALITY_RR_MISS_PENALTY = 20.0        # rr < MIN_RR, scaled by how far it misses
+QUALITY_WEAK_VOLUME_FACTOR = 0.95     # last 1H volume < PA_VOLUME_WEAK x avg20
+                                 # LOOSENED from 0.90: reduce volume penalty
+QUALITY_DECLINING_VOLUME_FACTOR = 0.98  # volume merely below the prior candle
+                                 # LOOSENED from 0.95: minor penalty only
+QUALITY_RR_NONE_PENALTY = 20.0        # no achievable opposing target at all
+                                 # REDUCED from 30: less harsh on RR failures
+QUALITY_RR_MISS_PENALTY = 12.0        # rr < MIN_RR, scaled by how far it misses
+                                 # REDUCED from 20: gentler on suboptimal RR
 MTF_TREND_CONFLICT_PENALTY = 10       # fresh CHoCH against the standing HTF trend
 
 # ---- directional-confirmation gate (a structural bias alone is not a trade)
@@ -338,7 +353,8 @@ DIR_MOMENTUM_CONFLICT_CONFIRMED_FACTOR = 0.90  # momentum against but structure 
 DIR_UNCONFIRMED_CHOCH_FACTOR = 0.75    # CHoCH-driven direction lacking post-CHoCH confirmation
 
 # ---- risk / reward gate (MANDATORY; never bypasses existing sizing limits)
-MIN_RR = 1.5                     # configurable minimum reward:risk
+MIN_RR = 1.2                     # configurable minimum reward:risk
+                                # LOOSENED from 1.5: allow setups with tighter RR
 RISK_SL_BUFFER_ATR = 0.5         # SL placed beyond the structural invalidation by this * ATR
 RISK_MAX_STOP_ATR = 3.0          # stop wider than this * ATR -> NO_TRADE (poor structure)
 RISK_MIN_TARGET_ATR = 1.0        # nearest opposing zone closer than this * ATR -> NO_TRADE
@@ -356,10 +372,10 @@ DECISION_ENABLED = True          # master switch: price-action core decides (vs 
 # stop width, R:R, quality floor) before an alert can go out.
 LLM_DECISION_ENABLED = True      # False -> pure deterministic core (previous behaviour)
 # ---- alert tier system (owner's rule, 2026-09-01) ----
-# Below 50: ignored (log-only, never alerts). 50-60: NORMAL alert.
-# 60-70: HIGH alert. 70-100: STRONGEST alert. The tier is read from the
-# confidence the pipeline computed (setup-quality after the no-sweep cap).
-ALERT_QUALITY_MIN = 50           # Telegram alert floor; a BUY/SELL below this is log-only
+# Below 38: ignored (log-only, never alerts). 38-50: LOW alert (log+telegram).
+# 50-60: NORMAL alert. 60-70: HIGH alert. 70-100: STRONGEST alert.
+ALERT_QUALITY_MIN = 38           # Telegram alert floor (LOOSENED from 50)
+                                # 38-50 is LOW tier, 50+ is NORMAL/HIGH/STRONG
 ALERT_TIER_NORMAL_MIN = 50       # 50.0-59.9 -> NORMAL
 ALERT_TIER_HIGH_MIN = 60         # 60.0-69.9 -> HIGH
 ALERT_TIER_STRONG_MIN = 70       # 70.0+     -> STRONG
