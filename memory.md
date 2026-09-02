@@ -7,7 +7,7 @@ The bot now decides on a **deterministic price-action & market-context core**
 LONG/SHORT/NO_TRADE; RSI/EMA/VWAP/Bollinger are **secondary confirmation only**.
 The owner's handwritten note (**[strategy_spec.md](strategy_spec.md)**) is the
 documented secondary layer. The LLM writes the **explanation** and audits the
-verdict in the background — it never decides. **509 unit tests pass.**
+verdict in the background — it never decides. **517 unit tests pass.**
 
 ## All decisions finalized
 - **Exchange:** Binance USDT-M **futures** (CCXT public, no keys, signals-only)
@@ -154,6 +154,13 @@ answer in batch shape is understood instead of dropped. The audit outcome is one
 `AI AUDIT` line per scan plus `AIOpinionWorker.status()`. The gates were NOT touched
 (owner's instruction, still in force) and `ai_used` still means "a model verdict
 replaced the deterministic one" — False on scheduled scans is correct.
+`scripts/target_fix_compare.py` (new) answers the deploy question with a count:
+`RISK_TARGET_SCAN_ZONES` off then on, `decision.decide` twice over identical
+candles, reporting setups cleared by the reward side alone and asserting the risk
+side (`stop_too_wide`/`no_structure_stop`) did not move. When candles cannot be
+fetched it says "nothing measured" rather than printing zeroes that read like a
+result (verified from this sandbox, where Binance refuses `exchangeInfo` at the
+HTTP layer even though TCP 443 connects — so live numbers come from the server).
 `scripts/why_no_signals.py` default path fixed (it resolved `/signals_log.csv` when
 run from a copy; now config → cwd → known locations, plus `--log`). `.gitignore`
 covers `signals_log*.csv*` / `ai_opinions.csv*` / `*.bak`, and a test asserts no
