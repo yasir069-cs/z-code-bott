@@ -124,6 +124,7 @@ def get_bot_status_summary() -> str:
         pass
 
     health = _health_lines()
+    extra += _ai_audit_lines()
 
     return (
         f"🟢 BOT HEALTH\n\n"
@@ -135,6 +136,49 @@ def get_bot_status_summary() -> str:
         f"{health}"
         f"{extra}"
     )
+
+
+def _ai_audit_lines() -> str:
+    """Is the AI stage actually answering, and was any of it used?
+
+    `/status` used to prove the AI was "on" by naming the model, which answered a
+    different question: a provider returning 200 with prose in every reply looked
+    identical here to a working audit. The last batch's answered/expected counts,
+    its LONG/SHORT/NO_TRADE tally and the failure text are what tell those apart,
+    and the contract line says in one place that the answer is audited and never
+    applied. Import is deferred and every access guarded: /status must survive a
+    half-initialised bot, and chat_assistant is imported by main itself.
+    """
+    lines = ""
+    try:
+        from main import _ai_worker
+        st = _ai_worker.status()
+    except Exception:
+        return lines
+    tally = st.get("tally") or {}
+    if st.get("expected"):
+        head = f"{st.get('last_status', '?')} — {st.get('answered', 0)}/{st.get('expected', 0)} setups answered"
+        if tally:
+            head += (f" | LONG {tally.get('LONG', 0)} SHORT {tally.get('SHORT', 0)}"
+                     f" NO_TRADE {tally.get('NO_TRADE', 0)} no-answer {tally.get('NO_ANSWER', 0)}")
+            head += (f" | agreement agree {tally.get('AGREE', 0)}"
+                     f" veto {tally.get('VETO_PROPOSED', 0)}"
+                     f" signal {tally.get('SIGNAL_PROPOSED', 0)}"
+                     f" disagree {tally.get('DISAGREE', 0)}")
+    else:
+        head = f"{st.get('last_status', 'IDLE')} (no batch this session yet)"
+    lines += f"\nAI Audit: {head}"
+    if st.get("last_error"):
+        lines += f"\nAI Audit last error: {str(st['last_error'])[:120]}"
+    try:
+        import ai_decision
+        caps = ai_decision.provider_caps()
+        mode = ("response_format=json_object enforced" if caps.get("json_object")
+                else "json_object rejected by the provider (prompt-only contract)")
+    except Exception:
+        mode = "contract state unavailable"
+    lines += f"\nAI Contract: audit-only, never applied to a shipped signal | {mode}"
+    return lines + "\n"
 
 
 def _build_system_prompt() -> str:

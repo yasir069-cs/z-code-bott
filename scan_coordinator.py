@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import csv
 import logging
+from collections import Counter
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -52,6 +53,22 @@ class _StageTimer:
     def __exit__(self, exc_type, exc, tb):
         self._stages[self._name] = round((time.monotonic() - self._t0) * 1000.0, 1)
         return False
+
+
+def _json_mode_state() -> str:
+    """Whether the provider is currently accepting `response_format`.
+
+    Imported lazily: this module is deliberately import-light (it is constructed
+    before the AI layer in main), and a missing capability report must never
+    break the audit path that reports it.
+    """
+    try:
+        import ai_decision
+        caps = ai_decision.provider_caps()
+    except Exception:  # pragma: no cover - defensive: logging helper only
+        return "json_mode=unknown"
+    return ("json_mode=on" if caps.get("json_object")
+            else "json_mode=off (provider rejected response_format)")
 
 
 def _agreement(deterministic: str, verdict: dict) -> str:
@@ -102,6 +119,14 @@ class AIOpinionWorker:
         self.last_finished_at: Optional[datetime] = None
         self.last_duration_s: float = 0.0
         self.last_queue_delay_s: float = 0.0
+        # What the last batch actually produced, so "is the AI stage working?" is
+        # answerable from /status and the journal instead of by opening
+        # ai_opinions.csv: how many of the queued setups got a verdict, the
+        # LONG/SHORT/NO_TRADE counts, and the failure text when none did.
+        self.last_answered: int = 0
+        self.last_expected: int = 0
+        self.last_tally: dict[str, int] = {}
+        self.last_error: str = ""
 
     def submit(self, scan_id: str, records: list, bundles: list) -> bool:
         """Queue one AI opinion batch. Returns False when the queue is full
@@ -129,6 +154,7 @@ class AIOpinionWorker:
             except Exception as exc:
                 name = type(exc).__name__
                 self.last_status = "TIMEOUT" if "timeout" in str(exc).lower() else "FAILED"
+                self.last_error = f"{name}: {exc}"[:200]
                 log.warning("AI opinion batch for scan %s failed (%s: %s) — scan "
                             "unaffected, deterministic signals stand", scan_id, name, exc)
             finally:
@@ -142,6 +168,13 @@ class AIOpinionWorker:
     def _run(self, scan_id: str, records: list, bundles: list) -> None:
         """Fetch verdicts and write the audit rows. AI failure states map to
         distinct statuses; malformed responses surface as FAILED, not crash."""
+        # Reset before the call, not after it: a batch that dies mid-flight must
+        # leave "0 of n answered" behind, or /status keeps reporting the previous
+        # scan's success and the outage is invisible exactly when it matters.
+        self.last_expected = len(records)
+        self.last_answered = 0
+        self.last_tally = {}
+        self.last_error = ""
         verdicts: dict = {}
         try:
             verdicts = self._verdicts_fn(bundles)
@@ -152,12 +185,37 @@ class AIOpinionWorker:
             raise
 
         self._write_rows(scan_id, records, verdicts, "SUCCESS", "")
+        tally = Counter((verdicts.get(rec["symbol"]) or {}).get("signal") or "NO_ANSWER"
+                        for rec in records)
+        agreement = Counter(_agreement(rec["deterministic_decision"],
+                                       verdicts.get(rec["symbol"]) or {}) for rec in records)
+        self.last_tally = {
+            "LONG": tally.get("LONG", 0), "SHORT": tally.get("SHORT", 0),
+            "NO_TRADE": tally.get("NO_TRADE", 0), "NO_ANSWER": tally.get("NO_ANSWER", 0),
+            "AGREE": agreement.get("AGREE", 0), "DISAGREE": agreement.get("DISAGREE", 0),
+            "VETO_PROPOSED": agreement.get("VETO_PROPOSED", 0),
+            "SIGNAL_PROPOSED": agreement.get("SIGNAL_PROPOSED", 0),
+        }
+        self.last_answered = sum(tally.get(sig, 0) for sig in ("LONG", "SHORT", "NO_TRADE"))
+        # The single line that answers "did the model actually answer, and was it
+        # used?" — it is not used, by design: the deterministic verdict shipped
+        # before this batch returned, and the audit row records the disagreement
+        # instead of acting on it. Reading the CSV to learn this was the old way.
+        log.info("AI AUDIT %s: %d/%d answered | LONG %d SHORT %d NO_TRADE %d no-answer %d | "
+                 "agreement AGREE %d VETO_PROPOSED %d SIGNAL_PROPOSED %d DISAGREE %d | "
+                 "applied=never "
+                 "(audit-only) | %s",
+                 scan_id, self.last_answered, len(records),
+                 self.last_tally["LONG"], self.last_tally["SHORT"], self.last_tally["NO_TRADE"],
+                 self.last_tally["NO_ANSWER"], self.last_tally["AGREE"],
+                 self.last_tally["VETO_PROPOSED"], self.last_tally["SIGNAL_PROPOSED"],
+                 self.last_tally["DISAGREE"], _json_mode_state())
         for rec in records:
             verdict = verdicts.get(rec["symbol"])
-            log.info("AI opinion %s: deterministic=%s ai=%s status=%s",
-                     rec["symbol"], rec["deterministic_decision"],
-                     (verdict or {}).get("signal"),
-                     "SUCCESS" if verdict else "UNAVAILABLE")
+            log.debug("AI opinion %s: deterministic=%s ai=%s status=%s",
+                      rec["symbol"], rec["deterministic_decision"],
+                      (verdict or {}).get("signal"),
+                      "SUCCESS" if verdict else "UNAVAILABLE")
 
     def _write_rows(self, scan_id: str, records: list, verdicts: dict,
                     status: str, error: str) -> None:
@@ -243,10 +301,20 @@ class AIOpinionWorker:
             log.warning("could not archive stale %s: %s", path.name, exc)
 
     def status(self) -> dict:
+        """The last batch's outcome, for /status and the health snapshot.
+
+        `answered`/`expected` is the number that separates "the AI stage is
+        working" from "the audit is silently empty" — an UNAVAILABLE-filled
+        ai_opinions.csv and a healthy-looking journal looked identical before.
+        """
         return {"last_status": self.last_status,
                 "pending": self._pending,
                 "last_duration_s": self.last_duration_s,
-                "last_queue_delay_s": self.last_queue_delay_s}
+                "last_queue_delay_s": self.last_queue_delay_s,
+                "answered": self.last_answered,
+                "expected": self.last_expected,
+                "tally": dict(self.last_tally),
+                "last_error": self.last_error}
 
 
 class ScanCoordinator:

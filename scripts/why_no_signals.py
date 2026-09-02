@@ -64,6 +64,39 @@ def num(row: dict, key: str):
         return None
 
 
+def log_candidates() -> list[Path]:
+    """Where the log is looked for, in order.
+
+    This script is usually run from a copy in /tmp on the live box, so the repo
+    cannot be assumed to be `parents[1]` of the script — that resolved to
+    `/signals_log.csv` and reported "nothing to analyse" next to a log with a
+    thousand rows in it. The bot's own config is the authority when it can be
+    imported; otherwise the obvious places are tried, and a missing file says
+    where it looked.
+    """
+    found: list[Path] = []
+    try:
+        import config
+        found.append(Path(config.SIGNALS_LOG_FILE))
+    except Exception:  # config imports .env; a copy outside the repo has neither
+        pass
+    home = Path.home()
+    for candidate in (Path.cwd() / "signals_log.csv", home / "z-code-bott" / "signals_log.csv",
+                      Path("/home/ubuntu/z-code-bott/signals_log.csv")):
+        if candidate not in found:
+            found.append(candidate)
+    return found
+
+
+def resolve_log_path(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser()
+    for candidate in log_candidates():
+        if candidate.exists():
+            return candidate
+    return log_candidates()[0]
+
+
 def load_rows(path: Path) -> list[dict]:
     with open(path, newline="", encoding="utf-8") as fh:
         return [{k: (v or "") for k, v in row.items()} for row in csv.DictReader(fh)]
@@ -191,7 +224,8 @@ def _print_scan(key: str, rows: list[dict], alert_min: float | None,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--file", default=str(Path(__file__).resolve().parents[1] / "signals_log.csv"))
+    parser.add_argument("--log", "--file", dest="file", default=None,
+                        help="signal log to read (default: the repo's signals_log.csv)")
     parser.add_argument("--scans", type=int, default=1, help="how many recent scans to report")
     parser.add_argument("--all", action="store_true", help="report every scan in the file")
     parser.add_argument("--fix", default="", help="comma list of layers to pretend were repaired: "
@@ -200,9 +234,11 @@ def main() -> None:
                         help="Telegram alert floor (default: config.ALERT_QUALITY_MIN)")
     args = parser.parse_args()
 
-    path = Path(args.file)
+    path = resolve_log_path(args.file)
     if not path.exists():
-        print(f"no log at {path} — nothing to analyse", file=sys.stderr)
+        print(f"no log at {path} — nothing to analyse\n"
+              f"pass --log /path/to/signals_log.csv (looked in: "
+              f"{', '.join(str(c) for c in log_candidates())})", file=sys.stderr)
         raise SystemExit(1)
     rows = load_rows(path)
     groups = group_scans(rows)

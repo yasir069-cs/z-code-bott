@@ -120,6 +120,32 @@
   (`long_ready` = a swept SELL-side pool, i.e. supports LONG); `range_pos` is
   labelled against `CANDLE_LIMIT` (50), not the 20-candle swing window.
 
+## AI output-contract rules (ai_decision.py)
+- The JSON requirement is enforced in the REQUEST, not only in the prompt:
+  decision calls send `response_format={"type":"json_object"}` when the provider
+  accepts it. A 400 that names `response_format` disables the capability for the
+  process (one wasted request, never one per scan) and the audit line reports
+  `json_mode=off`.
+- Parsing is tolerant of punctuation, never of absence. Prose before/after the JSON
+  is skipped, fences stripped, an envelope key unwound, and a truncated block is
+  cut back to its last complete element. A verdict that never arrived is **absent**
+  — the setup keeps the deterministic answer. No repair may fabricate one.
+- The two failure classes are retried differently. Transport (429/5xx/timeout) is
+  retried identically; a parse failure (`AIDecisionError.parse_failure`) is retried
+  with an explicit correction turn, plus a larger `max_tokens` up to
+  `AI_MAX_TOKENS_RETRY_CAP` when `finish_reason=length` (or an unterminated block)
+  says the reply was cut off. Re-sending the same prompt to a model that answered in
+  prose is how the live box spent 9 budget units a scan for nothing.
+- Every batch logs one `AI AUDIT <scan>: n/m answered | LONG x SHORT y NO_TRADE z |
+  applied=never (audit-only) | json_mode=…` line, and `AIOpinionWorker.status()`
+  carries the same tallies for `/status`. The counters reset at the START of a run,
+  so a batch that dies mid-flight reports 0 answered rather than the previous
+  scan's success.
+- `ai_used` means "a model verdict replaced the deterministic one" and stays False
+  on scheduled scans by design. It must not be repurposed as an "AI is working"
+  signal, and never make the model a decision stage to make it True — the owner's
+  rule is audit-only until `agreement` in `ai_opinions.csv` justifies a change.
+
 ## Fallback rules (fallback.py)
 - The **decision** never falls back — the deterministic core always decides.
 - LLM unavailable → `explanation_fallback(decision)` writes a local template from
