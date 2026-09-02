@@ -7,7 +7,7 @@ The bot now decides on a **deterministic price-action & market-context core**
 LONG/SHORT/NO_TRADE; RSI/EMA/VWAP/Bollinger are **secondary confirmation only**.
 The owner's handwritten note (**[strategy_spec.md](strategy_spec.md)**) is the
 documented secondary layer. The LLM writes the **explanation** and audits the
-verdict in the background — it never decides. **456 unit tests pass.**
+verdict in the background — it never decides. **468 unit tests pass.**
 
 ## All decisions finalized
 - **Exchange:** Binance USDT-M **futures** (CCXT public, no keys, signals-only)
@@ -91,6 +91,30 @@ as a bounded confirmation sub-score (`scoring.indicator_confirmation`), not a ga
 - ✅ **Docs** — README/Architecture/rules/memory said "OpenRouter/Nemotron" and
   "chunked at 12"; config/main docstrings described an LLM *decision* stage that the
   scheduled scan never runs. Both now describe the audit stage that exists.
+
+## Live-log hardening, part 2 (same session — the leftovers from the audit)
+- ✅ **Owner gate fails closed** — `_is_owner` returned True whenever
+  `TELEGRAM_CHAT_ID` was unset, so any stranger who found the bot could start a
+  24/7 `/scan_on` session and spend the AI budget. The chat id is now an
+  allow-list (comma-separated), an unset one authorises nobody, and a refusal says
+  whether the cause is configuration. `tests/test_telegram_owner_gate.py` covers
+  it (verified: fails when the guard is reverted).
+- ✅ **One AI transport** — the endpoint is resolved per call
+  (`chat_completions_url()`) instead of frozen at import, and the Telegram chat
+  assistant now rides `ai_decision.complete_chat`: the browser-like UA the
+  provider's WAF requires, the retry ladder, the fallback model, and — for the
+  first time — budget accounting, because assistant traffic was spending the daily
+  cap invisibly. `scripts/openrouter_diagnose.py` points at the live URL too.
+- ✅ **Backtest honesty** — `--strategy` applies the live alert floor
+  (`ALERT_QUALITY_MIN`) so it reports alerts the owner would have received rather
+  than every decision (sub-floor ones counted as `logged_only`), its report lists
+  what it cannot reproduce (funding, OI), and `evaluate_signal` derives a missing
+  RR from the levels instead of defaulting it to 2.0 — which had been crediting
+  rows with no RR as 2R wins.
+- ✅ **`liquidation` nearby-SR block** read `zone["distance"]`, a key
+  `support_resistance` never emits, so every entry was a permanent None. Distance
+  is now derived from the zone mid against the traded price and the block is
+  omitted entirely when there is no price to measure from.
 
 ## Interpretation decisions (documented)
 - Sweep is heavily weighted, not a hard gate — owner's decision; requiring it

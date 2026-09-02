@@ -174,6 +174,10 @@ AI_MODEL_FALLBACK = os.getenv("AI_MODEL_FALLBACK", "").strip()
 AI_MAX_TOKENS = 2000            # was 300: truncated single answers mid-"reason"
                                 # (finish_reason=length) and cannot hold a batch
 AI_TIMEOUT_SECONDS = 60.0
+# Bound for the interactive Telegram assistant, measured across its WHOLE retry
+# ladder (not one request): a chat reply must not sit on "typing..." while the
+# ladder works through 3 attempts x 2 models x 60s.
+AI_CHAT_DEADLINE_SECONDS = 45.0
 AI_TEMPERATURE = 0.1
 # Reasoning is DISABLED on purpose: the model burns the token budget on
 # chain-of-thought and the final JSON never gets produced (finish_reason=length).

@@ -89,7 +89,7 @@ explanation transport below is retained for a later phase.
 
 ```
 TELEGRAM_TOKEN=<from @BotFather>        # optional; alerts logged if missing
-TELEGRAM_CHAT_ID=<your chat id>         # optional
+TELEGRAM_CHAT_ID=<your chat id>         # REQUIRED for /scan_on, /scan_off (comma-separated for more)
 OPENROUTER_API_KEY=<provider key>           # optional; AGENTROUTER_API_KEY also accepted
 AI_BASE_URL=https://agentrouter.org/v1      # optional; any OpenAI-compatible provider
 AI_MODEL=deepseek-v4-flash                  # optional override
@@ -211,7 +211,7 @@ OHLCV cache + concurrency + exclusions + OI history). **Decision core:**
 `ai_decision.py` (batch + retry + budget), `fallback.py` (local explanation),
 `duplicate_guard.py`, `alerts.py`, `telegram_bot.py` (chat listener),
 `chat_assistant.py`, `logger.py`, `backtest.py` (logged-signal + `--strategy`
-replay), `requirements.txt`. Plus `tests/` (456 tests) and `scripts/`.
+replay), `requirements.txt`. Plus `tests/` (468 tests) and `scripts/`.
 Spec docs live in the repo root; **[price_action_spec.md](price_action_spec.md)**
 is the primary authority, **[strategy_spec.md](strategy_spec.md)** the secondary
 indicator layer, and `memory.md` tracks progress.

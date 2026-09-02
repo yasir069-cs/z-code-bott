@@ -44,9 +44,41 @@ import config
 
 log = logging.getLogger("ai_decision")
 
-# Retain the existing name for scripts/tests; the endpoint is derived from
-# config.AI_BASE_URL (default: AgentRouter).
+def chat_completions_url() -> str:
+    """The provider endpoint, resolved on every call.
+
+    It used to be a module constant built from `config.AI_BASE_URL` at import, so
+    a base URL changed after import (`.env` re-read in a test, a long-lived
+    process reloading config) kept POSTing to the stale host while every other
+    setting looked correct. `OPENROUTER_URL` below stays for scripts/diagnostics as
+    the import-time snapshot; production paths must call this.
+    """
+    return f"{config.AI_BASE_URL.rstrip('/')}/chat/completions"
+
+
+# Import-time snapshot, kept for `scripts/openrouter_diagnose.py` and as a
+# readable default; nothing in the bot reads this any more.
 OPENROUTER_URL = f"{config.AI_BASE_URL}/chat/completions"
+
+# A browser-like UA is a hard requirement, not a nicety: the provider sits behind
+# a WAF (Aliyun, seen live) that challenges the bare `python-requests/x.y` agent.
+PROVIDER_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+
+
+def provider_headers() -> dict:
+    """The headers every provider call sends, from one place.
+
+    Decisions and the chat assistant must not drift apart on this: a caller that
+    hand-rolls its own dict loses the User-Agent and starts failing 403/WAF
+    challenges that the rest of the bot has already been fixed for.
+    """
+    return {
+        "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": PROVIDER_USER_AGENT,
+    }
 
 # Statuses worth retrying: rate limits, timeouts and provider-side faults.
 # 400/401/403/404 mean the request itself is wrong — retrying just burns budget.
@@ -650,14 +682,20 @@ def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
     return (data["choices"][0]["message"].get("content") or "").strip(), data
 
 
-def _post_once(messages: list, model: str) -> str:
+def _post_once(messages: list, model: str, *, max_tokens: Optional[int] = None,
+               temperature: Optional[float] = None) -> str:
     """One HTTP round trip. Returns the message content, or raises AIDecisionError
-    tagged with whether another attempt is worth making."""
+    tagged with whether another attempt is worth making.
+
+    `max_tokens` / `temperature` let a non-decision caller (the chat assistant)
+    reuse this transport with its own sizing instead of duplicating the request
+    and losing the browser-like User-Agent that the provider's WAF requires.
+    """
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": config.AI_MAX_TOKENS,
-        "temperature": config.AI_TEMPERATURE,
+        "max_tokens": config.AI_MAX_TOKENS if max_tokens is None else max_tokens,
+        "temperature": config.AI_TEMPERATURE if temperature is None else temperature,
         # Ask for a plain JSON body explicitly: a few gateways default to
         # SSE streaming, which then fails json parsing ("Expecting value...").
         "stream": False,
@@ -671,18 +709,8 @@ def _post_once(messages: list, model: str) -> str:
     response = None
     try:
         response = requests.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                # Some provider CDNs/WAFs (Aliyun WAF in front of AgentRouter
-                # was seen live) challenge the bare python-requests UA; a
-                # browser-like UA sometimes passes the static checks.
-                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/128.0.0.0 Safari/537.36"),
-            },
+            chat_completions_url(),
+            headers=provider_headers(),
             json=payload,
             timeout=config.AI_TIMEOUT_SECONDS,
         )
@@ -734,7 +762,8 @@ def _post_once(messages: list, model: str) -> str:
     return content
 
 
-def _complete(messages: list, parse=None, deadline: Optional[float] = None):
+def _complete(messages: list, parse=None, deadline: Optional[float] = None,
+              max_tokens: Optional[int] = None, temperature: Optional[float] = None):
     """Request a completion, retrying the primary model then the secondary.
 
     This is where "one 502 kills the signal" is fixed: AI_RETRY_MAX attempts
@@ -767,7 +796,8 @@ def _complete(messages: list, parse=None, deadline: Optional[float] = None):
                     f"AI daily budget exhausted ({status['used']}/{status['limit']} "
                     f"requests on {status['day']})")
             try:
-                content = _post_once(messages, model)
+                content = _post_once(messages, model, max_tokens=max_tokens,
+                                     temperature=temperature)
                 return content if parse is None else parse(content)
             except AIDecisionError as exc:
                 last = exc
@@ -787,6 +817,25 @@ def _complete(messages: list, parse=None, deadline: Optional[float] = None):
                             model, config.AI_RETRY_MAX, models[model_index + 1])
 
     raise last if last else AIDecisionError("AI call failed with no recorded error")
+
+
+def complete_chat(messages: list, *, max_tokens: int = 600,
+                  temperature: float = 0.3,
+                  deadline: Optional[float] = None) -> str:
+    """One provider chat completion for non-decision callers.
+
+    The Telegram assistant used to build its own `requests.post` — no browser-like
+    User-Agent (the provider's WAF challenges the bare python-requests UA), no
+    retry, no fallback model, and no budget accounting, so assistant traffic was
+    invisible to the daily cap it was also consuming. Sharing the decision path's
+    transport means one place owns all of that; the sizing differs because a chat
+    answer is prose, not a JSON verdict.
+
+    Raises AIDecisionError when no model answered — callers must degrade to a
+    clear message, never a fabricated reply.
+    """
+    return _complete(messages, parse=None, deadline=deadline,
+                     max_tokens=max_tokens, temperature=temperature) or ""
 
 
 def _messages(user_prompt: str) -> list:
