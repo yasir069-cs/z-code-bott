@@ -11,15 +11,13 @@ Uses the configured AI provider (AgentRouter/DeepSeek v4 by default) with rich c
 import csv
 from datetime import datetime
 import logging
+import time
 from typing import Optional
 
-import requests
-
 import config
+import ai_decision
 
 log = logging.getLogger("chat_assistant")
-
-OPENROUTER_URL = f"{config.AI_BASE_URL}/chat/completions"
 
 
 def get_recent_signals_summary(limit: int = 5) -> str:
@@ -206,34 +204,27 @@ def ask_crypto_assistant(user_query: str, chat_history: Optional[list] = None) -
 
     messages.append({"role": "user", "content": user_query})
 
-    payload = {
-        "model": config.AI_MODEL,
-        "messages": messages,
-        "max_tokens": 600,
-        "temperature": 0.3,
-    }
-
+    # The provider call goes through ai_decision.complete_chat, i.e. the SAME
+    # transport the decisions use: browser-like User-Agent (the provider's WAF
+    # challenges the bare python-requests UA), retry with backoff, the fallback
+    # model, the endpoint resolved per call, and the per-IST-day budget. Chat used
+    # to hand-roll a single requests.post with none of that — it failed on the
+    # first 503 AND its requests were invisible to a daily cap they were spending.
     try:
-        response = requests.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30.0,
-        )
-        if response.status_code != 200:
-            log.error("AI provider chat error: %s", response.text[:500])
-            return "⚠️ Sorry, the AI service encountered an error. Please try again in a moment."
-
-        data = response.json()
-        reply = (data["choices"][0]["message"].get("content") or "").strip()
-        return reply or "I received your message, but the AI generated an empty response. Please ask again."
-
-    except requests.exceptions.Timeout:
-        log.warning("AI provider chat request timed out")
-        return "⏳ Request timed out. The AI model is taking longer than expected. Please try again."
-    except Exception as exc:
-        log.error("Error calling AI provider chat: %s", exc)
-        return f"⚠️ Unable to reach AI Assistant: {exc}"
+        reply = ai_decision.complete_chat(
+            messages,
+            max_tokens=600, temperature=0.3,
+            deadline=time.monotonic() + config.AI_CHAT_DEADLINE_SECONDS,
+        ).strip()
+        return reply or ("I received your message, but the AI generated an empty "
+                        "response. Please ask again.")
+    except ai_decision.AIDecisionError as exc:
+        # one line in the log for the owner, a safe summary for the user
+        log.warning("AI assistant call failed: %s", exc)
+        return ("⏳ The AI assistant is busy or the provider is not answering right "
+                "now. Please try again in a moment — /status, /signals and /strategy "
+                "work without it.")
+    except Exception as exc:            # the bot must never die on a chat reply
+        log.error("AI assistant failed unexpectedly: %s", exc, exc_info=True)
+        return ("⚠️ The AI assistant hit an unexpected error and could not answer. "
+                "The details are in the bot log.")

@@ -274,3 +274,37 @@ def test_available_liquidation_is_rendered_in_alert_and_csv(tmp_path, monkeypatc
     with path.open(newline="", encoding="utf-8") as handle:
         row = next(csv.DictReader(handle))
     assert json.loads(row["liquidation"]) == summary
+
+
+def test_nearby_sr_entries_report_a_real_distance(monkeypatch):
+    """The zone block used to read `zone["distance"]`, a key the S/R layer never
+    emits — every entry was None forever. Distance is now derived from the zone
+    mid against the traded price, and omitted entirely when there is no price."""
+    now = 1_000_000.0
+    monkeypatch.setattr(liquidation.time, "time", lambda: now)
+    cache = liquidation.LiquidationCache()
+    cache.set_connection(True)
+    cache.add_event(_event(now - 30, "SELL", price=101.0, notional=5000.0))
+
+    sr = {"nearest_support": {"mid": 98.0, "side": "support"},
+          "nearest_resistance": {"mid": 103.0, "side": "resistance"}}
+    levels = cache.summary("BTCUSDT", current_price=100.0,
+                           sr=sr)["event_price_context"][-1]["nearby_sr"]
+    assert {lvl["type"]: lvl["distance_pct"] for lvl in levels} == {
+        "nearest_support": -2.0, "nearest_resistance": 3.0}
+    assert all(lvl["mid"] for lvl in levels)
+
+    # no price -> nothing honest to say, so no block at all (never a None field)
+    contexts = cache.summary("BTCUSDT", sr=sr)["event_price_context"]
+    assert all("nearby_sr" not in block for block in contexts)
+    # a zone without a usable mid is skipped, not reported as 0 away; when that
+    # is the only zone, no block is emitted at all
+    partial = cache.summary("BTCUSDT", current_price=100.0,
+                            sr={"nearest_support": {"side": "support"},
+                                "nearest_resistance": {"mid": 103.0,
+                                                       "side": "resistance"}})[
+        "event_price_context"][-1]["nearby_sr"]
+    assert [lvl["type"] for lvl in partial] == ["nearest_resistance"]
+    assert all("nearby_sr" not in b for b in cache.summary(
+        "BTCUSDT", current_price=100.0,
+        sr={"nearest_support": {"side": "support"}})["event_price_context"])

@@ -164,10 +164,12 @@ crypto-bot/
 ├── fallback.py          # local explanation template (decision is never faked)
 ├── duplicate_guard.py   # 15 min alert cooldown + 30 min HOLD-log window per coin
 ├── alerts.py            # structured Telegram alert (market context primary + indicators)
-├── telegram_bot.py      # long-lived chat listener (commands + Q&A)
+├── telegram_bot.py      # long-lived chat listener (commands + Q&A; control commands
+│                        #   are owner-only and fail closed on TELEGRAM_CHAT_ID)
 ├── chat_assistant.py    # provider-backed assistant for user questions
 ├── logger.py            # signals_log.csv writer (28 cols) + header migration
-├── backtest.py          # logged-signal replay + --strategy core replay (look-ahead-safe)
+├── backtest.py          # logged-signal replay + --strategy core replay (look-ahead-safe,
+│                        #   live alert floor; report states what it cannot reproduce)
 ├── .env                 # TELEGRAM_TOKEN, OPENROUTER_API_KEY, sizing
 └── requirements.txt
 ```

@@ -159,19 +159,46 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("🧹 Chat memory cleared. You can start a fresh conversation!")
 
 
+def owner_chat_ids() -> set[str]:
+    """Chat ids allowed to drive the bot (TELEGRAM_CHAT_ID, comma-separated)."""
+    return {c.strip() for c in (config.TELEGRAM_CHAT_ID or "").split(",") if c.strip()}
+
+
 def _is_owner(update: Update) -> bool:
-    """Check if the sender is the bot owner (TELEGRAM_CHAT_ID)."""
-    if not config.TELEGRAM_CHAT_ID:
-        return True  # no restriction if chat_id not configured
+    """Control commands are for the owner only — and FAIL CLOSED.
+
+    An unset TELEGRAM_CHAT_ID used to mean "no restriction", so anyone who found
+    the bot could start a 24/7 scan session (/scan_on burns the exchange rate
+    budget and the AI daily cap until /scan_off) from a chat the owner never
+    configured. There is no safe reading of "who is the owner" from an empty
+    allow-list, so an empty allow-list means nobody — including the owner, who
+    gets told exactly how to fix it.
+    """
+    allowed = owner_chat_ids()
+    if not allowed:
+        return False
     chat_id = str(update.effective_chat.id) if update.effective_chat else ""
-    return chat_id == config.TELEGRAM_CHAT_ID
+    return chat_id in allowed
+
+
+async def _deny(update: Update) -> None:
+    """Refuse a control command, saying whether the reason is configuration."""
+    if not update.message:
+        return
+    if not owner_chat_ids():
+        await update.message.reply_text(
+            "🚫 Control commands are disabled: TELEGRAM_CHAT_ID is not set in .env, "
+            "so the bot has no owner to authorise. Set it to your chat id and restart."
+        )
+    else:
+        await update.message.reply_text(
+            "🚫 Access denied. Only the bot owner can use this command.")
 
 
 async def cmd_scan_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /scan_on — start on-demand scan session anytime."""
     if not _is_owner(update):
-        if update.message:
-            await update.message.reply_text("🚫 Access denied. Only the bot owner can use this command.")
+        await _deny(update)
         return
 
     if update.message:
@@ -204,8 +231,7 @@ async def cmd_scan_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_scan_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /scan_off — stop on-demand scan session."""
     if not _is_owner(update):
-        if update.message:
-            await update.message.reply_text("🚫 Access denied. Only the bot owner can use this command.")
+        await _deny(update)
         return
 
     result = ondemand.stop_ondemand_scan()

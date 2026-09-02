@@ -82,6 +82,16 @@
 - Alert tiers (owner's rule, 2026-09-01): quality < 50 → ignored (log-only);
   50-60 → NORMAL alert; 60-70 → HIGH alert; 70+ → STRONGEST alert.
 
+## AI transport rules (shared by every provider call)
+- The endpoint is `chat_completions_url()`, resolved on **every call**. A
+  module-level constant frozen from `config.AI_BASE_URL` at import kept posting to
+  the old host whenever the base URL changed later.
+- Headers come from one place: auth, JSON accept, and the browser-like
+  `User-Agent` the provider's WAF requires (bare `python-requests` gets
+  challenged). Every caller reuses it rather than copying the dict.
+- `stream: False` is explicit — some gateways default to SSE and the reply then
+  fails JSON parsing.
+
 ## AI rules (ai_decision.py — explanation + background audit)
 - The LLM **never decides** what is emitted. It turns a finished decision into
   prose and, in the background, records an independent opinion; a slow, failed, or
@@ -148,6 +158,30 @@
   a TP is never fabricated on the wrong side of the entry for a row that HOLDs.
 - `into_opposing_zone` (price already pressing into the zone) stays a hard reject:
   that is no room, not a measurement gap.
+
+## Telegram command rules (telegram_bot.py)
+- `/scan_on` and `/scan_off` are **owner-only**, and the check **fails closed**:
+  `TELEGRAM_CHAT_ID` is the allow-list (comma-separated for several chats), and an
+  unset value authorises *nobody*. It used to authorise *everybody* — "no
+  restriction if chat_id not configured" handed a 24/7 scan session and the AI
+  daily budget to anyone who found the bot.
+- A refusal names its reason: unconfigured says set `TELEGRAM_CHAT_ID`,
+  non-owner says access denied. Both paths return before any command side effect,
+  so a regression in the guard shows up as a failed assertion, not a live scan
+  started from a test.
+- Read-only commands (`/status`, `/signals`, `/strategy`, `/help`, `/clear`, the
+  chat assistant) stay open to whoever can reach the bot; only *control* is gated.
+
+## Chat assistant rules (chat_assistant.py)
+- The assistant shares `ai_decision`'s transport (`ai_decision.complete_chat`) —
+  same endpoint resolved per call, same browser-like User-Agent, same retry
+  ladder and the same daily budget. Hand-rolling a second `requests.post` gave it
+  none of that: it died on the first 503 and its requests were invisible to the
+  cap they were spending.
+- Chat consumes the AI budget and says so via `budget_status()`; it is a provider
+  request like any other, not free.
+- A failed call answers with a clear "not answering right now", never an invented
+  reply. `/status`, `/signals`, `/strategy` work without the AI entirely.
 
 ## Error handling
 - Exchange fetch fails → retry with backoff → skip coin.

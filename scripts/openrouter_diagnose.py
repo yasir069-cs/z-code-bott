@@ -5,6 +5,9 @@ the REAL error bodies (never the API key):
   B: minimal request, WITH reasoning    -> is reasoning the breaker?
   C: full crypto prompt, NO reasoning   -> prompt size / JSON compliance
   D: full crypto prompt, WITH reasoning -> the production configuration
+  E: full crypto prompt, bare UA        -> does the provider WAF still challenge
+                                            python-requests? Production sends a
+                                            browser-like UA; E drops it again.
 
 Usage: python scripts/openrouter_diagnose.py
 """
@@ -40,18 +43,24 @@ def check_key_hygiene() -> None:
     print(f".env in .gitignore     : {'.env' in gitignore}")
 
 
-def run_test(name: str, messages: list, reasoning_enabled: bool | None) -> dict:
+def run_test(name: str, messages: list, reasoning_enabled: bool | None,
+             *, bare_ua: bool = False) -> dict:
     payload = {"model": MODEL, "messages": messages, "max_tokens": config.AI_MAX_TOKENS}
     if reasoning_enabled is not None:
         payload["reasoning"] = {"enabled": reasoning_enabled}
+    # Same headers the bot sends, so a pass here means a pass in production.
+    # bare_ua drops the User-Agent to reproduce the pre-fix WAF challenge.
+    headers = dict(ai_decision.provider_headers())
+    if bare_ua:
+        headers.pop("User-Agent", None)
     print(f"\n=== Test {name} ===")
     print(f"Model: {MODEL}")
     print(f"Reasoning: {payload.get('reasoning', 'omitted')}")
+    print(f"User-Agent: {headers.get('User-Agent', 'python-requests (bare)')}")
     try:
         response = requests.post(
-            ai_decision.OPENROUTER_URL,
-            headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
-                     "Content-Type": "application/json"},
+            ai_decision.chat_completions_url(),   # the endpoint production uses
+            headers=headers,
             json=payload,
             timeout=config.AI_TIMEOUT_SECONDS,
         )
@@ -101,10 +110,13 @@ def main() -> None:
             {"role": "user", "content": ai_decision.build_prompt(bundle)}]
     result_c = run_test("C: full crypto prompt, no reasoning", full, False)
     result_d = run_test("D: full crypto prompt, with reasoning", full, True)
+    result_e = run_test("E: full crypto prompt, bare python UA", full, False,
+                        bare_ua=True)
 
     print("\n=== Summary ===")
     for name, res in (("A minimal/no-reasoning", result_a), ("B minimal/reasoning", result_b),
-                      ("C full/no-reasoning", result_c), ("D full/reasoning", result_d)):
+                      ("C full/no-reasoning", result_c), ("D full/reasoning", result_d),
+                      ("E full/bare-ua", result_e)):
         print(f"Test {name}: HTTP {res['status']} -> {'OK' if res['ok'] else 'FAILED'}")
 
     # If any full-prompt run produced parsable JSON, show the parsed decision
