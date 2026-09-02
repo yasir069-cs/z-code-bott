@@ -183,6 +183,22 @@
 - A failed call answers with a clear "not answering right now", never an invented
   reply. `/status`, `/signals`, `/strategy` work without the AI entirely.
 
+## Secrets and .env rules
+- Never paste a credential into this repo — not in docs, not in a test fixture.
+  The leak-watchdog in `config.py` stores **prefixes only**
+  (`_EXPOSED_TELEGRAM_TOKENS` / `_EXPOSED_OPENROUTER_KEYS`); a full value in the
+  list would be the very leak it exists to detect. `test_credentials.py` once held
+  the live bot token verbatim, which is how it reached public Git history — a test
+  now scans every tracked file for a full-shaped secret so it cannot come back.
+- Rotate first, then extend the prefix list with the leaked value's prefix, so
+  startup keeps warning until every host is updated. The warning silences itself
+  once `.env` carries a new credential.
+- Startup validates the AI config (`config.check_config_warnings()`) and logs
+  `CONFIG:` lines for a malformed `AI_BASE_URL` (quotes, spaces, a copied
+  markdown link), an empty `AI_MODEL`, a fallback equal to the primary, and a
+  model with no key. Those are silent-failure modes: the visible symptom is an
+  `ai_opinions.csv` full of FAILED rows while the daily budget keeps burning.
+
 ## Error handling
 - Exchange fetch fails → retry with backoff → skip coin.
 - AI fails → `fallback.py` local explanation (the decision is unaffected).

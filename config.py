@@ -453,22 +453,67 @@ SIGNALS_LOG_FILE = BASE_DIR / "signals_log.csv"
 BOT_LOG_FILE = BASE_DIR / "bot.log"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# Credentials known to have been exposed in chat/logs. If one of these is
-# still configured at startup, warn loudly on every boot until rotated.
-_EXPOSED_TELEGRAM_TOKEN = "8851597372:AAFlynes"
-_EXPOSED_OPENROUTER_KEY = "sk-or-v1-5e4bb826af4b"
+# Credentials known to have been exposed (pasted into a chat, printed in a log,
+# or committed to this repo). Startup warns on every boot while one is still
+# configured, so the warning disappears by itself once the owner rotates.
+#
+# PREFIXES ONLY, never a full secret: enough to recognise a leaked value, useless
+# for replaying it. A full token here would be exactly the leak this list exists
+# to detect — `tests/test_credentials.py` used to paste one, which is how the
+# live bot token ended up in the public Git history (rotate it, then update the
+# prefix below to the OLD value's prefix if you want the watchdog to keep firing).
+_EXPOSED_TELEGRAM_TOKENS = (
+    "8851597372:AAFlynes",      # pasted in chat AND committed in a test fixture
+)
+_EXPOSED_OPENROUTER_KEYS = (
+    "sk-or-v1-5e4bb826af4b",    # leaked in an earlier session
+    "sk-or-v1-87531e9388a2",    # pasted into chat on 2026-09-02
+)
 
 
 def check_exposed_credentials() -> list[str]:
     """Return warnings for any still-configured credential that is known to
     have been leaked publicly. Empty list = clean."""
     warnings = []
-    if TELEGRAM_TOKEN.startswith(_EXPOSED_TELEGRAM_TOKEN):
+    if any(TELEGRAM_TOKEN.startswith(p) for p in _EXPOSED_TELEGRAM_TOKENS):
         warnings.append("TELEGRAM_TOKEN was exposed in chat — revoke it via "
                         "@BotFather /revoke and put the new token in .env")
-    if OPENROUTER_API_KEY.startswith(_EXPOSED_OPENROUTER_KEY):
+    if any(OPENROUTER_API_KEY.startswith(p) for p in _EXPOSED_OPENROUTER_KEYS):
         warnings.append("OPENROUTER_API_KEY was exposed in chat — revoke it at "
                         "the provider's key page and put the new key in .env")
+    return warnings
+
+
+def check_config_warnings() -> list[str]:
+    """Non-secret .env mistakes that otherwise show up as 'the AI is silent'.
+
+    A real incident: `AI_BASE_URL` was pasted out of a chat window as a Markdown
+    link, so the value in .env was `[https://host/v1](https://host/v1)`. Every
+    request then died in `requests` with MissingSchema, the retry ladder treated
+    that as transient (it is raised as RequestException), and the visible symptom
+    was just an ai_opinions.csv full of FAILED rows — while the daily budget was
+    still being consumed 3x per call. Say it out loud at startup instead.
+    """
+    warnings = []
+    from urllib.parse import urlparse
+    parsed = urlparse(AI_BASE_URL)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        warnings.append(f"AI_BASE_URL is not a usable URL ({AI_BASE_URL!r}) — every "
+                        "AI call will fail. Check .env for quotes or a pasted "
+                        "markdown link like [https://…](https://…); it must be a "
+                        "bare URL")
+    elif any(c in AI_BASE_URL for c in "[]() "):
+        warnings.append(f"AI_BASE_URL contains brackets/spaces ({AI_BASE_URL!r}) — "
+                        "looks like a copied markdown link, not a URL")
+    if not AI_MODEL:
+        warnings.append("AI_MODEL is empty — the provider has nothing to run; "
+                        "explanations will always come from the local template")
+    if AI_MODEL_FALLBACK and AI_MODEL_FALLBACK == AI_MODEL:
+        warnings.append("AI_MODEL_FALLBACK equals AI_MODEL — the retry ladder will "
+                        "just repeat the same model; set a different one or leave it empty")
+    if not OPENROUTER_API_KEY and AI_MODEL:
+        warnings.append("AI_MODEL is set but no API key is configured — the AI stage "
+                        "is off (explanations use the local template; nothing breaks)")
     return warnings
 
 CSV_COLUMNS = ["timestamp", "signal_id", "coin", "signal", "entry", "SL", "TP", "RR",

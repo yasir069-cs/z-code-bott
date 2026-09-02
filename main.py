@@ -945,6 +945,9 @@ def main() -> None:
     logger.migrate_csv_header()  # reconcile signals_log.csv to the current column set
     for warning in config.check_exposed_credentials():
         log.warning("SECURITY: %s", warning)
+    # .env mistakes that would otherwise surface as "the AI went quiet"
+    for warning in config.check_config_warnings():
+        log.warning("CONFIG: %s", warning)
     log.info("=== Crypto Signal Bot starting (model=%s @ %s, telegram=%s, ai_key=%s) ===",
              config.AI_MODEL, config.AI_BASE_URL,
              "configured" if config.TELEGRAM_TOKEN else "NOT configured",

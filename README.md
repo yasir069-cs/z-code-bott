@@ -87,6 +87,12 @@ explanation transport below is retained for a later phase.
 
 ## Required `.env` variables
 
+Values are read raw — no quotes, no angle brackets, and **never paste a URL out of
+a chat window or a markdown file** (`[https://host/v1](https://host/v1)` is a link,
+not a URL, and it makes every AI call fail while the retry ladder burns the daily
+budget; startup prints a `CONFIG:` line for it now). Verify what the file actually
+contains: `grep -n AI_ .env | cat -A`.
+
 ```
 TELEGRAM_TOKEN=<from @BotFather>        # optional; alerts logged if missing
 TELEGRAM_CHAT_ID=<your chat id>         # REQUIRED for /scan_on, /scan_off (comma-separated for more)
