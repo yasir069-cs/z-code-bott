@@ -191,3 +191,64 @@ def test_migrate_no_file_is_safe(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SIGNALS_LOG_FILE", log_file)
     logger.migrate_csv_header()        # must not raise
     assert not log_file.exists()
+
+
+# ── HOLD log window + log level ─────────────────────────────────────────────
+def test_hold_row_suppressed_within_window_and_on_reason_change():
+    """Same verdict + same blocking reason inside HOLD_LOG_COOLDOWN_MIN is one
+    row; a changed reason is new information and is always written."""
+    g = duplicate_guard.DuplicateGuard()
+    now = _now()
+    key = "NO_TRADE|poor_rr"
+    assert g.hold_logged_recently("BTC/USDT", now, key) is False
+    g.record_hold("BTC/USDT", now, key)
+    assert g.hold_logged_recently("BTC/USDT", now + timedelta(minutes=5), key) is True
+    assert g.hold_logged_recently("BTC/USDT", now, "NO_TRADE|counter_htf") is False
+    window = config.HOLD_LOG_COOLDOWN_MIN
+    assert g.hold_logged_recently("BTC/USDT",
+                                  now + timedelta(minutes=window, seconds=1), key) is False
+
+
+def test_alert_cooldown_and_hold_window_are_independent():
+    """Recording a HOLD must never mute a later BUY for the same coin."""
+    g = duplicate_guard.DuplicateGuard()
+    now = _now()
+    g.record_hold("ETH/USDT", now, "NO_TRADE|low_setup_quality")
+    assert g.is_duplicate("ETH/USDT", now) is False
+    g.record("ETH/USDT", now)
+    assert g.is_duplicate("ETH/USDT", now + timedelta(minutes=1)) is True
+    assert g.hold_tracked_count() == 1
+    g.reset()
+    assert g.hold_tracked_count() == 0 and g.tracked_count() == 0
+
+
+def test_hold_rows_log_at_debug_not_info(tmp_path, monkeypatch, caplog):
+    """37 HOLD rows a scan drowned the INFO journal; BUY/SELL stay INFO."""
+    import logging
+    monkeypatch.setattr(config, "SIGNALS_LOG_FILE", tmp_path / "signals_log.csv")
+    with caplog.at_level(logging.DEBUG, logger="logger"):
+        logger.log_signal({"coin": "A/USDT", "signal": "HOLD", "entry": 1.0})
+        logger.log_signal({"coin": "B/USDT", "signal": "BUY", "entry": 2.0})
+    holds = [r for r in caplog.records if "A/USDT" in r.getMessage()]
+    buys = [r for r in caplog.records if "B/USDT" in r.getMessage()]
+    assert holds and holds[0].levelno == logging.DEBUG
+    assert buys and buys[0].levelno == logging.INFO
+
+
+def test_hold_reason_key_sig_shape():
+    from main import _hold_reason_key
+    assert _hold_reason_key({"decision": "NO_TRADE", "no_trade_reason": "poor_rr, stop_too_wide"}) \
+        == "NO_TRADE|poor_rr, stop_too_wide"
+    assert _hold_reason_key({}) == "None|None"
+
+
+def test_persist_counts_and_survives_a_disk_error(tmp_path, monkeypatch):
+    """One unwritable row must cost one row — never the rest of the scan."""
+    import main
+
+    def boom(sig):
+        raise OSError("disk full")
+    monkeypatch.setattr(main.logger, "log_signal", boom)
+    summary = {"log_failed": 0}
+    assert main._persist({"coin": "X/USDT", "signal": "BUY"}, summary) is False
+    assert summary["log_failed"] == 1

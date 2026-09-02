@@ -93,5 +93,10 @@ def log_signal(signal: dict) -> None:
     except OSError as exc:
         log.error("failed writing signal row for %s: %s", row.get("coin"), exc)
         raise
-    log.info("Signal logged: %s %s %s (ai_used=%s)",
-             row.get("coin"), row.get("signal"), row.get("entry"), row.get("ai_used"))
+    # A blocked setup is a log row, not an event worth the owner's INFO stream:
+    # 37 of them per scan drowned the journald tail in "Signal logged: … HOLD"
+    # lines. BUY/SELL stay INFO; HOLD drops to DEBUG (the CSV still gets it,
+    # deduped by the caller's HOLD_LOG_COOLDOWN_MIN window).
+    _log = log.info if row.get("signal") in ("BUY", "SELL") else log.debug
+    _log("Signal logged: %s %s %s (ai_used=%s)",
+         row.get("coin"), row.get("signal"), row.get("entry"), row.get("ai_used"))

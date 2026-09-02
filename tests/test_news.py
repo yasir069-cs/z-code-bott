@@ -241,24 +241,43 @@ def test_pending_queue_dedupes_similar_events_in_one_cycle():
     assert len(pending) == 1
 
 
-def test_cycle_recheck_catches_split_story_across_publishes():
+def test_cycle_recheck_catches_split_story_across_publishes(monkeypatch, tmp_path):
     """process_cycle re-checks memory before each publish, so two similar
-    events pending in ONE cycle still alert exactly once."""
-    engine = NewsEngine()
-    # pre-seed two similar but separately-clustered events
-    e1 = NewsEvent(); e1.articles = [
+    events pending in ONE cycle still alert exactly once.
+
+    The pair is built by hand because the *split* is the subject: clustering
+    sometimes files one story as two events, and the memory re-check is the only
+    thing that stops the second alert. Ingestion is stubbed to hand those events
+    back — with the real feed wired, the cycle ingested nothing, `pending` came
+    out empty, and the assertion passed on an accident instead of on the guard.
+    """
+    engine = NewsEngine(fetch_fn=lambda: [])
+    engine._alerts = news.AlertMemory(tmp_path / "alerted.json")
+
+    e1 = NewsEvent()
+    e1.articles = [
         _art("Binance halts withdrawals after security incident",
              "binance.com", "https://binance.com/en/x", ""),
         _art("Binance halts withdrawals after security incident",
-             "cointelegraph.com", "https://c.com/1", "")]
+             "cointelegraph.com", "https://c.com/1", ""),
+    ]
     e1.assets = set(); e1.status = compute_status(e1)
-    e2 = NewsEvent(); e2.articles = [
+    e2 = NewsEvent()
+    e2.articles = [
+        _art("Binance suspends withdrawals following security incident",
+             "binance.com", "https://binance.com/en/y", ""),
         _art("Binance suspends withdrawals following security incident",
              "theblock.co", "https://t.com/1", ""),
         _art("Binance suspends withdrawals following security incident",
-             "decrypt.co", "https://de.com/1", "")]
+             "decrypt.co", "https://de.com/1", ""),
+    ]
     e2.assets = set(); e2.status = compute_status(e2)
+    # both are independently publishable: only the re-check can stop the second
+    assert e1.status == "VERIFIED" and e2.status == "VERIFIED"
+    assert e1.claim_tokens() != e2.claim_tokens()
+
     engine._events = [e1, e2]
+    monkeypatch.setattr(engine, "ingest", lambda articles: [(e1, "new"), (e2, "new")])
 
     sent = engine.process_cycle(
         analyzer=_ai_ok,
@@ -845,3 +864,84 @@ def test_old_events_expire():
 def test_asset_extraction():
     assets = news.extract_assets("Bitcoin and Ethereum rally as $SUI launches")
     assert {"BTC", "ETH", "SUI"} <= assets
+
+
+# ------------------------------------------------- AI transport: one shared path
+# rules.md: every provider call goes through ai_decision's transport — the WAF-
+# required User-Agent, the retry ladder, the fallback model and the daily budget.
+# news_analysis was the last module hand-rolling its own requests.post.
+
+def test_news_ai_call_goes_through_the_shared_transport(monkeypatch):
+    import ai_decision
+    seen = {}
+
+    def fake_complete(messages, *, max_tokens=600, temperature=0.3, deadline=None,
+                      json_mode=False):
+        seen.update(messages=messages, max_tokens=max_tokens, temperature=temperature,
+                    json_mode=json_mode)
+        return '{"direction": "BULLISH"}'
+
+    monkeypatch.setattr(ai_decision, "complete_chat", fake_complete)
+    content = na._post({
+        "messages": [{"role": "user", "content": "analyse"}],
+        "temperature": 0.2, "max_tokens": 900,
+        "response_format": {"type": "json_object"},
+    })
+    assert content == '{"direction": "BULLISH"}'
+    assert seen["json_mode"] is True                 # the payload's intent survives
+    assert seen["max_tokens"] == 900 and seen["temperature"] == 0.2
+    assert seen["messages"][0]["content"] == "analyse"
+
+
+def test_news_transport_reports_provider_failures_as_news_failures(monkeypatch):
+    """The news engine's contract to its caller is 'skip this alert', so a provider
+    error is re-thrown as AINewsError — but the text must survive the translation,
+    or the log says 'news AI failed' with no way to know it was a timeout."""
+    import ai_decision
+
+    def boom(*a, **k):
+        raise ai_decision.AIDecisionError("AI provider timeout after 90s")
+
+    monkeypatch.setattr(ai_decision, "complete_chat", boom)
+    with pytest.raises(na.AINewsError) as exc:
+        na._post({"messages": [], "response_format": None})
+    assert "timeout after 90s" in str(exc.value)
+
+
+def test_news_parser_reads_json_out_of_a_messy_reply():
+    assert na._parse_json('Sure — here it is:\n```json\n{"direction": "BEARISH"}\n```\n') == {
+        "direction": "BEARISH"}
+    assert na._parse_json('note [1] {"strength": "HIGH"} note [2]')["strength"] == "HIGH"
+
+
+def test_news_parser_refuses_a_reply_with_no_object_in_it():
+    for reply in ("I cannot assess this event.", "[]", "```\n[]\n```"):
+        with pytest.raises(na.AINewsError):
+            na._parse_json(reply)
+
+
+def test_news_validation_rejects_an_object_that_is_not_an_assessment():
+    """A batch-shaped reply parses as JSON but is not a verdict — `_validate` owns
+    that judgement, and it must fail closed rather than default into a direction."""
+    with pytest.raises(na.AINewsError) as exc:
+        na._validate({"decisions": [{"a": 1}]}, _hack_event())
+    assert "summary" in str(exc.value)
+
+
+def test_no_hand_rolled_provider_post_left_in_the_repo():
+    """The rule is one transport; this keeps a fourth `requests.post` from creeping
+    back in with its own headers, its own timeout and no budget accounting."""
+    # AST, not substring: these files legitimately *talk about* requests.post in
+    # their docstrings (explaining why they no longer call it).
+    import ast
+    import pathlib
+    offenders = []
+    for name in ("news_analysis.py", "chat_assistant.py", "alerts.py", "telegram_bot.py",
+                 "liquidation.py", "futures_context.py", "scanner.py", "main.py"):
+        tree = ast.parse(pathlib.Path(name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "post"
+                    and getattr(node.func.value, "id", "") == "requests"):
+                offenders.append(f"{name}:{node.lineno}")
+    assert not offenders, f"hand-rolled provider calls: {offenders}"

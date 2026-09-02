@@ -140,7 +140,7 @@ def test_valid_buy_json(monkeypatch):
     # request shape: provider endpoint, model, token budget; the OpenRouter
     # "reasoning" field is OMITTED when disabled (strict gateways reject
     # unknown body fields) and only sent when AI_REASONING_ENABLED.
-    assert calls["url"] == ai_decision.OPENROUTER_URL
+    assert calls["url"] == ai_decision.chat_completions_url()
     assert calls["payload"]["model"] == config.AI_MODEL
     if config.AI_REASONING_ENABLED:
         assert calls["payload"]["reasoning"] == {"enabled": True}
@@ -329,7 +329,13 @@ def test_llm_transport_defaults_to_agentrouter(monkeypatch):
     assert cfg.OPENROUTER_API_KEY == "sk-or-test"
     assert cfg.AI_BASE_URL == "https://agentrouter.org/v1"
     assert cfg.AI_MODEL == "deepseek-v4-flash"
-    assert ai_decision.OPENROUTER_URL == "https://agentrouter.org/v1/chat/completions"
+    # resolved at CALL time, so a reloaded/changed base URL is actually used —
+    # the old import-time constant kept posting to whatever host was configured
+    # when the module was first imported
+    assert ai_decision.chat_completions_url() == \
+        "https://agentrouter.org/v1/chat/completions"
+    monkeypatch.setattr(cfg, "AI_BASE_URL", "https://elsewhere.example/v1/")
+    assert ai_decision.chat_completions_url() == "https://elsewhere.example/v1/chat/completions"
 
 
 def test_empty_fallback_model_disables_the_second_model(monkeypatch):
@@ -741,3 +747,35 @@ def test_fallback_reason_is_tagged():
 
 def test_fallback_never_claims_ai():
     assert fallback.fallback_decision(_bundle())["ai_used"] is False
+
+
+def test_decision_and_chat_share_one_transport_config(monkeypatch):
+    """Endpoint + headers must come from the same two functions for every caller.
+
+    The chat assistant used to hand-roll its own requests.post with its own URL
+    constant and no User-Agent: the decisions got retried through the WAF and the
+    assistant did not, which read as "the provider is flaky" instead of "two
+    transports drifted apart"."""
+    calls = []
+
+    answer = json.dumps({"signal": "BUY", "entry": 100, "stop_loss": 98.5,
+                         "take_profit": 103, "rr": 2.0, "confidence": 80,
+                         "reason": "sweep + structure"})
+
+    def fake_post(url, headers=None, json=None, timeout=None, **kw):
+        calls.append({"url": url, "headers": headers})
+        return _content_resp(answer)
+
+    monkeypatch.setattr(ai_decision.requests, "post", fake_post)
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-or-test")
+    ai_decision.reset_budget()
+
+    assert ai_decision.complete_chat([{"role": "user", "content": "x"}],
+                                     max_tokens=600) == answer
+    assert ai_decision.nemotron_decision(_bundle())["signal"] == "BUY"
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call["url"] == ai_decision.chat_completions_url()
+        assert call["headers"] == ai_decision.provider_headers()
+        assert call["headers"]["User-Agent"] == ai_decision.PROVIDER_USER_AGENT
