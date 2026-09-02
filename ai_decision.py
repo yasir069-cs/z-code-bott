@@ -676,6 +676,12 @@ def _post_once(messages: list, model: str) -> str:
                 "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                # Some provider CDNs/WAFs (Aliyun WAF in front of AgentRouter
+                # was seen live) challenge the bare python-requests UA; a
+                # browser-like UA sometimes passes the static checks.
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/128.0.0.0 Safari/537.36"),
             },
             json=payload,
             timeout=config.AI_TIMEOUT_SECONDS,
