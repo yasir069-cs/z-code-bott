@@ -7,7 +7,7 @@ The bot now decides on a **deterministic price-action & market-context core**
 LONG/SHORT/NO_TRADE; RSI/EMA/VWAP/Bollinger are **secondary confirmation only**.
 The owner's handwritten note (**[strategy_spec.md](strategy_spec.md)**) is the
 documented secondary layer. The LLM writes the **explanation** and audits the
-verdict in the background — it never decides. **477 unit tests pass.**
+verdict in the background — it never decides. **485 unit tests pass.**
 
 ## All decisions finalized
 - **Exchange:** Binance USDT-M **futures** (CCXT public, no keys, signals-only)
@@ -135,6 +135,26 @@ as a bounded confirmation sub-score (`scoring.indicator_confirmation`), not a ga
   `support_resistance` never emits, so every entry was a permanent None. Distance
   is now derived from the zone mid against the traded price and the block is
   omitted entirely when there is no price to measure from.
+
+## Second live log (2026-09-02 12:07, PID 37708) — gates off, still zero alerts
+`main` removed `no_clear_target`/`poor_rr` from `risk_gate.evaluate` and dropped the
+floors to 30/35/25 with `MIN_RR=1.2`; the scan still ended `signals 0 (holds 41)`.
+Reading the last 41 rows of `signals_log.csv` (the reason codes, not the prose the
+alert shows) shows why: the two removed codes were never the whole gate —
+`stop_too_wide`, `target_too_close` and `into_opposing_zone` are still live, and
+`insufficient_primary_evidence`/`low_setup_quality` are recorded by `decision.decide`,
+not by the risk gate. Removing a gate cannot help while the layers beside it still
+veto. The reward side is the part this branch repairs (zone scan, wrong-side
+protection, `target_note`); the risk side (`stop_too_wide` from a `last_swing_high`
+farther than 3 ATR) is untouched on both branches and is the next thing to measure —
+`scripts/why_no_signals.py` prints how many alerts each layer would free, so the
+decision is taken from the log rather than by feel.
+Deployed-code tells in that same log, for the record: `exchange returned 28 rows
+(< 300), skipping`, `funnel 41/41/41`, INFO-level `Signal logged: … HOLD`, and no
+`CONFIG:`/`SECURITY:` lines — none of the branch's fixes were on the box; the server
+was running `main`. Owner-side `.env` fix confirmed applied: `AI_BASE_URL=https://
+openrouter.ai/api/v1` (it had held a markdown link, which failed every AI call and
+burned `AI_DAILY_BUDGET` on retries).
 
 ## Interpretation decisions (documented)
 - Sweep is heavily weighted, not a hard gate — owner's decision; requiring it
