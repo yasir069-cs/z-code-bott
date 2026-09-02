@@ -20,7 +20,10 @@ TZ = ZoneInfo("Asia/Kolkata")  # IST = UTC+5:30, no DST
 # ------------------------------------------------------------------ secrets
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+# AI provider key. The historical name is OPENROUTER_API_KEY; AGENTROUTER_API_KEY
+# is accepted as an alias so .env can carry the provider-accurate name.
+OPENROUTER_API_KEY = (os.getenv("AGENTROUTER_API_KEY")
+                      or os.getenv("OPENROUTER_API_KEY", "")).strip()
 
 # ------------------------------------------------------------------ scanner
 EXCHANGE_ID = "binance"
@@ -432,7 +435,7 @@ def check_exposed_credentials() -> list[str]:
                         "@BotFather /revoke and put the new token in .env")
     if OPENROUTER_API_KEY.startswith(_EXPOSED_OPENROUTER_KEY):
         warnings.append("OPENROUTER_API_KEY was exposed in chat — revoke it at "
-                        "openrouter.ai/keys and put the new key in .env")
+                        "the provider's key page and put the new key in .env")
     return warnings
 
 CSV_COLUMNS = ["timestamp", "signal_id", "coin", "signal", "entry", "SL", "TP", "RR",
