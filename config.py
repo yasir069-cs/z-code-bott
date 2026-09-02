@@ -296,14 +296,12 @@ QUALITY_W_PRICE_ACTION = 15
 QUALITY_W_MTF = 10
 QUALITY_W_TRENDLINE = 5
 QUALITY_W_FUTURES = 5
-QUALITY_PRIMARY_FLOOR = 35       # primary score below this -> NO_TRADE (indicators cannot rescue)
-                                 # LOWERED from 45: with penalty floor at 0.5, primary 45 becomes ~22
+QUALITY_PRIMARY_FLOOR = 25       # primary score below this -> NO_TRADE (indicators cannot rescue)
+                                 # LOWERED: RR penalties removed from quality
 IND_CONFIRM_BONUS_MAX = 15       # aligned indicators add at most this (cannot trigger alone)
-                                 # RAISED from 10: give indicators more rescue power
 IND_CONFLICT_PENALTY_MAX = 10    # opposing indicators shave at most this (secondary yields)
-                                 # LOWERED from 15: reduce conflict impact
-QUALITY_MIN = 42                 # final setup-quality gate for a tradable setup
-                                 # LOWERED from 50: allow more setups through (need real-world testing)
+QUALITY_MIN = 35                 # final setup-quality gate (quality now excludes RR)
+                                 # RR is checked separately post-quality
 
 # ---- setup-quality exhaustion & location penalties
 # A score that only asks "how strongly does each layer agree with the
@@ -334,10 +332,10 @@ QUALITY_WEAK_VOLUME_FACTOR = 0.95     # last 1H volume < PA_VOLUME_WEAK x avg20
                                  # LOOSENED from 0.90: reduce volume penalty
 QUALITY_DECLINING_VOLUME_FACTOR = 0.98  # volume merely below the prior candle
                                  # LOOSENED from 0.95: minor penalty only
-QUALITY_RR_NONE_PENALTY = 20.0        # no achievable opposing target at all
-                                 # REDUCED from 30: less harsh on RR failures
-QUALITY_RR_MISS_PENALTY = 12.0        # rr < MIN_RR, scaled by how far it misses
-                                 # REDUCED from 20: gentler on suboptimal RR
+QUALITY_RR_NONE_PENALTY = 0.0         # RR gate moved AFTER quality check
+                                 # WAS 20: no target shouldn't kill quality score
+QUALITY_RR_MISS_PENALTY = 0.0        # RR gate moved AFTER quality check
+                                 # WAS 12: suboptimal RR is a gate, not a quality penalty
 MTF_TREND_CONFLICT_PENALTY = 10       # fresh CHoCH against the standing HTF trend
 
 # ---- directional-confirmation gate (a structural bias alone is not a trade)
@@ -371,14 +369,14 @@ DECISION_ENABLED = True          # master switch: price-action core decides (vs 
 # verdict then faces the SAME deterministic validation (direction gates,
 # stop width, R:R, quality floor) before an alert can go out.
 LLM_DECISION_ENABLED = True      # False -> pure deterministic core (previous behaviour)
-# ---- alert tier system (owner's rule, 2026-09-01) ----
-# Below 38: ignored (log-only, never alerts). 38-50: LOW alert (log+telegram).
-# 50-60: NORMAL alert. 60-70: HIGH alert. 70-100: STRONGEST alert.
-ALERT_QUALITY_MIN = 38           # Telegram alert floor (LOOSENED from 50)
-                                # 38-50 is LOW tier, 50+ is NORMAL/HIGH/STRONG
-ALERT_TIER_NORMAL_MIN = 50       # 50.0-59.9 -> NORMAL
-ALERT_TIER_HIGH_MIN = 60         # 60.0-69.9 -> HIGH
-ALERT_TIER_STRONG_MIN = 70       # 70.0+     -> STRONG
+# ---- alert tier system (UPDATED with RR removed from quality) ----
+# Below 30: ignored (log-only, never alerts). 30-40: LOW alert (log+telegram).
+# 40-50: NORMAL alert. 50-60: HIGH alert. 60-100: STRONGEST alert.
+ALERT_QUALITY_MIN = 30           # Telegram alert floor (LOOSENED to 30, RR moved to separate gate)
+                                # RR is checked separately, not in quality
+ALERT_TIER_NORMAL_MIN = 40       # 40.0-49.9 -> NORMAL (lowered from 50)
+ALERT_TIER_HIGH_MIN = 50         # 50.0-59.9 -> HIGH (lowered from 60)
+ALERT_TIER_STRONG_MIN = 60       # 60.0+     -> STRONG (lowered from 70)
 
 # ---- news verification engine (VERIFY FIRST — AI never decides what is true)
 NEWS_ENABLED = False             # news engine OFF (owner's call, 2026-08-30)
