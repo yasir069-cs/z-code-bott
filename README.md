@@ -80,6 +80,7 @@ explanation transport below is retained for a later phase.
 | `python main.py --once` | One real production scan cycle on live data |
 | `python scripts/e2e_demo.py [SYMBOL]` | Forces the gates open on real candles and runs decision → guard → alert → CSV end-to-end (writes `signals_log_demo.csv`) |
 | `python scripts/funnel_check.py` | Live funnel stats: coins → sweeps → 1H → 15M → 5M |
+| `python scripts/why_no_signals.py [--all] [--fix target]` | Offline: turns `signals_log.csv`'s `no_trade_reason` rows into a per-scan blocker histogram and shows how many alerts each layer would free |
 | `python scripts/schedule_check.py` | Prints all scheduler fire times for the next 24h (expects 60 scans, 18:00:15…22:55:15) |
 | `python backtest.py --horizon-hours 24` | Backtests `signals_log.csv` against real Binance history → `backtest_report.txt` |
 | `python backtest.py --strategy BTC/USDT:USDT` | Replays the **live decision core** over recent 1H/15M/5M history (look-ahead-safe) → `backtest_strategy_report.txt` |
@@ -217,7 +218,7 @@ OHLCV cache + concurrency + exclusions + OI history). **Decision core:**
 `ai_decision.py` (batch + retry + budget), `fallback.py` (local explanation),
 `duplicate_guard.py`, `alerts.py`, `telegram_bot.py` (chat listener),
 `chat_assistant.py`, `logger.py`, `backtest.py` (logged-signal + `--strategy`
-replay), `requirements.txt`. Plus `tests/` (468 tests) and `scripts/`.
+replay), `requirements.txt`. Plus `tests/` (485 tests) and `scripts/`.
 Spec docs live in the repo root; **[price_action_spec.md](price_action_spec.md)**
 is the primary authority, **[strategy_spec.md](strategy_spec.md)** the secondary
 indicator layer, and `memory.md` tracks progress.
