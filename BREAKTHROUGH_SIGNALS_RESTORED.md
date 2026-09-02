@@ -7,7 +7,8 @@ After aggressive config tuning, signals were still 0/40. Root cause analysis rev
 1. **RR penalties in quality score** (-20/-12 points) killed scores before quality threshold
 2. **RR gate blockers in risk_gate.py** rejected signals for undefined/poor RR
 
-Both were mathematically preventing ANY signals from reaching decision = BUY/SELL.
+The quality penalty was suppressing scores; the risk gate correctly continues to
+prevent trades without a valid stop, target, or minimum RR.
 
 ## The Solution (Implemented)
 
@@ -21,12 +22,13 @@ Both were mathematically preventing ANY signals from reaching decision = BUY/SEL
 
 **Result**: Quality scores improved but signals still blocked by risk gate
 
-### Commit 2: `94d7d9b` - RR Gate Blockers Removed
-- Removed `if rr < MIN_RR: reasons.append("poor_rr")` block
-- Removed `if tp is None: reasons.append("no_clear_target")` block
-- Removed `if sl is None: reasons.append("no_structure_stop")` block
+### Follow-up correction: risk safety preserved
+- `QUALITY_RR_NONE_PENALTY` and `QUALITY_RR_MISS_PENALTY` remain zero.
+- `risk_gate.py` still rejects `poor_rr`, `no_clear_target`, and
+  `no_structure_stop` because those are execution-safety requirements.
 
-**Result**: Gates no longer reject on RR/target/stop issues
+**Result**: Quality can rank setups independently, while the risk gate still
+rejects unsafe execution conditions.
 
 ## Outcome (Before vs After)
 
@@ -66,14 +68,14 @@ But risk_gate("poor_rr") → NO_TRADE ❌
 Quality = (Primary * Exhaustion) + Indicator - 0
         = (57.2 * 0.80) + 0
         = 45.8 ✓ passed quality >= 35
-risk_gate("poor_rr") → removed ✓ allows SELL
+risk_gate("poor_rr") → NO_TRADE ❌ (safety gate remains mandatory)
 ```
 
 ## Why This Approach
 
 1. **Quality measures market structure validity** (bias, S/R, liquidity, PA, MTF)
-2. **RR is now informational**, not a gate-keeper
-3. **Signals can surface** even with poor RR (owner reviews before trading)
+2. **RR is excluded from quality scoring**, but remains a mandatory safety gate
+3. **Signals surface only when minimum execution risk is valid**
 4. **No data loss**: RR still calculated and logged for manual review
 
 ## Next Steps
@@ -94,17 +96,10 @@ QUALITY_PRIMARY_FLOOR = 35    # from 25
 ALERT_QUALITY_MIN = 40        # from 30
 ```
 
-### To restore RR as a hard gate:
-```python
-# risk_gate.py (uncomment)
-if rr is not None and rr < cfg.MIN_RR:
-    reasons.append("poor_rr")
-```
-
 ## Commits Pushed
 
 ```
-94d7d9b (HEAD -> main, origin/main) Remove RR gate blockers
+94d7d9b Remove RR gate blockers (superseded by safety correction)
 7b58611 CRITICAL: Remove RR penalties from quality score
 f7dcbda Aggressive config tuning to allow signals through
 124fad2 Fix AI JSON parsing, improve error logging

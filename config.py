@@ -20,9 +20,11 @@ TZ = ZoneInfo("Asia/Kolkata")  # IST = UTC+5:30, no DST
 # ------------------------------------------------------------------ secrets
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-# AI provider key. The historical name is OPENROUTER_API_KEY; AGENTROUTER_API_KEY
-# is accepted as an alias so .env can carry the provider-accurate name.
-OPENROUTER_API_KEY = (os.getenv("AGENTROUTER_API_KEY")
+# NVIDIA is the active provider. We accept legacy OpenRouter/AgentRouter names as
+# fallbacks so older .env files continue to work without breaking the app.
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
+OPENROUTER_API_KEY = (NVIDIA_API_KEY
+                      or os.getenv("AGENTROUTER_API_KEY")
                       or os.getenv("OPENROUTER_API_KEY", "")).strip()
 
 # ------------------------------------------------------------------ scanner
@@ -155,15 +157,13 @@ RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2.0"))  # max 2% ris
 LEV_ATR_LOW = 0.01               # ATR < 1% of price -> high leverage OK
 LEV_ATR_HIGH = 0.03              # ATR > 3% of price -> low leverage only
 
-# ------------------------------------------------------------------ AI (AgentRouter / DeepSeek v4)
-# AI_BASE_URL keeps the transport configurable (any OpenAI-compatible
-# provider). Primary: AgentRouter serving deepseek-v4-flash.
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://agentrouter.org/v1").rstrip("/")
-AI_MODEL = os.getenv("AI_MODEL", "deepseek-v4-flash")
+# ------------------------------------------------------------------ AI (NVIDIA / OpenAI-compatible)
+# NVIDIA is the active default endpoint for the DeepSeek v4 Flash model.
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
+AI_MODEL = os.getenv("AI_MODEL", "deepseek-ai/deepseek-v4-flash-0731")
 # Secondary model, tried when the primary fails every retry. Empty by default:
-# the AgentRouter key only serves the primary model. Set AI_MODEL_FALLBACK in
-# .env when the provider offers a second usable model. Only after both paths
-# fail does the run fall back to the pure-Python indicator decision.
+# set AI_MODEL_FALLBACK in .env when the provider offers a second usable model.
+# Only after both paths fail does the run fall back to the pure-Python indicator decision.
 AI_MODEL_FALLBACK = os.getenv("AI_MODEL_FALLBACK", "").strip()
 AI_MAX_TOKENS = 8000            # 2000 was too small for 20-coin batches: the
                                 # model burned the budget on chain-of-thought
@@ -296,12 +296,12 @@ QUALITY_W_PRICE_ACTION = 15
 QUALITY_W_MTF = 10
 QUALITY_W_TRENDLINE = 5
 QUALITY_W_FUTURES = 5
-QUALITY_PRIMARY_FLOOR = 25       # primary score below this -> NO_TRADE (indicators cannot rescue)
-                                 # LOWERED: RR penalties removed from quality
+QUALITY_PRIMARY_FLOOR = 35       # primary score below this -> NO_TRADE (indicators cannot rescue)
+                                 # RR penalties remain part of the quality calculation, but risk gate still vetoes poor RR
 IND_CONFIRM_BONUS_MAX = 15       # aligned indicators add at most this (cannot trigger alone)
 IND_CONFLICT_PENALTY_MAX = 10    # opposing indicators shave at most this (secondary yields)
-QUALITY_MIN = 35                 # final setup-quality gate (quality now excludes RR)
-                                 # RR is checked separately post-quality
+QUALITY_MIN = 42                 # final setup-quality gate for a tradable setup
+                                 # RR penalties remain part of the quality calculation
 
 # ---- setup-quality exhaustion & location penalties
 # A score that only asks "how strongly does each layer agree with the
@@ -332,10 +332,10 @@ QUALITY_WEAK_VOLUME_FACTOR = 0.95     # last 1H volume < PA_VOLUME_WEAK x avg20
                                  # LOOSENED from 0.90: reduce volume penalty
 QUALITY_DECLINING_VOLUME_FACTOR = 0.98  # volume merely below the prior candle
                                  # LOOSENED from 0.95: minor penalty only
-QUALITY_RR_NONE_PENALTY = 0.0         # RR gate moved AFTER quality check
-                                 # WAS 20: no target shouldn't kill quality score
-QUALITY_RR_MISS_PENALTY = 0.0        # RR gate moved AFTER quality check
-                                 # WAS 12: suboptimal RR is a gate, not a quality penalty
+QUALITY_RR_NONE_PENALTY = 20.0        # no achievable opposing target at all
+                                 # IMPORTANT: quality must reflect unrealizable RR
+QUALITY_RR_MISS_PENALTY = 12.0        # rr < MIN_RR, scaled by how far it misses
+                                 # must lower the score when the setup is weak on RR
 MTF_TREND_CONFLICT_PENALTY = 10       # fresh CHoCH against the standing HTF trend
 
 # ---- directional-confirmation gate (a structural bias alone is not a trade)
