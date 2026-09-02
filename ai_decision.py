@@ -877,7 +877,7 @@ def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
         if not content:
             raise AIDecisionError(
                 f"AI provider streamed an empty response (model={model}, "
-                f"content-type={ctype or 'unknown'}, body={body[:200]!r})",
+                f"content-type={ctype or 'unknown'}, body={body[:500]!r})",
                 retryable=True)
         return content, None
     try:
@@ -885,9 +885,21 @@ def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
     except ValueError as exc:  # requests' JSONDecodeError is a ValueError
         raise AIDecisionError(
             f"AI provider returned a non-JSON body (model={model}, "
-            f"content-type={ctype or 'unknown'}): {exc} | body={body[:200]!r}",
+            f"content-type={ctype or 'unknown'}): {exc} | body={body[:500]!r}",
             retryable=True) from exc
-    return (data["choices"][0]["message"].get("content") or "").strip(), data
+
+    # A 200 without choices/message/content is its own failure class: naming the
+    # missing key (plus the truncated body) is the difference between a two-minute
+    # diagnosis and guessing which of the three was absent. Carried over from
+    # `main`, whose version raised a bare KeyError that the transport then reported
+    # as a generic "response malformed".
+    try:
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except (KeyError, IndexError, TypeError) as exc:
+        raise AIDecisionError(
+            f"AI response missing choices/message/content (model={model}): {exc!r} "
+            f"| body={str(data)[:500]!r}", retryable=True) from exc
+    return content, data
 
 
 def _post_once(messages: list, model: str, *, max_tokens: Optional[int] = None,
@@ -1114,7 +1126,8 @@ def _complete(messages: list, parse=None, deadline: Optional[float] = None,
 
 def complete_chat(messages: list, *, max_tokens: int = 600,
                   temperature: float = 0.3,
-                  deadline: Optional[float] = None) -> str:
+                  deadline: Optional[float] = None,
+                  json_mode: bool = False) -> str:
     """One provider chat completion for non-decision callers.
 
     The Telegram assistant used to build its own `requests.post` — no browser-like
@@ -1128,7 +1141,8 @@ def complete_chat(messages: list, *, max_tokens: int = 600,
     clear message, never a fabricated reply.
     """
     return _complete(messages, parse=None, deadline=deadline,
-                     max_tokens=max_tokens, temperature=temperature) or ""
+                     max_tokens=max_tokens, temperature=temperature,
+                     json_mode=json_mode) or ""
 
 
 def _messages(user_prompt: str) -> list:

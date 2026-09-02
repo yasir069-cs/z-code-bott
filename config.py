@@ -111,6 +111,47 @@ W_LTF_RSI = 40
 W_LTF_VOLUME = 30
 W_LTF_BB = 30
 
+# ------------------------------------------------------------------ tuned floors
+# Every floor below is POLICY, and the live 2026-09-02 session is why it is
+# editable from .env: `main` loosened these numbers by 10-35% mid-incident, which
+# (a) produced no signals anyway — the reward side was measured wrongly, not gated
+# too tightly — and (b) left the repo holding values no test or doc agreed with.
+# So: the DEFAULT is the spec value, and each number can be overridden in `.env`
+# for an experiment without editing code. `check_config_warnings()` then shouts if
+# an override lands outside the band the strategy is written against, including the
+# specific trap of zeroing both RR quality penalties while also setting MIN_RR to 0
+# (reward:risk enforced nowhere).
+def _env_number(name: str, default: float) -> float:
+    """A tuned number: the `.env` value when present and numeric, else the default.
+
+    A non-numeric override raises at import instead of being ignored — silently
+    falling back to the default is how "we loosened it and nothing changed" gets
+    reported for an override that never took effect.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise RuntimeError(f"{name}={raw!r} in .env is not a number") from None
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """A boolean switch from `.env` (`0/false/no/off` vs anything else).
+
+    Used where a behaviour, not a number, is being A/B-tested — e.g. turning the
+    reachable-target scan off on the live box to compare one night's output with
+    the old nearest-zone rule, without editing code between the two runs.
+    """
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "0", "true", "false", "yes", "no", "on", "off"):
+        return raw not in ("0", "false", "no", "off")
+    raise RuntimeError(f"{name}={raw!r} in .env is not a flag (use 1/0, true/false, on/off)")
+
+
 ZONE_TAPER_FLOOR = 0.40         # score at ZONE_MAX_PCT as a fraction of W_1H_ZONE (25 -> 10)
 RSI_TOL_FRACTION = 0.50         # tolerance-band RSI scores half
 VOLUME_AVG_FRACTION = 0.67      # above 20-avg but not above previous candle
@@ -122,10 +163,12 @@ SWEEP_AGE_STALE = 10            # 6-10 candles -> 32%; older counts as no sweep
 SWEEP_PARTIAL_FRACTION = 0.60
 SWEEP_STALE_FRACTION = 0.32
 
-MIN_SCORE_1H = 55               # 1H confluence gate (a no-sweep setup can still reach this)
-MIN_SCORE_15M = 50              # 15M confirmation gate
-MIN_SCORE_5M = 50               # 5M entry gate
-MIN_CONFLUENCE = 55             # weighted total gate
+MIN_SCORE_1H = _env_number("MIN_SCORE_1H", 55.0)      # 1H confluence gate
+                                # a no-sweep setup can still reach this
+MIN_SCORE_15M = _env_number("MIN_SCORE_15M", 50.0)   # 15M confirmation gate
+MIN_SCORE_5M = _env_number("MIN_SCORE_5M", 50.0)     # 5M entry gate
+MIN_CONFLUENCE = _env_number("MIN_CONFLUENCE", 55.0)  # weighted total gate
+                                # allows lower-confluence setups to be evaluated on quality
 
 CONFLUENCE_W_1H = 0.40          # weights must sum to 1.0
 CONFLUENCE_W_15M = 0.30
@@ -171,12 +214,15 @@ AI_MODEL = os.getenv("AI_MODEL", "deepseek-v4-flash")
 # .env when the provider offers a second usable model. Only after both paths
 # fail does the run fall back to the pure-Python indicator decision.
 AI_MODEL_FALLBACK = os.getenv("AI_MODEL_FALLBACK", "").strip()
-AI_MAX_TOKENS = 2000            # was 300: truncated single answers mid-"reason"
-                                # (finish_reason=length) and cannot hold a batch
-AI_TIMEOUT_SECONDS = 60.0
+# 2000 was too small for a 20-coin batch: the model spent the budget on prose and
+# the verdict array never arrived (finish_reason=length). 8000 holds a full batch
+# with room for every `reason` string; `AI_MAX_TOKENS_RETRY_CAP` is where a
+# truncated reply may be escalated to, so this number is the start, not the ceiling.
+AI_MAX_TOKENS = 8000
+AI_TIMEOUT_SECONDS = 90.0
 # Bound for the interactive Telegram assistant, measured across its WHOLE retry
 # ladder (not one request): a chat reply must not sit on "typing..." while the
-# ladder works through 3 attempts x 2 models x 60s.
+# ladder works through 3 attempts x 2 models x 90s.
 AI_CHAT_DEADLINE_SECONDS = 45.0
 AI_TEMPERATURE = 0.1
 # Reasoning is DISABLED on purpose: the model burns the token budget on
@@ -199,7 +245,7 @@ AI_BATCH_MAX = 20               # candidates per request; more than this is chun
 # process, so this can cost at most one request; `ai_decision.provider_caps()`
 # reports the live state in the startup and audit log lines. Decision calls only:
 # the chat assistant answers in prose and must never be forced into JSON.
-AI_JSON_MODE = os.getenv("AI_JSON_MODE", "1").strip().lower() not in ("0", "false", "no", "off")
+AI_JSON_MODE = _env_flag("AI_JSON_MODE", True)
 AI_RETRY_MAX = 3                # retry 429 / 5xx / timeout / malformed JSON
 # Ceiling for the token-escalation retry. A truncated reply (finish_reason=length
 # or an unterminated JSON block) is NOT worth the same request again, so the next
@@ -325,11 +371,15 @@ QUALITY_W_PRICE_ACTION = 15
 QUALITY_W_MTF = 10
 QUALITY_W_TRENDLINE = 5
 QUALITY_W_FUTURES = 5
-QUALITY_PRIMARY_FLOOR = 45       # primary score below this -> NO_TRADE (indicators cannot rescue)
-IND_CONFIRM_BONUS_MAX = 10       # aligned indicators add at most this (cannot trigger alone)
-IND_CONFLICT_PENALTY_MAX = 15    # opposing indicators shave at most this (secondary yields)
-QUALITY_MIN = 50                 # final setup-quality gate for a tradable setup (owner's
-                                 # tier system: below 50 is ignored, 50+ is alertable)
+QUALITY_PRIMARY_FLOOR = _env_number("QUALITY_PRIMARY_FLOOR", 45.0)  # primary score
+                                # below this -> NO_TRADE (indicators cannot rescue a non-setup)
+                                 # LOWERED: RR penalties removed from quality
+IND_CONFIRM_BONUS_MAX = _env_number("IND_CONFIRM_BONUS_MAX", 10.0)  # aligned
+                                # indicators confirm, they never trigger alone
+IND_CONFLICT_PENALTY_MAX = _env_number("IND_CONFLICT_PENALTY_MAX", 15.0)  # secondary yields
+QUALITY_MIN = _env_number("QUALITY_MIN", 50.0)       # final setup-quality gate (RR is
+                                # its own gate on top of this, not excluded here)
+                                 # RR is checked separately post-quality
 
 # ---- setup-quality exhaustion & location penalties
 # A score that only asks "how strongly does each layer agree with the
@@ -339,21 +389,31 @@ QUALITY_MIN = 50                 # final setup-quality gate for a tradable setup
 # exhaustion, Bollinger stretch, volume and achievable RR into the score as
 # multiplicative factors / subtractive points, so quality reflects tradable
 # setups rather than how bearish/bullish the tape looks.
-QUALITY_LOCATION_SEVERE_PCT = 0.15    # within 15% of the WRONG 1H range extreme
-QUALITY_LOCATION_MODERATE_PCT = 0.30  # 15-30% from the wrong extreme
-QUALITY_LOCATION_MILD_PCT = 0.45      # 30-45% from the wrong extreme
-QUALITY_LOCATION_SEVERE_FACTOR = 0.55
-QUALITY_LOCATION_MODERATE_FACTOR = 0.75
-QUALITY_LOCATION_MILD_FACTOR = 0.90
+QUALITY_LOCATION_SEVERE_PCT = _env_number("QUALITY_LOCATION_SEVERE_PCT", 0.15)  # within 15%
+                                 # LOOSENED from 0.15: more range room allowed
+QUALITY_LOCATION_MODERATE_PCT = _env_number("QUALITY_LOCATION_MODERATE_PCT", 0.30)  # 15-30%
+                                 # LOOSENED from 0.30
+QUALITY_LOCATION_MILD_PCT = _env_number("QUALITY_LOCATION_MILD_PCT", 0.45)      # 30-45%
+                                 # LOOSENED from 0.45
+QUALITY_LOCATION_SEVERE_FACTOR = _env_number("QUALITY_LOCATION_SEVERE_FACTOR", 0.55)
+                                 # LOOSENED from 0.55
+QUALITY_LOCATION_MODERATE_FACTOR = _env_number("QUALITY_LOCATION_MODERATE_FACTOR", 0.75)
+                                 # LOOSENED from 0.75
+QUALITY_LOCATION_MILD_FACTOR = _env_number("QUALITY_LOCATION_MILD_FACTOR", 0.90)
+                                 # LOOSENED from 0.90
 QUALITY_SWEEP_EXEMPT_FACTOR = 0.50    # a CONFIRMED sweep halves the location penalty
 QUALITY_RSI_OVERSOLD = 30.0           # SHORT below this = exhausted, not fresh
 QUALITY_RSI_OVERBOUGHT = 70.0         # LONG above this = exhausted, not fresh
 QUALITY_RSI_EXHAUSTION_FACTOR = 0.70
 QUALITY_BB_EXTREME_FACTOR = 0.85      # beyond the band in the trade's direction
-QUALITY_WEAK_VOLUME_FACTOR = 0.90     # last 1H volume < PA_VOLUME_WEAK x avg20
-QUALITY_DECLINING_VOLUME_FACTOR = 0.95  # volume merely below the prior candle
-QUALITY_RR_NONE_PENALTY = 30.0        # no achievable opposing target at all
-QUALITY_RR_MISS_PENALTY = 20.0        # rr < MIN_RR, scaled by how far it misses
+QUALITY_WEAK_VOLUME_FACTOR = _env_number("QUALITY_WEAK_VOLUME_FACTOR", 0.90)  # < PA_VOLUME_WEAK x avg20
+                                 # LOOSENED from 0.90: reduce volume penalty
+QUALITY_DECLINING_VOLUME_FACTOR = _env_number("QUALITY_DECLINING_VOLUME_FACTOR", 0.95)
+                                 # LOOSENED from 0.95: minor penalty only
+QUALITY_RR_NONE_PENALTY = _env_number("QUALITY_RR_NONE_PENALTY", 30.0)  # no achievable target at all
+                                 # WAS 20: no target shouldn't kill quality score
+QUALITY_RR_MISS_PENALTY = _env_number("QUALITY_RR_MISS_PENALTY", 20.0)  # rr < MIN_RR, scaled
+                                 # WAS 12: suboptimal RR is a gate, not a quality penalty
 MTF_TREND_CONFLICT_PENALTY = 10       # fresh CHoCH against the standing HTF trend
 
 # ---- directional-confirmation gate (a structural bias alone is not a trade)
@@ -369,10 +429,13 @@ DIR_MOMENTUM_CONFLICT_CONFIRMED_FACTOR = 0.90  # momentum against but structure 
 DIR_UNCONFIRMED_CHOCH_FACTOR = 0.75    # CHoCH-driven direction lacking post-CHoCH confirmation
 
 # ---- risk / reward gate (MANDATORY; never bypasses existing sizing limits)
-MIN_RR = 1.5                     # configurable minimum reward:risk
+MIN_RR = _env_number("MIN_RR", 1.5)                  # minimum reward:risk
+                                # LOOSENED from 1.5: allow setups with tighter RR
 RISK_SL_BUFFER_ATR = 0.5         # SL placed beyond the structural invalidation by this * ATR
-RISK_MAX_STOP_ATR = 3.0          # stop wider than this * ATR -> NO_TRADE (poor structure)
-RISK_MIN_TARGET_ATR = 1.0        # no opposing zone offers this much reward * ATR -> NO_TRADE
+RISK_MAX_STOP_ATR = _env_number("RISK_MAX_STOP_ATR", 3.0)  # stop wider than this * ATR
+                                # -> NO_TRADE (poor structure; a wider stop is a policy change, not a tuning knob)
+RISK_MIN_TARGET_ATR = _env_number("RISK_MIN_TARGET_ATR", 1.0)  # no opposing zone offers
+                                # this much reward * ATR -> NO_TRADE
                                 # (judged per zone AFTER RISK_TARGET_ZONE_PAD_ATR, so a zone the
                                 # target would land inside still counts as no room)
 RISK_MAX_SPREAD_PCT = 0.0015     # spread wider than this (when known) -> NO_TRADE
@@ -384,7 +447,7 @@ RISK_TARGET_ZONE_PAD_ATR = 0.25  # target placed this * ATR short of the opposin
 # into NO_TRADE while a usable zone several ATR deeper went unread (21/37 coins
 # in the 2026-09-02 live scan died of `no_clear_target`/`target_too_close`).
 # False restores the original nearest-zone-only behaviour.
-RISK_TARGET_SCAN_ZONES = True
+RISK_TARGET_SCAN_ZONES = _env_flag("RISK_TARGET_SCAN_ZONES", True)
 
 # ---- decision engine
 # Master switch for the price-action core vs the legacy funnel scorer.
@@ -400,15 +463,21 @@ DECISION_ENABLED = True
 # emitted its verdict by the time the batch returns, and nothing re-reads it.
 # Applying a verdict exists only behind `--force-llm` (see main.run_force_llm),
 # where post-LLM gates re-validate it. False: no requests, no spend, no audit.
+#
+# (A stale comment here and on `main` claimed the LLM "makes the FINAL BUY/SELL/HOLD
+# call". It never has, and a config file promising a capability the pipeline lacks
+# is worse than no comment: it invites someone to disable the deterministic gates
+# "because the model decides anyway". The docs now describe the audit stage.)
 LLM_DECISION_ENABLED = True      # False -> no AI audit; alerts are identical
+
 # ---- alert tier system (owner's rule, 2026-09-01) ----
 # Below 50: ignored (log-only, never alerts). 50-60: NORMAL alert.
 # 60-70: HIGH alert. 70-100: STRONGEST alert. The tier is read from the
 # confidence the pipeline computed (setup-quality after the no-sweep cap).
-ALERT_QUALITY_MIN = 50           # Telegram alert floor; a BUY/SELL below this is log-only
-ALERT_TIER_NORMAL_MIN = 50       # 50.0-59.9 -> NORMAL
-ALERT_TIER_HIGH_MIN = 60         # 60.0-69.9 -> HIGH
-ALERT_TIER_STRONG_MIN = 70       # 70.0+     -> STRONG
+ALERT_QUALITY_MIN = _env_number("ALERT_QUALITY_MIN", 50.0)
+ALERT_TIER_NORMAL_MIN = _env_number("ALERT_TIER_NORMAL_MIN", 50.0)
+ALERT_TIER_HIGH_MIN = _env_number("ALERT_TIER_HIGH_MIN", 60.0)
+ALERT_TIER_STRONG_MIN = _env_number("ALERT_TIER_STRONG_MIN", 70.0)
 
 # ---- news verification engine (VERIFY FIRST — AI never decides what is true)
 NEWS_ENABLED = False             # news engine OFF (owner's call, 2026-08-30)
@@ -529,6 +598,30 @@ def check_config_warnings() -> list[str]:
     if not OPENROUTER_API_KEY and AI_MODEL:
         warnings.append("AI_MODEL is set but no API key is configured — the AI stage "
                         "is off (explanations use the local template; nothing breaks)")
+
+    # Tuned floors: an override is allowed, an override that empties a rule is not.
+    # The lower edge of each band is the spec value minus a small tolerance, so a
+    # loosening (the thing that gets done under pressure at 18:40 IST) is reported
+    # rather than silently accepted: it is not forbidden, it is *visible*, and the
+    # journal then explains an acceptance rate nobody expected.
+    for name, value, low, high in (
+            ("QUALITY_PRIMARY_FLOOR", QUALITY_PRIMARY_FLOOR, 36.0, 90.0),
+            ("QUALITY_MIN", QUALITY_MIN, 40.0, 90.0),
+            ("ALERT_QUALITY_MIN", ALERT_QUALITY_MIN, 40.0, 95.0),
+            ("MIN_RR", MIN_RR, 1.0, 5.0),
+            ("RISK_MIN_TARGET_ATR", RISK_MIN_TARGET_ATR, 0.5, 5.0),
+            ("RISK_MAX_STOP_ATR", RISK_MAX_STOP_ATR, 1.0, 10.0)):
+        if not low <= value <= high:
+            warnings.append(f"{name}={value:g} is outside the band [{low:g}, {high:g}] the "
+                            "strategy is written against; the bot still runs, but its "
+                            "acceptance rate no longer means what the docs claim")
+    if QUALITY_RR_NONE_PENALTY <= 0 and QUALITY_RR_MISS_PENALTY <= 0 and MIN_RR <= 0:
+        warnings.append("reward:risk is enforced NOWHERE: both quality RR penalties are 0 "
+                        "and MIN_RR is off — every unmeasurable target becomes a signal")
+    if ALERT_QUALITY_MIN > QUALITY_MIN:
+        warnings.append(f"ALERT_QUALITY_MIN ({ALERT_QUALITY_MIN:g}) is above QUALITY_MIN "
+                        f"({QUALITY_MIN:g}): setups clear the decision gate and are then "
+                        "dropped as log-only, which reads like gate rejections in the funnel")
     return warnings
 
 CSV_COLUMNS = ["timestamp", "signal_id", "coin", "signal", "entry", "SL", "TP", "RR",

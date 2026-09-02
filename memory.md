@@ -7,7 +7,7 @@ The bot now decides on a **deterministic price-action & market-context core**
 LONG/SHORT/NO_TRADE; RSI/EMA/VWAP/Bollinger are **secondary confirmation only**.
 The owner's handwritten note (**[strategy_spec.md](strategy_spec.md)**) is the
 documented secondary layer. The LLM writes the **explanation** and audits the
-verdict in the background — it never decides. **517 unit tests pass.**
+verdict in the background — it never decides. **533 unit tests pass.**
 
 ## All decisions finalized
 - **Exchange:** Binance USDT-M **futures** (CCXT public, no keys, signals-only)
@@ -167,9 +167,11 @@ covers `signals_log*.csv*` / `ai_opinions.csv*` / `*.bak`, and a test asserts no
 tracked file is a log or a rotation — `main` currently tracks `signals_log.csv.v1.bak`
 (984 live rows), which the merge must drop with `git rm --cached`.
 
-## Second live log (2026-09-02 12:07, PID 37708) — gates off, still zero alerts
-`main` removed `no_clear_target`/`poor_rr` from `risk_gate.evaluate` and dropped the
-floors to 30/35/25 with `MIN_RR=1.2`; the scan still ended `signals 0 (holds 41)`.
+## Second live log (2026-09-02 12:07 **UTC** = 17:37 IST, PID 37708) — still zero alerts
+Journalctl timestamps are UTC, so this scan is 40 minutes AFTER main's 16:19-16:57 IST
+commits. The server's HEAD is `f7dcbda` — the aggressive floor loosening (`MIN_RR=1.2`,
+30/35/25) — and NOT `94d7d9b`'s gate commenting, which is why the CSV rows still carry
+`no_clear_target`/`poor_rr`/`no_structure_stop`. The scan still ended `signals 0 (holds 41)`.
 Reading the last 41 rows of `signals_log.csv` (the reason codes, not the prose the
 alert shows) shows why: the two removed codes were never the whole gate —
 `stop_too_wide`, `target_too_close` and `into_opposing_zone` are still live, and
@@ -186,6 +188,25 @@ Deployed-code tells in that same log, for the record: `exchange returned 28 rows
 was running `main`. Owner-side `.env` fix confirmed applied: `AI_BASE_URL=https://
 openrouter.ai/api/v1` (it had held a markdown link, which failed every AI call and
 burned `AI_DAILY_BUDGET` on retries).
+
+## Merged into `main` (2026-09-02, PR #2) — what the deployed build now is
+`main` now equals this branch: the reachable-target gate, the restored
+`no_clear_target`/`poor_rr`/`no_structure_stop` checks, the AI output contract
+(JSON mode + tolerant extraction + correction/escalation retries), the audit-only
+log lines, the security hygiene and the diagnostics. Kept from `main`'s own commits:
+`AI_MAX_TOKENS=8000`, `AI_TIMEOUT_SECONDS=90` and the penalty-stacking floor
+(`setup_quality` combines penalties as `max(0.5, min(...))` instead of multiplying
+0.55×0.90×0.70 into a 65% haircut). Reverted to spec and made `.env`-tunable
+(`_env_number`, with `check_config_warnings()` reporting any override outside the
+band): the floors `f7dcbda` loosened by 10-35%, `IND_CONFIRM_BONUS_MAX 10` /
+`IND_CONFLICT_PENALTY_MAX 15` (indicators confirm, they do not trigger) and both RR
+quality penalties (main zeroed them *while* disabling the RR gate — RR enforced
+nowhere, which is now a named startup warning). `signals_log.csv.v1.bak` (984 live
+rows) is untracked (`git rm --cached`, file left on disk) and the ignore rules now
+cover every rotation. The five Sep-02 tuning guides were kept and banner-corrected:
+the server ran `f7dcbda` (16:28 IST) at the time of the 12:07/12:20 UTC logs, so the
+gate-commenting commits never executed on it and the "signals restored 0→2" claim was
+never reproduced by the deployed build.
 
 ## Interpretation decisions (documented)
 - Sweep is heavily weighted, not a hard gate — owner's decision; requiring it
