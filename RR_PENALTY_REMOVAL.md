@@ -29,7 +29,7 @@ Example: (54 * 0.65) + 5 - 20 = 15.1 ❌
 ```
 Quality = (primary * exhaustion) + indicator
 Example: (54 * 0.65) + 5 = 35.1 ✅
-Then check RR in a separate gate post-quality
+Then check RR in the mandatory risk gate post-quality
 ```
 
 ## Config Changes
@@ -39,7 +39,7 @@ Then check RR in a separate gate post-quality
 | `QUALITY_RR_NONE_PENALTY` | 20 | 0 | ❌ Removes -20 subtractive for no target |
 | `QUALITY_RR_MISS_PENALTY` | 12 | 0 | ❌ Removes -12 for suboptimal RR |
 | `QUALITY_MIN` | 42 | 35 | Adjusted for score distribution |
-| `QUALITY_PRIMARY_FLOOR` | 35 | 25 | Lower floor, RR no longer in scoring |
+| `QUALITY_PRIMARY_FLOOR` | 35 | 35 | Preserve primary evidence floor |
 | `ALERT_QUALITY_MIN` | 38 | 30 | More signals alert |
 | `ALERT_TIER_NORMAL_MIN` | 50 | 40 | Redistributed tiers |
 | `ALERT_TIER_HIGH_MIN` | 60 | 50 | Redistributed tiers |
@@ -55,7 +55,7 @@ DELL/USDT: quality=38.4 ❌ HOLD (RR killed it)
 ### After
 ```
 DELL/USDT: quality=38.4 ✅ ALERT LOW
-(RR checked separately - if fails, alert is tagged "RR below 1.2" but doesn't kill signal)
+(RR is checked separately and still blocks execution if it fails.)
 ```
 
 ### Signal Volume Expected
@@ -64,10 +64,10 @@ DELL/USDT: quality=38.4 ✅ ALERT LOW
 
 ## Where RR is Now Validated
 
-RR is still checked, but in `decision.py` after quality passes:
-- In the Python fallback path (indicator decision)
-- In post-LLM validation gates
-- Alert will show `RR=0.88 below MIN_RR=1.2` in reason, but signal won't be rejected just for RR
+RR is still checked by `risk_gate.py` after quality is calculated:
+- `poor_rr`, `no_clear_target`, and `no_structure_stop` remain vetoes
+- RR penalties are excluded from the quality number, so ranking is not distorted
+- A setup must still pass the risk gate before becoming a trade signal
 
 ## Testing
 
@@ -97,7 +97,7 @@ INFO | logger | DELL/USDT HOLD 458.5 ❌
 1. **Quality now measures market structure fitness** (bias, S/R, liquidity, price-action, MTF alignment)
 2. **RR is validation, not evidence** — poor RR doesn't mean bad structure
 3. **Signals can now surface** with quality >= 30, even if RR is suboptimal
-4. **Owner can then manually check** RR before trading (bot sends alert with full details)
+4. **Only risk-valid setups alert**; RR remains available in the full decision details
 
 ## Rollback (if signals are too aggressive)
 
