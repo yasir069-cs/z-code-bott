@@ -58,10 +58,25 @@ explanation transport below is retained for a later phase.
   model `deepseek-v4-flash`; `AI_MODEL_FALLBACK` is empty by default (the key
   serves one model), then the local template.
 - **Batched:** all candidates from one scan go in one request (sorted by
-  setup_quality, chunked at `AI_BATCH_MAX = 20`), returning a JSON **array** keyed
-  by symbol — so the free tier's 50-requests/day cap stops binding and scan time
-  stays low. 20 is deliberate: a full scan's shortlist fits in ONE request, so
-  under an always-on `/scan_on` session the day's budget is the only limit.
+  setup_quality, chunked at `AI_BATCH_MAX = 20`), returning one JSON object
+  `{"decisions": [ … ]}` keyed by symbol — a bare array is still accepted — so the
+  free tier's 50-requests/day cap stops binding and scan time stays low. 20 is
+  deliberate: a full scan's shortlist fits in ONE request, so under an always-on
+  `/scan_on` session the day's budget is the only limit.
+- **Output contract:** the batch request sets `response_format={"type":"json_object"}`,
+  so the provider is constrained to JSON rather than merely asked for it. A gateway
+  that rejects the field is detected on its first 400 and the capability is switched
+  off for the process (`ai_decision.provider_caps()`). Replies are still read
+  tolerantly — prose around the JSON is skipped, ``` fences stripped, a reply cut
+  off by `max_tokens` salvaged back to its last complete verdict — and a truncated
+  answer is retried with a correction turn and a larger token budget
+  (`AI_MAX_TOKENS_RETRY_CAP`) instead of the same request three times. Nothing is
+  ever invented for a setup the model did not answer.
+- **`ai_used`** in `signals_log.csv` means "a model verdict replaced the
+  deterministic one", which scheduled scans never do: `ai_used=False` on every row
+  is the designed value, not an outage. The audit outcome is the `AI AUDIT …`
+  journal line (`x/y answered | LONG n SHORT n NO_TRADE n | applied=never`) and
+  `ai_opinions.csv`.
 - **Retry:** 3 attempts per model with exponential backoff on 429 / 5xx / timeout
   / malformed JSON before falling to the next model.
 - `AI_MAX_TOKENS = 2000` (a batch needs the room; 300 used to truncate answers
@@ -101,6 +116,8 @@ OPENROUTER_API_KEY=<provider key>           # optional; AGENTROUTER_API_KEY also
 AI_BASE_URL=https://agentrouter.org/v1      # optional; any OpenAI-compatible provider
 AI_MODEL=deepseek-v4-flash                  # optional override
 AI_MODEL_FALLBACK=                          # optional; empty = primary model only
+AI_JSON_MODE=1                              # optional; 0 = don't send response_format
+AI_MAX_TOKENS_RETRY_CAP=12000               # optional; ceiling for a truncated reply
 ACCOUNT_BALANCE=1000                    # optional; USDT balance for position sizing
 RISK_PER_TRADE_PCT=2.0                  # optional; max % risk per trade
 LOG_LEVEL=INFO                          # optional
@@ -218,7 +235,7 @@ OHLCV cache + concurrency + exclusions + OI history). **Decision core:**
 `ai_decision.py` (batch + retry + budget), `fallback.py` (local explanation),
 `duplicate_guard.py`, `alerts.py`, `telegram_bot.py` (chat listener),
 `chat_assistant.py`, `logger.py`, `backtest.py` (logged-signal + `--strategy`
-replay), `requirements.txt`. Plus `tests/` (485 tests) and `scripts/`.
+replay), `requirements.txt`. Plus `tests/` (509 tests) and `scripts/`.
 Spec docs live in the repo root; **[price_action_spec.md](price_action_spec.md)**
 is the primary authority, **[strategy_spec.md](strategy_spec.md)** the secondary
 indicator layer, and `memory.md` tracks progress.

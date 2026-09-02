@@ -106,3 +106,47 @@ def test_unknown_fix_layer_is_rejected_by_the_cli(tmp_path, capsys, monkeypatch)
     else:
         raise AssertionError("unknown --fix layer must exit non-zero")
     assert "unknown --fix layer" in capsys.readouterr().err
+
+
+def test_the_log_is_found_even_when_the_script_runs_from_a_copy(tmp_path, monkeypatch):
+    """Run as `/tmp/why.py`, `parents[1]` of the script is `/` — the default used to
+    resolve to `/signals_log.csv` and report "nothing to analyse" beside a log with
+    a thousand rows in it. Config is the authority, the working directory is the
+    fallback, and an explicit path always wins.
+    """
+    import config
+
+    log = tmp_path / "signals_log.csv"
+    log.write_text("timestamp,coin\n")
+    monkeypatch.chdir(tmp_path)
+
+    elsewhere = tmp_path / "elsewhere.csv"          # what the bot's config points at
+    elsewhere.write_text("timestamp,coin\n")
+    monkeypatch.setattr(config, "SIGNALS_LOG_FILE", elsewhere)
+    assert wns.resolve_log_path(None) == elsewhere
+
+    # A config path that does not exist must not win over a real log next door:
+    # the bot may be configured for another directory while the rows are here.
+    monkeypatch.setattr(config, "SIGNALS_LOG_FILE", tmp_path / "missing.csv")
+    assert wns.resolve_log_path(None) == log
+
+    tmp_path.joinpath("signals_log.csv").unlink()
+    assert wns.resolve_log_path(None) == tmp_path / "missing.csv"   # names the config path
+
+    assert wns.resolve_log_path("~/custom.csv") == Path.home() / "custom.csv"
+    assert log in wns.log_candidates()
+
+
+def test_a_missing_log_says_where_it_looked(tmp_path, monkeypatch, capsys):
+    import config
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "SIGNALS_LOG_FILE", tmp_path / "nope.csv")
+    monkeypatch.setattr(sys, "argv", ["why.py", "--log", str(tmp_path / "absent.csv"),
+                                      "--alert-min", "50"])
+    try:
+        wns.main()
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("a missing log must exit non-zero, not print an empty report")
+    assert "looked in" in capsys.readouterr().err

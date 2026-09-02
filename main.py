@@ -953,6 +953,24 @@ def main() -> None:
              "configured" if config.TELEGRAM_TOKEN else "NOT configured",
              "configured" if config.OPENROUTER_API_KEY else "NOT configured")
 
+    # One line that states what the AI stage actually is, because "AI enabled" was
+    # readable four different ways: which model, whether the provider is being
+    # asked for JSON it must obey, how the token budget is sized, and — the one
+    # people keep getting wrong — that the answer is AUDITED, never applied. When
+    # `ai_used=False` shows up on every row, this line is the first thing to read:
+    # it is the expected value for a scheduled scan, not a failure.
+    log.info("AI CONTRACT: audit-only (deterministic verdict is what ships; "
+             "--force-llm is the only path that applies a model verdict) | "
+             "queue=every decided setup incl. HOLDs | model=%s fallback=%s | "
+             "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
+             "batch=%d retries=%d budget=%d/day | LLM_DECISION_ENABLED=%s",
+             config.AI_MODEL, config.AI_MODEL_FALLBACK or "none",
+             "on" if config.AI_JSON_MODE else "off",
+             "on" if config.AI_REASONING_ENABLED else "off",
+             config.AI_MAX_TOKENS, config.AI_MAX_TOKENS_RETRY_CAP,
+             config.AI_TIMEOUT_SECONDS, config.AI_BATCH_MAX, config.AI_RETRY_MAX,
+             config.AI_DAILY_BUDGET, config.LLM_DECISION_ENABLED)
+
     # News verification engine: discovery -> deterministic verification ->
     # (VERIFIED only) AI summary + impact analysis -> Telegram. Verification
     # and interpretation stay separate; news never feeds trading signals.

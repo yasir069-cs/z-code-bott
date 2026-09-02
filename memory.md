@@ -7,7 +7,7 @@ The bot now decides on a **deterministic price-action & market-context core**
 LONG/SHORT/NO_TRADE; RSI/EMA/VWAP/Bollinger are **secondary confirmation only**.
 The owner's handwritten note (**[strategy_spec.md](strategy_spec.md)**) is the
 documented secondary layer. The LLM writes the **explanation** and audits the
-verdict in the background — it never decides. **485 unit tests pass.**
+verdict in the background — it never decides. **509 unit tests pass.**
 
 ## All decisions finalized
 - **Exchange:** Binance USDT-M **futures** (CCXT public, no keys, signals-only)
@@ -135,6 +135,30 @@ as a bounded confirmation sub-score (`scoring.indicator_confirmation`), not a ga
   `support_resistance` never emits, so every entry was a permanent None. Distance
   is now derived from the zone mid against the traded price and the block is
   omitted entirely when there is no price to measure from.
+
+## AI output contract (2026-09-02, after the .env fix — HTTP 200 but `ai_used=False`)
+Restarting with a clean `AI_BASE_URL` made the provider reachable (`AI provider HTTP
+status: 200`), yet every row still logged `ai_used=False`: `nvidia/nemotron-3-ultra`
+answered with analysis prose, the extractor only stripped a fence at the very start
+and sliced first-`[`-to-last-`]`, and the ladder replayed the identical doomed
+request `AI_RETRY_MAX` times per model. `news_analysis.py` had already solved this on
+the same gateway (`response_format` + a 400 retry); the decision batch path simply
+never got it. Now: the batch prompt requires one object `{"decisions": [ … ]}` and
+JSON mode is requested from the provider (learned-off on the first 400 naming the
+field); `_extract_json`/`_extract_json_array` skip prose anywhere, honour quotes
+while bracket-matching, and salvage a truncated block to its last complete element;
+a parse failure is retried with a correction turn and, when `finish_reason=length`,
+with a bigger `max_tokens` (new `AI_JSON_MODE`, `AI_MAX_TOKENS_RETRY_CAP`, both
+`.env`-overridable); `parse_verdict` also unwraps a batch envelope, so a single-setup
+answer in batch shape is understood instead of dropped. The audit outcome is one
+`AI AUDIT` line per scan plus `AIOpinionWorker.status()`. The gates were NOT touched
+(owner's instruction, still in force) and `ai_used` still means "a model verdict
+replaced the deterministic one" — False on scheduled scans is correct.
+`scripts/why_no_signals.py` default path fixed (it resolved `/signals_log.csv` when
+run from a copy; now config → cwd → known locations, plus `--log`). `.gitignore`
+covers `signals_log*.csv*` / `ai_opinions.csv*` / `*.bak`, and a test asserts no
+tracked file is a log or a rotation — `main` currently tracks `signals_log.csv.v1.bak`
+(984 live rows), which the merge must drop with `git rm --cached`.
 
 ## Second live log (2026-09-02 12:07, PID 37708) — gates off, still zero alerts
 `main` removed `no_clear_target`/`poor_rr` from `risk_gate.evaluate` and dropped the

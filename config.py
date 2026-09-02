@@ -190,7 +190,22 @@ AI_REASONING_ENABLED = False
 AI_BATCH_ENABLED = True
 AI_BATCH_MAX = 20               # candidates per request; more than this is chunked
                                 # (20 fits a full scan's shortlist in ONE request)
+# Structured-output enforcement. True asks the provider to CONSTRAIN the reply to
+# a JSON object (`response_format={"type":"json_object"}`) instead of merely
+# requesting one — the difference between "please" and "the API will not return
+# prose". The prompts therefore require the object envelope `{"decisions": [...]}`
+# (a bare array is still accepted by the parser). A gateway that rejects the
+# field is detected on its first 400 and the capability is switched off for the
+# process, so this can cost at most one request; `ai_decision.provider_caps()`
+# reports the live state in the startup and audit log lines. Decision calls only:
+# the chat assistant answers in prose and must never be forced into JSON.
+AI_JSON_MODE = os.getenv("AI_JSON_MODE", "1").strip().lower() not in ("0", "false", "no", "off")
 AI_RETRY_MAX = 3                # retry 429 / 5xx / timeout / malformed JSON
+# Ceiling for the token-escalation retry. A truncated reply (finish_reason=length
+# or an unterminated JSON block) is NOT worth the same request again, so the next
+# attempt is given more room — up to here — before the batch is abandoned. Sized
+# for a 20-setup batch: ~600 tokens per verdict object plus the model's own prose.
+AI_MAX_TOKENS_RETRY_CAP = int(os.getenv("AI_MAX_TOKENS_RETRY_CAP", "12000"))
 AI_RETRY_BACKOFF_BASE = 1.0     # 1s, 2s, 4s
 AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "50"))  # advisory daily request cap
 

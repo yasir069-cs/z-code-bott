@@ -122,3 +122,23 @@ def test_duplicate_fallback_model_is_reported(monkeypatch):
     monkeypatch.setattr(config, "AI_MODEL", "deepseek-v4-flash")
     monkeypatch.setattr(config, "AI_MODEL_FALLBACK", "deepseek-v4-flash")
     assert any("equals AI_MODEL" in w for w in config.check_config_warnings())
+
+
+def test_live_log_rotations_are_ignored_by_git():
+    """`signals_log.csv.v1.bak` (984 live rows) was once committed on `main`.
+
+    The logger archives the old file whenever the column set grows, so a rotation
+    lands next to the log on every deploy; a history dump of who was told to trade
+    what is not a source file. Both halves are pinned: nothing tracked contains a
+    log name or a `.bak`, and git still ignores one if it appears.
+    """
+    import subprocess
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    tracked = subprocess.run(["git", "ls-files"], capture_output=True, text=True,
+                             cwd=str(repo)).stdout.split()
+    assert tracked, "not run inside the repo — the check would pass vacuously"
+    assert not [f for f in tracked if ".bak" in f or "signals_log" in f or "ai_opinions" in f]
+    for name in ("signals_log.csv.v1.bak", "ai_opinions.csv.v2.bak", "signals_log.csv"):
+        probe = subprocess.run(["git", "check-ignore", "-q", name], capture_output=True,
+                               cwd=str(repo))
+        assert probe.returncode == 0, name + " is not ignored"

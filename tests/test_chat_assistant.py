@@ -143,3 +143,50 @@ def test_assistant_retries_and_degrades_honestly(monkeypatch):
     assert "RSI is" not in reply                     # no fabricated answer
     assert ai_decision.budget_status()["used"] == config.AI_RETRY_MAX
     ai_decision.reset_budget()
+
+
+def test_status_reports_the_last_ai_batch_and_the_contract(monkeypatch):
+    """"AI is on" must mean "the last batch got answers", not "a model is
+    configured" — the live box had HTTP 200, prose replies and `ai_used=False`,
+    and /status still said the model name as if that were news."""
+    class _Worker:
+        def status(self):
+            return {"last_status": "SUCCESS", "answered": 2, "expected": 3,
+                    "tally": {"LONG": 1, "SHORT": 0, "NO_TRADE": 1, "NO_ANSWER": 1,
+                              "AGREE": 1, "VETO_PROPOSED": 0, "SIGNAL_PROPOSED": 1,
+                              "DISAGREE": 0},
+                    "last_error": ""}
+
+    import main
+    monkeypatch.setattr(main, "_ai_worker", _Worker(), raising=True)
+    text = chat_assistant.get_bot_status_summary()
+    assert "AI Audit: SUCCESS — 2/3 setups answered" in text
+    assert "LONG 1 SHORT 0 NO_TRADE 1 no-answer 1" in text
+    assert "audit-only, never applied to a shipped signal" in text
+    assert "response_format=json_object" in text
+
+
+def test_status_survives_a_worker_that_cannot_answer(monkeypatch):
+    """A broken worker must degrade to no extra line, not a broken /status."""
+    class _Broken:
+        def status(self):
+            raise RuntimeError("worker is gone")
+
+    import main
+    monkeypatch.setattr(main, "_ai_worker", _Broken(), raising=True)
+    text = chat_assistant.get_bot_status_summary()
+    assert "AI Audit" not in text
+    assert "BOT HEALTH" in text
+
+
+def test_status_shows_the_last_batch_error_verbatim(monkeypatch):
+    class _Worker:
+        def status(self):
+            return {"last_status": "FAILED", "answered": 0, "expected": 41,
+                    "tally": {}, "last_error": "AIDecisionError: reply was prose"}
+
+    import main
+    monkeypatch.setattr(main, "_ai_worker", _Worker(), raising=True)
+    text = chat_assistant.get_bot_status_summary()
+    assert "0/41 setups answered" in text
+    assert "reply was prose" in text
