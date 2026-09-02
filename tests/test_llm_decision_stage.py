@@ -304,3 +304,72 @@ def test_deterministic_decision_unchanged_by_stage():
     assert signal == "BUY"                    # the funnel's LONG still alerts
     out, s, ai_used, _ = _apply_llm_verdict(d, None, "T")
     assert out is d and s == signal and ai_used is False
+
+
+# ── prompt fidelity: what the model is told must match what the code measured ─
+
+def _sweep_bundle():
+    """A candidate exactly as the scheduled scan now builds it: feat_1h carried."""
+    d = _decide(UPTREND)
+    sweep = {"direction": "SELL", "age_candles": 2, "level": 100.5,
+             "wick": 0.9, "wick_body_ratio": 3.2, "volume_ratio": 2.1}
+    cand = {"symbol": "TEST/USDT:USDT", "direction": "BUY", "fr": None,
+            "feat_1h": {"sweep": sweep, "indicators": d["snaps"]["1h"]}}
+    return cand, d, sweep
+
+
+def test_scheduled_scan_no_longer_drops_the_1h_features():
+    """Regression: STEP 4 built `feat_1h` from filter_1h but appended only
+    {symbol, direction, df_1h, fr}, so every scheduled prompt said "sweep: none
+    detected" and the band-aid `c["feat_1h"] = c.get("feat_1h") or {}` hid it."""
+    import inspect
+    import main
+    src = inspect.getsource(main._run_scan_locked)
+    assert '"feat_1h": feat' in src, "1H features must travel with the candidate"
+    assert 'c["feat_1h"] = c.get("feat_1h")' not in src, \
+        "the silent default must not come back"
+
+
+def test_bundle_and_prompt_reach_the_model_with_a_real_sweep():
+    from main import _build_decision_bundle
+    cand, d, sweep = _sweep_bundle()
+    bundle = _build_decision_bundle(cand, d, d["snaps"]["5m"], last_price=None)
+    assert bundle["sweep"] == sweep
+    prompt = ai_decision.build_decision_prompt(bundle)
+    assert "Liquidation sweep: SELL side, 2 candles ago" in prompt
+    assert "none detected in recent 1H candles" not in prompt
+
+
+def test_liquidity_flags_are_labelled_with_the_sides_they_sweep():
+    """liquidity.py calls a swept SELL-side pool `long_ready`; the prompt used to
+    print it as "buy-side sweep", telling the model the inverse of the fact."""
+    liq = {"long_ready": True, "short_ready": False,
+           "equal_lows": [1, 2], "equal_highs": [],
+           "sweep": {"age_candles": 1, "confirmed": True, "ready": True,
+                     "side": "sell-side", "direction": "BUY"}}
+    facts = ai_decision._facts_block({"liquidity": liq, "risk": {}})
+    assert "sell-side sweep confirmed (supports LONG)=True" in facts
+    assert "buy-side sweep confirmed (supports SHORT)=False" in facts
+    assert "buy-side sweep=True" not in facts
+    assert "equal lows=2" in facts
+    assert "Most recent sweep: sell-side pool, 1 candle(s) ago" in facts
+
+
+def test_range_position_names_the_real_window():
+    """indicators.range_pos spans CANDLE_LIMIT candles; the prompt said 20, so
+    the model read 0.07 as a 20-bar extreme instead of a 50-bar one."""
+    line = ai_decision._range_line({"range_pos": 0.07})
+    assert f"{config.CANDLE_LIMIT}-candle low" in line
+    assert f"{config.CANDLE_LIMIT}-candle high" in line
+    assert "20-candle low" not in line
+    assert "swing low/high (20)" in line          # the swing window, correctly named
+
+
+def test_target_zone_note_reaches_the_prompt():
+    """The TP is no longer assumed to come from the nearest zone, so the prompt
+    has to say which zone it did come from."""
+    liq = {"risk": {"sl": 100.0, "tp": 95.4, "rr": 2.2,
+                    "target_note": "support zone@94.6 (1 nearer opposing zone(s) "
+                                   "unusable or too close)"}}
+    facts = ai_decision._facts_block(liq)
+    assert "target from support zone@94.6" in facts

@@ -9,6 +9,14 @@ Outcome rules (conservative):
   * candle hits TP first -> win            (+RR of the signal)
   * neither within the horizon -> OPEN     (unrealized R at last close)
 
+Two modes, both scoring only CLOSED outcomes against future 5M candles:
+  * default            — replays what `signals_log.csv` recorded (so the numbers
+                         describe the alerts the owner actually received)
+  * `--strategy SYM`   — re-runs the live decision core over recent history,
+                         with the live alert floor applied and the fetch-time
+                         context it cannot reconstruct (funding, OI) listed in
+                         the report's "Replay limits" block
+
 Usage:
     python backtest.py                        # uses signals_log.csv
     python backtest.py --log path/log.csv --horizon-hours 24
@@ -78,9 +86,21 @@ def evaluate_signal(sig: dict, fetcher: CandleFetcher, horizon_hours: int = 24) 
     ts_utc = ts.astimezone(timezone.utc)
     horizon = ts_utc + timedelta(hours=horizon_hours)
     df = fetcher(sig["coin"], ts_utc + timedelta(minutes=5), horizon)
+    entry0, sl0, tp0 = float(sig["entry"]), float(sig["SL"]), float(sig["TP"])
+    # A blank/absent RR is DERIVED from the levels, never defaulted to a round
+    # number: crediting every row without an RR as a 2R win inflated the reported
+    # average with a figure the strategy never produced. reward/risk is geometry.
+    logged_rr = None
+    try:
+        logged_rr = float(sig.get("RR")) if sig.get("RR") not in (None, "") else None
+    except (TypeError, ValueError):
+        logged_rr = None
+    if logged_rr is None:
+        gap = abs(entry0 - sl0)
+        logged_rr = round(abs(tp0 - entry0) / gap, 2) if gap > 0 else 0.0
     result = {"coin": sig["coin"], "signal": sig["signal"], "timestamp": sig["timestamp"],
-              "entry": float(sig["entry"]), "SL": float(sig["SL"]), "TP": float(sig["TP"]),
-              "RR": float(sig["RR"]) if sig["RR"] else 2.0, "outcome": "NO_DATA", "r": 0.0}
+              "entry": entry0, "SL": sl0, "TP": tp0,
+              "RR": logged_rr, "outcome": "NO_DATA", "r": 0.0}
     if df is None or df.empty:
         return result
 
@@ -158,8 +178,9 @@ def _slice_frames(frames_full: dict, c5: pd.Timestamp) -> dict:
 
 
 def replay_strategy(symbol: str, frames_full: dict, horizon_hours: int = 24,
-                    decide_fn=None) -> list[dict]:
-    """Replay decision.decide over the 5M history and score each LONG/SHORT.
+                    decide_fn=None, min_quality: Optional[float] = None,
+                    stats: Optional[dict] = None) -> list[dict]:
+    """Replay decision.decide over the 5M history and score each alertable setup.
 
     For every 5M bar we hand the decider the multi-TF frames sliced to that
     bar's close (via :func:`_slice_frames`), then simulate the fill with the
@@ -168,10 +189,20 @@ def replay_strategy(symbol: str, frames_full: dict, horizon_hours: int = 24,
     skipped, mirroring the live HOLD (silent). A per-coin cooldown mirrors the
     live duplicate guard so one setup is not re-emitted every 5 minutes.
 
+    `min_quality` defaults to `config.ALERT_QUALITY_MIN` — the live floor a
+    BUY/SELL has to clear to reach Telegram. Scoring a sub-floor decision as a
+    signal would report trades the owner was never alerted to (they are logged
+    log-only, live and here). Pass 0 to replay every LONG/SHORT decision
+    regardless of tier.
+
     *decide_fn* defaults to the live :func:`decision.decide` (resolved at call
     time so it can be monkeypatched); pass a stub to test the harness alone.
+    `stats`, when given, is filled with the per-bar counts the report needs
+    (bars, no_trade, logged_only, alerted) so the return value stays a list.
     """
     decide = decide_fn or decision_core.decide
+    if min_quality is None:
+        min_quality = getattr(config, "ALERT_QUALITY_MIN", 0.0)
     entry_df = frames_full.get(config.TF_ENTRY)
     if entry_df is None or entry_df.empty:
         return []
@@ -184,8 +215,10 @@ def replay_strategy(symbol: str, frames_full: dict, horizon_hours: int = 24,
     cooldown = timedelta(minutes=config.DUPLICATE_COOLDOWN_MIN)
     results: list[dict] = []
     last_emit: Optional[datetime] = None
+    bars = no_trade = logged_only = 0
 
     for open_ts in entry_df.index:
+        bars += 1
         emit_dt = open_ts.to_pydatetime()
         if last_emit is not None and emit_dt < last_emit + cooldown:
             continue
@@ -193,6 +226,12 @@ def replay_strategy(symbol: str, frames_full: dict, horizon_hours: int = 24,
         d = decide(frames)
         word = _STRAT_SIGNAL_MAP.get(d.get("decision"))
         if word is None:  # NO_TRADE -> silent, exactly like a live HOLD
+            no_trade += 1
+            continue
+        quality = d.get("setup_quality") or 0.0
+        if min_quality and quality < min_quality:
+            # live: written to signals_log.csv, never alerted
+            logged_only += 1
             continue
         sig = {
             "timestamp": open_ts.astimezone(config.TZ).isoformat(),
@@ -203,6 +242,9 @@ def replay_strategy(symbol: str, frames_full: dict, horizon_hours: int = 24,
         }
         results.append(evaluate_signal(sig, fill_fetcher, horizon_hours))
         last_emit = emit_dt
+    if stats is not None:
+        stats.update({"bars_evaluated": bars, "no_trade": no_trade,
+                      "logged_only": logged_only, "alerted": len(results)})
     return results
 
 
@@ -233,15 +275,35 @@ def run_strategy_backtest(symbol: str, exchange, horizon_hours: int = 24) -> dic
     if missing:
         log.warning("strategy backtest: no candle data for %s on %s", missing, symbol)
         return _summarize([], 0, horizon_hours)
-    results = replay_strategy(symbol, frames_full, horizon_hours)
-    return _summarize(results, 0, horizon_hours)
+    stats: dict = {}
+    results = replay_strategy(symbol, frames_full, horizon_hours, stats=stats)
+    report = _summarize(results, stats.get("no_trade", 0), horizon_hours)
+    report["mode"] = "strategy-replay"
+    report["logged_only"] = stats.get("logged_only", 0)
+    report["bars_evaluated"] = stats.get("bars_evaluated", 0)
+    report["cooldown_min"] = config.DUPLICATE_COOLDOWN_MIN
+    # Stated in the report itself, because --strategy is otherwise read as
+    # "that is exactly what the live bot would have done".
+    report["limitations"] = [
+        f"funding-rate rejection not applied (no historical funding series here; "
+        f"live rejects longs into a deeply negative rate and shorts into a "
+        f"strongly positive one)",
+        "open-interest context unavailable (live fetches OI history)",
+        f"alert floor applied: only setup_quality >= {config.ALERT_QUALITY_MIN} "
+        f"counts as a signal; lower ones are logged as log-only, never alerted",
+        f"duplicate guard simulated as a per-coin {config.DUPLICATE_COOLDOWN_MIN}-min "
+        "cooldown (live also skips the fetch for cooling coins)",
+    ]
+    return report
 
 
 def write_report(report: dict, out_path: Path) -> None:
     lines = [
         "=== Crypto Signal Bot — Backtest Report ===",
         f"Generated: {datetime.now(config.TZ).isoformat(timespec='seconds')}",
-        f"Total BUY/SELL signals: {report['total_signals']}  (HOLD logged: {report['holds_logged']})",
+        f"Total BUY/SELL signals: {report['total_signals']}  (HOLD logged: {report['holds_logged']})"
+        + (f"  (log-only, below the alert floor: {report['logged_only']}"
+           f" over {report['bars_evaluated']} bars)" if "logged_only" in report else ""),
         f"Fill horizon: {report.get('horizon_hours', 24)}h after each signal",
         f"Wins: {report['wins']}   Losses: {report['losses']}   Open: {report['open']}   No data: {report['no_data']}",
         f"Win rate (closed): {report['win_rate']:.1f}%",
@@ -250,6 +312,10 @@ def write_report(report: dict, out_path: Path) -> None:
         "",
         f"{'timestamp':25s} {'coin':14s} {'sig':4s} {'entry':>12s} {'SL':>12s} {'TP':>12s} {'RR':>5s} {'outcome':8s} {'R':>7s}",
     ]
+    if report.get("limitations"):
+        lines.append("Replay limits (what this mode does NOT reproduce):")
+        lines.extend(f"  - {item}" for item in report["limitations"])
+        lines.append("")
     for r in report["results"]:
         lines.append(f"{r['timestamp']:25s} {r['coin']:14s} {r['signal']:4s} "
                      f"{r['entry']:12.6g} {r['SL']:12.6g} {r['TP']:12.6g} {r['RR']:5.2f} "
