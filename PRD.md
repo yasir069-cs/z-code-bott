@@ -7,7 +7,8 @@ A signals-only bot that scans the **full Binance USDT-M futures** market every
 core** (market structure → S/R → liquidity → price action → trendlines → MTF →
 futures context → risk gate; indicators only confirm). It reads top-down
 (1H bias → 15M setup → 5M entry), sets entry/SL/TP/RR, and sends Telegram alerts.
-An LLM (**OpenRouter / NVIDIA Nemotron**) writes the **explanation only** and can
+An LLM (**AgentRouter / deepseek-v4-flash**) writes the **explanation only**, records
+a background **opinion audit** it cannot act on, and can
 never change or drop a decision. The decision hierarchy is defined in
 **[price_action_spec.md](price_action_spec.md)** (primary authority); the owner's
 handwritten indicator note **[strategy_spec.md](strategy_spec.md)** is the

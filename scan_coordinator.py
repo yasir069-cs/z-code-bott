@@ -54,6 +54,26 @@ class _StageTimer:
         return False
 
 
+def _agreement(deterministic: str, verdict: dict) -> str:
+    """Grade one AI opinion against the verdict that was actually emitted.
+
+    The stage is audit-only, so disagreement is information for the owner rather
+    than a veto — VETO_PROPOSED marks "the model would have suppressed this
+    signal", SIGNAL_PROPOSED marks "the model would have alerted this HOLD".
+    """
+    opinion = (verdict or {}).get("signal")
+    if not opinion:
+        return "NO_ANSWER"
+    det = (deterministic or "NO_TRADE").upper()
+    if opinion == det:
+        return "AGREE"
+    if opinion == "NO_TRADE" and det in ("LONG", "SHORT"):
+        return "VETO_PROPOSED"
+    if det == "NO_TRADE" and opinion in ("LONG", "SHORT"):
+        return "SIGNAL_PROPOSED"
+    return "DISAGREE"
+
+
 class AIOpinionWorker:
     """Single-worker background executor for AI opinions.
 
@@ -64,8 +84,17 @@ class AIOpinionWorker:
     bounded, and the worker never emits alerts.
     """
 
-    def __init__(self, verdicts_fn: Callable):
+    def __init__(self, verdicts_fn: Callable,
+                 notify: Optional[Callable[[str], bool]] = None,
+                 budget_notice_fn: Optional[Callable[[], Optional[str]]] = None):
         self._verdicts_fn = verdicts_fn
+        # notify / budget_notice_fn are injected (main wires alerts + ai_decision)
+        # so this module stays import-light and testable. The provider's daily cap
+        # is spent on retries too, so the owner is told once per day when the audit
+        # stage goes quiet — otherwise ai_opinions.csv just fills with UNAVAILABLE
+        # rows and nothing explains why.
+        self._notify = notify
+        self._budget_notice_fn = budget_notice_fn
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai-worker")
         self._pending = 0
         self._lock = threading.Lock()
@@ -105,6 +134,7 @@ class AIOpinionWorker:
             finally:
                 self.last_duration_s = round(time.monotonic() - started, 2)
                 self.last_finished_at = datetime.now(config.TZ)
+                self._notify_budget_exhausted()
 
         self._pool.submit(_task)
         return True
@@ -132,6 +162,7 @@ class AIOpinionWorker:
     def _write_rows(self, scan_id: str, records: list, verdicts: dict,
                     status: str, error: str) -> None:
         try:
+            self._reconcile_header()
             new_file = not config.AI_OPINIONS_LOG_FILE.exists()
             with open(config.AI_OPINIONS_LOG_FILE, "a", newline="",
                       encoding="utf-8") as fh:
@@ -159,10 +190,57 @@ class AIOpinionWorker:
                         "ai_status": ai_status,
                         "ai_confidence": verdict.get("confidence", ""),
                         "ai_reason": (verdict.get("reason") or error or "")[:300],
+                        "agreement": _agreement(rec["deterministic_decision"], verdict),
+                        # audit-only stage: what shipped is the deterministic call
                         "final_decision": rec["deterministic_decision"],
                     })
         except OSError as exc:
             log.warning("ai_opinions.csv write failed: %s", exc)
+
+    def _notify_budget_exhausted(self) -> None:
+        """One Telegram line per IST day, the first time the AI budget is spent.
+
+        `ai_decision.budget_exhausted_notice()` hands out its text exactly once a
+        day; this is the only caller that ever delivers it.
+        """
+        if self._budget_notice_fn is None or self._notify is None:
+            return
+        try:
+            notice = self._budget_notice_fn()
+            if notice:
+                self._notify("<b>\U0001F916 AI opinion budget</b>\n" + notice)
+        except Exception as exc:            # a failed notice must never break the worker
+            log.warning("AI budget notice failed (%s)", exc)
+
+    def _reconcile_header(self) -> None:
+        """Archive ai_opinions.csv when its header no longer matches the columns.
+
+        Same rule signals_log.csv follows: history is never rewritten in place and
+        a DictWriter must never put new fields under an old header.
+        """
+        path = config.AI_OPINIONS_LOG_FILE
+        if not path.exists():
+            return
+        try:
+            with open(path, newline="", encoding="utf-8") as fh:
+                header = next(csv.reader(fh), None)
+        except OSError as exc:
+            log.warning("could not read %s header: %s", path.name, exc)
+            return
+        if header == list(config.AI_OPINION_COLUMNS):
+            return
+        bak = path.parent / (path.name + ".v1.bak")
+        n = 2
+        while bak.exists():
+            bak = path.parent / (path.name + ".v%d.bak" % n)
+            n += 1
+        try:
+            path.rename(bak)
+            log.warning("%s columns changed (%d -> %d); archived old file to %s",
+                        path.name, len(header or []), len(config.AI_OPINION_COLUMNS),
+                        bak.name)
+        except OSError as exc:
+            log.warning("could not archive stale %s: %s", path.name, exc)
 
     def status(self) -> dict:
         return {"last_status": self.last_status,

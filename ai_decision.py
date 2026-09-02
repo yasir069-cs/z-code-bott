@@ -885,10 +885,14 @@ def _facts_block(det: dict) -> str:
         + (", fresh CHoCH against the standing HTF trend" if mtf.get("choch_reversal") else ""),
         f"S/R: price at {(sr.get('at_zone') or {}).get('side', 'no zone')}"
         f"{' (major)' if (sr.get('at_zone') or {}).get('major') else ''}",
-        f"Liquidity: confirmed buy-side sweep={liq.get('long_ready')}, "
-        f"confirmed sell-side sweep={liq.get('short_ready')}, "
+        # labels must match liquidity.py's vocabulary: `long_ready` means a
+        # SELL-side pool was swept and reclaimed (the setup that supports a
+        # LONG). Calling it a "buy-side sweep" told the model the opposite.
+        f"Liquidity: sell-side sweep confirmed (supports LONG)={liq.get('long_ready')}, "
+        f"buy-side sweep confirmed (supports SHORT)={liq.get('short_ready')}, "
         f"equal lows={len(liq.get('equal_lows') or [])}, "
         f"equal highs={len(liq.get('equal_highs') or [])}",
+        _sweep_age_fact(liq),
         f"Price-action signals: bullish={(pa.get('signals') or {}).get('bullish', 0)}, "
         f"bearish={(pa.get('signals') or {}).get('bearish', 0)}",
         f"Trendline break: {(tl.get('break') or {}).get('dir', 'none')}",
@@ -898,11 +902,31 @@ def _facts_block(det: dict) -> str:
         f"Calculated structural levels: entry={_fmt_lvl(det.get('entry'))}, "
         f"ATR={_fmt_lvl(structure.get('atr'))}, "
         f"SL={_fmt_lvl(risk.get('sl'))}, TP={_fmt_lvl(risk.get('tp'))}, "
-        f"RR={_fmt_lvl(risk.get('rr'))}",
+        f"RR={_fmt_lvl(risk.get('rr'))}"
+        + (f" (target from {risk.get('target_note')})" if risk.get("target_note") else ""),
     ]
     if warnings:
         lines.append(f"Data warnings: {', '.join(warnings)}")
     return "\n".join(lines)
+
+
+def _sweep_age_fact(liq: dict) -> str:
+    """The most recent sweep of either side, with age and confirmation status.
+
+    `liq["sweep"]` is the *younger* of the two directions liquidity.py detected —
+    not necessarily the confirmed one — so the line names which pool it took and
+    whether confirmation followed, instead of letting the model assume a sweep
+    exists whenever either flag is set.
+    """
+    sweep = (liq or {}).get("sweep") or {}
+    if not sweep:
+        return "Most recent sweep: none detected on the setup timeframe"
+    side = sweep.get("side") or ("sell-side" if sweep.get("direction") == "BUY"
+                                 else "buy-side")
+    state = "confirmed" if sweep.get("confirmed") else "not confirmed"
+    ready = "ready" if sweep.get("ready") else "not ready"
+    return (f"Most recent sweep: {side} pool, "
+             f"{sweep.get('age_candles')} candle(s) ago, {state} ({ready})")
 
 
 def _sweep_fact(bundle: dict) -> str:
@@ -920,7 +944,11 @@ def _range_line(ind: dict) -> str:
     """1H range location — a factual feature the model reads for itself."""
     rp = (ind or {}).get("range_pos")
     rp_s = f"{rp:.3f}" if isinstance(rp, (int, float)) else "n/a"
-    return (f"1H range position: {rp_s} (0.000 = 20-candle low, 1.000 = high); "
+    # range_pos spans the strategy window (CANDLE_LIMIT), NOT the 20-candle
+    # swing window — the old label told the model it was looking at 20 candles.
+    span = getattr(config, "CANDLE_LIMIT", 50)
+    return (f"1H range position: {rp_s} (0.000 = {span}-candle low, "
+            f"1.000 = {span}-candle high); "
             f"swing low/high (20): {_fmt_lvl((ind or {}).get('swing_low_20'))} / "
             f"{_fmt_lvl((ind or {}).get('swing_high_20'))}")
 

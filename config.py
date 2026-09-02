@@ -31,6 +31,14 @@ VOLUME_MIN_USDT = 50_000_000    # 24h quote volume filter ($50M — futures liqu
 CANDLE_LIMIT = 50               # last 50 candles per timeframe (strategy window)
 INDICATOR_WARMUP = 250          # extra closed candles so pandas-ta values converge
                                 # to TradingView (Wilder/EMA recursions need warm-up)
+# A brand-new perp cannot supply 50+250 candles. Skipping it for that (the old
+# `len(rows) < 300` rule) made every fresh listing permanently untradeable — and
+# logged a WARNING per scan, per coin (live 2026-09-02: MARSCOIN 26 rows,
+# 牛来 72 rows). The structural core only needs pivots (8 bars) and the secondary
+# indicators 25; a short frame is therefore served with its real length — values
+# are simply less converged than TradingView's — and only frames shorter than
+# this are dropped.
+FRAME_MIN_CANDLES = 40
 FETCH_RETRY_MAX = 3             # exchange fetch fails -> retry 3x -> skip coin
 FETCH_TIMEOUT_MS = 15000        # explicit per-request ccxt timeout: no request
                                 # may hang indefinitely, whatever the deadline
@@ -185,6 +193,12 @@ AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "50"))  # advisory daily requ
 # ------------------------------------------------------------------ duplicate guard
 DUPLICATE_COOLDOWN_MIN = 15     # same coin within 15 min -> skip (futures pace faster)
 GUARD_RESET_TIME = "23:00"      # tracker resets at 11:00 PM IST
+# A blocked setup is re-evaluated every scan, and each rejection used to append
+# its own HOLD row: 37 blocked coins x 60 scans = ~2.2k rows a session, and an
+# on-demand /scan_on session runs 24/7. HOLD rows still land in the CSV (the
+# audit trail wants them) but only once per window per coin; a change of verdict
+# or of the blocking reason is a new row.
+HOLD_LOG_COOLDOWN_MIN = 30
 
 # ------------------------------------------------------------------ scheduler
 SESSION_START = "18:00"         # 6:00 PM IST
@@ -339,20 +353,35 @@ DIR_UNCONFIRMED_CHOCH_FACTOR = 0.75    # CHoCH-driven direction lacking post-CHo
 MIN_RR = 1.5                     # configurable minimum reward:risk
 RISK_SL_BUFFER_ATR = 0.5         # SL placed beyond the structural invalidation by this * ATR
 RISK_MAX_STOP_ATR = 3.0          # stop wider than this * ATR -> NO_TRADE (poor structure)
-RISK_MIN_TARGET_ATR = 1.0        # nearest opposing zone closer than this * ATR -> NO_TRADE
+RISK_MIN_TARGET_ATR = 1.0        # no opposing zone offers this much reward * ATR -> NO_TRADE
+                                # (judged per zone AFTER RISK_TARGET_ZONE_PAD_ATR, so a zone the
+                                # target would land inside still counts as no room)
 RISK_MAX_SPREAD_PCT = 0.0015     # spread wider than this (when known) -> NO_TRADE
 RISK_TARGET_ZONE_PAD_ATR = 0.25  # target placed this * ATR short of the opposing zone edge
+# Search every opposing S/R zone for a *reachable* target, not just the nearest
+# one. A zone is a range ~1 ATR wide, so the nearest support/resistance often
+# straddles the entry or sits a fraction of an ATR away: that is a wall, not a
+# target, and treating it as the only option turned "no room to the first zone"
+# into NO_TRADE while a usable zone several ATR deeper went unread (21/37 coins
+# in the 2026-09-02 live scan died of `no_clear_target`/`target_too_close`).
+# False restores the original nearest-zone-only behaviour.
+RISK_TARGET_SCAN_ZONES = True
 
 # ---- decision engine
-DECISION_ENABLED = True          # master switch: price-action core decides (vs legacy funnel)
+# Master switch for the price-action core vs the legacy funnel scorer.
+# Currently INERT: nothing reads it — `decision.decide` is unconditional and the
+# legacy graded scorer survives only as `scoring.indicator_confirmation` (secondary
+# layer) and in `backtest.py --strategy`. Kept as the documented kill-switch slot.
+DECISION_ENABLED = True
 
-# ---- LLM decision stage (shortlisted coins -> LLM BEFORE the gates reject)
-# After the 1H/15M/5M + funding funnel, every shortlisted coin is sent to the
-# LLM with its full structured data. The model may return LONG, SHORT or
-# NO_TRADE — including disagreeing with the deterministic core — but every
-# verdict then faces the SAME deterministic validation (direction gates,
-# stop width, R:R, quality floor) before an alert can go out.
-LLM_DECISION_ENABLED = True      # False -> pure deterministic core (previous behaviour)
+# ---- LLM opinion AUDIT (background; can never change what is emitted)
+# True: every shortlisted coin is queued to the worker with its full structured
+# data and the answer lands in ai_opinions.csv (with an `agreement` grade) for the
+# owner to read. It is NOT a decision stage — the scheduled scan has already
+# emitted its verdict by the time the batch returns, and nothing re-reads it.
+# Applying a verdict exists only behind `--force-llm` (see main.run_force_llm),
+# where post-LLM gates re-validate it. False: no requests, no spend, no audit.
+LLM_DECISION_ENABLED = True      # False -> no AI audit; alerts are identical
 # ---- alert tier system (owner's rule, 2026-09-01) ----
 # Below 50: ignored (log-only, never alerts). 50-60: NORMAL alert.
 # 60-70: HIGH alert. 70-100: STRONGEST alert. The tier is read from the
@@ -449,9 +478,15 @@ CSV_COLUMNS = ["timestamp", "signal_id", "coin", "signal", "entry", "SL", "TP", 
 
 # Background AI opinions audit log (signal_id keyed; never blocks a scan)
 AI_OPINIONS_LOG_FILE = BASE_DIR / "ai_opinions.csv"
+# `agreement` grades the AI opinion against the verdict actually emitted, so the
+# audit file answers "would the model have changed anything?" at a glance:
+# AGREE / DISAGREE / VETO_PROPOSED (model would suppress a Python signal) /
+# SIGNAL_PROPOSED (model wants a trade Python blocked) / NO_ANSWER.
+# final_decision stays the deterministic verdict: the stage is audit-only and can
+# never replace what shipped.
 AI_OPINION_COLUMNS = ["timestamp", "scan_id", "signal_id", "symbol",
                       "deterministic_decision", "ai_opinion", "ai_status",
-                      "ai_confidence", "ai_reason", "final_decision"]
+                      "ai_confidence", "ai_reason", "agreement", "final_decision"]
 
 
 def setup_logging() -> None:
