@@ -241,24 +241,43 @@ def test_pending_queue_dedupes_similar_events_in_one_cycle():
     assert len(pending) == 1
 
 
-def test_cycle_recheck_catches_split_story_across_publishes():
+def test_cycle_recheck_catches_split_story_across_publishes(monkeypatch, tmp_path):
     """process_cycle re-checks memory before each publish, so two similar
-    events pending in ONE cycle still alert exactly once."""
-    engine = NewsEngine()
-    # pre-seed two similar but separately-clustered events
-    e1 = NewsEvent(); e1.articles = [
+    events pending in ONE cycle still alert exactly once.
+
+    The pair is built by hand because the *split* is the subject: clustering
+    sometimes files one story as two events, and the memory re-check is the only
+    thing that stops the second alert. Ingestion is stubbed to hand those events
+    back — with the real feed wired, the cycle ingested nothing, `pending` came
+    out empty, and the assertion passed on an accident instead of on the guard.
+    """
+    engine = NewsEngine(fetch_fn=lambda: [])
+    engine._alerts = news.AlertMemory(tmp_path / "alerted.json")
+
+    e1 = NewsEvent()
+    e1.articles = [
         _art("Binance halts withdrawals after security incident",
              "binance.com", "https://binance.com/en/x", ""),
         _art("Binance halts withdrawals after security incident",
-             "cointelegraph.com", "https://c.com/1", "")]
+             "cointelegraph.com", "https://c.com/1", ""),
+    ]
     e1.assets = set(); e1.status = compute_status(e1)
-    e2 = NewsEvent(); e2.articles = [
+    e2 = NewsEvent()
+    e2.articles = [
+        _art("Binance suspends withdrawals following security incident",
+             "binance.com", "https://binance.com/en/y", ""),
         _art("Binance suspends withdrawals following security incident",
              "theblock.co", "https://t.com/1", ""),
         _art("Binance suspends withdrawals following security incident",
-             "decrypt.co", "https://de.com/1", "")]
+             "decrypt.co", "https://de.com/1", ""),
+    ]
     e2.assets = set(); e2.status = compute_status(e2)
+    # both are independently publishable: only the re-check can stop the second
+    assert e1.status == "VERIFIED" and e2.status == "VERIFIED"
+    assert e1.claim_tokens() != e2.claim_tokens()
+
     engine._events = [e1, e2]
+    monkeypatch.setattr(engine, "ingest", lambda articles: [(e1, "new"), (e2, "new")])
 
     sent = engine.process_cycle(
         analyzer=_ai_ok,

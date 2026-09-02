@@ -297,3 +297,83 @@ def test_batch_survives_a_worker_exception(monkeypatch):
     monkeypatch.setattr(scanner, "thread_exchange", lambda: None)
     out = scanner.fetch_timeframe_batch(["OK/USDT:USDT", "BOOM/USDT:USDT"], "1h")
     assert set(out) == {"OK/USDT:USDT"}
+
+
+# ------------------------------------------------- thin history (fresh listings)
+#
+# Binance returns fewer rows than asked for a symbol listed days ago. The fetcher
+# used to throw those coins away before the strategy ever saw them — a 45-bar
+# frame still gives the structural core its 50-candle window, just with less
+# pandas-ta warm-up, so it is degraded, not dropped.
+
+def test_short_history_is_served_when_it_covers_the_candles():
+    """45 closed 15M candles >= FRAME_MIN_CANDLES -> usable frame, one fetch."""
+    want = config.CANDLE_LIMIT + config.INDICATOR_WARMUP
+    rows = _ohlcv_rows("15m", n=45)
+    assert len(rows) == 46                       # 45 closed + the forming candle
+
+    class _Ex:
+        def __init__(self):
+            self.calls = 0
+        def fetch_ohlcv(self, symbol, timeframe="15m", limit=None):
+            self.calls += 1
+            return rows
+
+    ex = _Ex()
+    df = scanner.fetch_ohlcv(ex, "NEWCOIN/USDT:USDT", "15m")
+    assert df is not None, "a 45-candle frame must not be thrown away"
+    assert len(df) == 45 < want                  # short, but real data
+    assert scanner.fetch_ohlcv(ex, "NEWCOIN/USDT:USDT", "15m") is not None
+    assert ex.calls == 1, "short frames are cached like any other frame"
+
+
+def test_short_history_is_logged_as_degraded_not_silent(caplog):
+    import logging
+    rows = _ohlcv_rows("1h", n=44)
+
+    class _Ex:
+        def fetch_ohlcv(self, symbol, timeframe="1h", limit=None):
+            return rows
+
+    with caplog.at_level(logging.INFO, logger="scanner"):
+        scanner.fetch_ohlcv(_Ex(), "NEWCOIN/USDT:USDT", "1h")
+    msgs = [r.getMessage() for r in caplog.records if "short history" in r.getMessage()]
+    assert len(msgs) == 1 and "44/300" in msgs[0]
+    assert not [r for r in caplog.records if "skipping" in r.getMessage()]
+
+
+def test_history_below_the_minimum_is_still_rejected(caplog):
+    """Fewer closed candles than FRAME_MIN_CANDLES cannot support the strategy."""
+    import logging
+    rows = _ohlcv_rows("1h", n=config.FRAME_MIN_CANDLES - 1)
+
+    class _Ex:
+        def fetch_ohlcv(self, symbol, timeframe="1h", limit=None):
+            return rows
+
+    with caplog.at_level(logging.WARNING, logger="scanner"):
+        assert scanner.fetch_ohlcv(_Ex(), "FRESH/USDT:USDT", "1h") is None
+    assert any("skipping" in r.getMessage() for r in caplog.records)
+
+
+def test_minimum_is_configurable(monkeypatch):
+    """FRAME_MIN_CANDLES is the only gate: raising it must reject the same frame."""
+    monkeypatch.setattr(config, "FRAME_MIN_CANDLES", 60)
+    rows = _ohlcv_rows("1h", n=45)
+
+    class _Ex:
+        def fetch_ohlcv(self, symbol, timeframe="1h", limit=None):
+            return rows
+
+    assert scanner.fetch_ohlcv(_Ex(), "NEWCOIN/USDT:USDT", "1h") is None
+
+
+def test_full_history_is_unaffected():
+    rows = _ohlcv_rows("1h", n=config.CANDLE_LIMIT + config.INDICATOR_WARMUP + 1)
+
+    class _Ex:
+        def fetch_ohlcv(self, symbol, timeframe="1h", limit=None):
+            return rows
+
+    df = scanner.fetch_ohlcv(_Ex(), "BTC/USDT:USDT", "1h")
+    assert len(df) == config.CANDLE_LIMIT + config.INDICATOR_WARMUP
