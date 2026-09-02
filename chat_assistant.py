@@ -190,7 +190,7 @@ Your job is to assist users in Telegram with queries about the bot's strategy, s
 
 
 def ask_crypto_assistant(user_query: str, chat_history: Optional[list] = None) -> str:
-    """Send user query to OpenRouter and return the assistant's reply."""
+    """Send user query to the AI provider and return the assistant's reply."""
     if not config.OPENROUTER_API_KEY:
         return (
             "⚠️ <b>AI Assistant Offline:</b> OPENROUTER_API_KEY is not configured in `.env`.\n\n"
@@ -224,7 +224,7 @@ def ask_crypto_assistant(user_query: str, chat_history: Optional[list] = None) -
             timeout=30.0,
         )
         if response.status_code != 200:
-            log.error("OpenRouter chat error: %s", response.text[:500])
+            log.error("AI provider chat error: %s", response.text[:500])
             return "⚠️ Sorry, the AI service encountered an error. Please try again in a moment."
 
         data = response.json()
@@ -232,8 +232,8 @@ def ask_crypto_assistant(user_query: str, chat_history: Optional[list] = None) -
         return reply or "I received your message, but the AI generated an empty response. Please ask again."
 
     except requests.exceptions.Timeout:
-        log.warning("OpenRouter chat request timed out")
+        log.warning("AI provider chat request timed out")
         return "⏳ Request timed out. The AI model is taking longer than expected. Please try again."
     except Exception as exc:
-        log.error("Error calling OpenRouter chat: %s", exc)
+        log.error("Error calling AI provider chat: %s", exc)
         return f"⚠️ Unable to reach AI Assistant: {exc}"
