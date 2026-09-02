@@ -84,10 +84,11 @@ def test_prompt_states_rsi_trend_direction_explicitly():
 
 # ------------------------------------------------------ mocked HTTP helpers
 class _Resp:
-    def __init__(self, payload=None, status=200, text=""):
+    def __init__(self, payload=None, status=200, text="", headers=None):
         self._payload = payload
         self.status_code = status
         self.text = text
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -97,6 +98,17 @@ class _Resp:
         if self._payload is None:
             raise ValueError("no json")
         return self._payload
+
+
+class _SseResp(_Resp):
+    """A gateway that answers with text/event-stream despite stream:false."""
+
+    def __init__(self, deltas, status=200):
+        events = [f"data: {json.dumps({'choices': [{'delta': {'content': d}}]})}"
+                  for d in deltas] + ["data: [DONE]"]
+        super().__init__(payload=None, status=status,
+                         text="\n".join(events),
+                         headers={"Content-Type": "text/event-stream"})
 
 
 def _mock_post(monkeypatch, resp):
@@ -230,6 +242,59 @@ def test_malformed_response_body_raises(monkeypatch):
     monkeypatch.setattr("config.OPENROUTER_API_KEY", "sk-or-test")
     with pytest.raises(ai_decision.AIDecisionError):
         ai_decision.nemotron_decision(_bundle())
+
+
+def test_sse_streamed_response_is_joined(monkeypatch):
+    """Some gateways (AgentRouter seen live) answer with text/event-stream
+    despite stream:false — the JSON parse then failed with 'Expecting value:
+    line 1 column 1'. The deltas must be joined into one answer instead."""
+    verdict = json.dumps({"signal": "BUY", "entry": 100, "stop_loss": 98.5,
+                          "take_profit": 103, "rr": 2.0, "confidence": 80,
+                          "reason": "sse joined", "rsi_bounce_detected": True})
+    _mock_post(monkeypatch, _SseResp(['{"signal": "BUY", ', '"entry": 100, ',
+                                      '"stop_loss": 98.5, ', '"take_profit": 103, ',
+                                      '"rr": 2.0, ', '"confidence": 80, ',
+                                      '"reason": "sse joined", ',
+                                      '"rsi_bounce_detected": true}']))
+    monkeypatch.setattr("config.OPENROUTER_API_KEY", "sk-or-test")
+    out = ai_decision.nemotron_decision(_bundle())
+    assert out["signal"] == "BUY" and out["ai_used"] is True
+    assert out["confidence"] == 80
+    assert out["reason"] == "sse joined"
+
+
+def test_sse_detected_by_data_prefix_even_without_content_type(monkeypatch):
+    """A gateway that streams but forgets the event-stream content-type is
+    still recognized from the body's leading 'data:' line."""
+    resp = _Resp(text='data: {"choices": [{"delta": {"content": "OK"}}]}\n\ndata: [DONE]')
+    _mock_post(monkeypatch, resp)
+    monkeypatch.setattr("config.OPENROUTER_API_KEY", "sk-or-test")
+    assert ai_decision._join_sse_deltas(resp.text) == "OK"
+
+
+def test_empty_200_body_raises_with_diagnostic(monkeypatch):
+    """HTTP 200 with an empty/non-JSON body (the live AgentRouter failure)
+    must raise a retryable error whose message carries the content-type and
+    body snippet — not a bare 'Expecting value' JSONDecodeError."""
+    resp = _Resp(text="", headers={"Content-Type": "application/json"})
+    _mock_post(monkeypatch, resp)
+    monkeypatch.setattr("config.OPENROUTER_API_KEY", "sk-or-test")
+    with pytest.raises(ai_decision.AIDecisionError) as ei:
+        ai_decision.nemotron_decision(_bundle())
+    assert "non-JSON body" in str(ei.value)
+    assert ei.value.retryable is True
+
+
+def test_request_payload_asks_for_non_streaming(monkeypatch):
+    """stream:false is sent explicitly so streaming-by-default gateways
+    return one plain JSON body."""
+    calls = _mock_post(monkeypatch, _content_resp(
+        json.dumps({"signal": "BUY", "entry": 100, "stop_loss": 98.5,
+                    "take_profit": 103, "rr": 2.0, "confidence": 70,
+                    "reason": "ok"})))
+    monkeypatch.setattr("config.OPENROUTER_API_KEY", "sk-or-test")
+    ai_decision.nemotron_decision(_bundle())
+    assert calls["payload"]["stream"] is False
 
 
 def test_missing_key_raises_immediately(monkeypatch):
