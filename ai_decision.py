@@ -69,8 +69,11 @@ futures signal bot on Binance. Active session: New York overlap
 Your job is NOT to execute trades. You only decide: BUY / SELL / HOLD.
 
 === OUTPUT CONTRACT (READ FIRST — NON-NEGOTIABLE) ===
-- Respond with ONE valid JSON object. No markdown, no code fences, no
-  commentary before or after, no trailing prose.
+*** CRITICAL: YOU MUST RESPOND WITH ONLY VALID JSON. ***
+*** NO THINKING, NO EXPLANATION, NO MARKDOWN, NO CODE FENCES. ***
+*** ONLY THE JSON OBJECT. NOTHING ELSE. ***
+
+- Respond with ONE valid JSON object only.
 - Exactly these keys: signal, entry, stop_loss, take_profit, rr, confidence,
   reason, rsi_bounce_detected.
 - signal: "BUY" | "SELL" | "HOLD" (uppercase string).
@@ -80,6 +83,7 @@ Your job is NOT to execute trades. You only decide: BUY / SELL / HOLD.
 - reason: one concise sentence of concrete evidence (name the factors that
   decided it), never a generic template.
 - Invalid JSON = a failed answer. There is no partial credit.
+- Do NOT include any text before or after the JSON object.
 
 === EVIDENCE HIERARCHY (WEIGH IN THIS ORDER) ===
 1. Market structure and location (1H trend, range position, BOS/CHoCH)
@@ -434,16 +438,58 @@ def _strip_fences(text: str) -> str:
     return cleaned
 
 
+def _is_likely_reasoning(text: str) -> bool:
+    """Check if the response looks like analysis/reasoning rather than JSON.
+    
+    Models often preface JSON with thinking or explanation. If we see analysis
+    prose at the start, the JSON (if any) is likely truncated or malformed."""
+    cleaned = text.strip()[:500].lower()
+    reasoning_markers = (
+        'let me', 'i need to', 'analyzing', 'i can see', 'based on',
+        'the user', 'step 1', 'step 2', 'first,', 'second,',
+        'however,', 'therefore,', 'in summary', 'this setup',
+        'the trader', 'looking at', 'here is', 'analyzing the'
+    )
+    return any(cleaned.startswith(m) for m in reasoning_markers)
+
+
 def _extract_json(text: str) -> dict:
     """Parse the JSON object out of a (possibly fenced) response."""
     cleaned = _strip_fences(text)
+    
+    # Diagnostic: if the response starts with reasoning, log it clearly
+    if _is_likely_reasoning(text):
+        log.warning("AI response started with reasoning/prose instead of JSON; "
+                    "this indicates model reasoning leakage (should be json-only). "
+                    "First 400 chars: %s", text[:400])
+        raise AIDecisionError(
+            f"AI returned analysis prose instead of JSON. "
+            f"First 200 chars: {text[:200]!r}. "
+            f"Possible causes: (1) model is thinking aloud; (2) prompt not enforcing json-only; "
+            f"(3) model's output truncated mid-reasoning.",
+            retryable=True)
+    
     start, end = cleaned.find("{"), cleaned.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise AIDecisionError(f"no JSON object in AI response: {text[:200]!r}", retryable=True)
+        raise AIDecisionError(
+            f"no JSON object found in AI response. "
+            f"Response length: {len(text)}. "
+            f"First 300 chars: {text[:300]!r}. "
+            f"Last 300 chars: {text[-300:]!r}.",
+            retryable=True)
     try:
         return json.loads(cleaned[start:end + 1])
     except json.JSONDecodeError as exc:
-        raise AIDecisionError(f"AI returned invalid JSON: {exc}", retryable=True) from exc
+        # Show context around the error
+        attempted = cleaned[start:end + 1]
+        error_pos = exc.pos if hasattr(exc, 'pos') else '?'
+        snippet_start = max(0, error_pos - 50) if isinstance(error_pos, int) else 0
+        snippet_end = min(len(attempted), snippet_start + 100) if isinstance(error_pos, int) else 100
+        snippet = attempted[snippet_start:snippet_end] if isinstance(error_pos, int) else attempted[:200]
+        raise AIDecisionError(
+            f"AI returned invalid JSON at position {error_pos}: {exc.msg}. "
+            f"Context: ...{snippet!r}...",
+            retryable=True) from exc
 
 
 def _extract_json_array(text: str) -> list:
@@ -454,6 +500,16 @@ def _extract_json_array(text: str) -> list:
     reshuffle is not worth burning a retry on.
     """
     cleaned = _strip_fences(text)
+    
+    # Diagnostic: if the response starts with reasoning, log it clearly
+    if _is_likely_reasoning(text):
+        log.warning("AI batch response started with reasoning/prose instead of array; "
+                    "first 400 chars: %s", text[:400])
+        raise AIDecisionError(
+            f"AI returned analysis prose instead of JSON array. "
+            f"First 200 chars: {text[:200]!r}.",
+            retryable=True)
+    
     start, end = cleaned.find("["), cleaned.rfind("]")
     if start != -1 and end > start:
         try:
@@ -470,7 +526,11 @@ def _extract_json_array(text: str) -> list:
             return value
     if "signal" in obj:  # a one-candidate batch answered as a bare object
         return [obj]
-    raise AIDecisionError(f"no JSON array in AI batch response: {text[:200]!r}", retryable=True)
+    raise AIDecisionError(
+        f"no JSON array found in AI batch response. "
+        f"Response length: {len(text)}. "
+        f"First 300 chars: {text[:300]!r}.",
+        retryable=True)
 
 
 def _to_float(value, field: str):
@@ -632,22 +692,33 @@ def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
     headers = getattr(response, "headers", None) or {}
     ctype = (headers.get("Content-Type") or "").lower()
     body = getattr(response, "text", "") or ""
+    
     if "event-stream" in ctype or body.lstrip().startswith("data:"):
         content = _join_sse_deltas(body).strip()
         if not content:
             raise AIDecisionError(
                 f"AI provider streamed an empty response (model={model}, "
-                f"content-type={ctype or 'unknown'}, body={body[:200]!r})",
+                f"content-type={ctype or 'unknown'}, body={body[:500]!r})",
                 retryable=True)
         return content, None
+    
     try:
         data = response.json()
     except ValueError as exc:  # requests' JSONDecodeError is a ValueError
         raise AIDecisionError(
             f"AI provider returned a non-JSON body (model={model}, "
-            f"content-type={ctype or 'unknown'}): {exc} | body={body[:200]!r}",
+            f"content-type={ctype or 'unknown'}): {exc} | body={body[:500]!r}",
             retryable=True) from exc
-    return (data["choices"][0]["message"].get("content") or "").strip(), data
+    
+    try:
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except (KeyError, IndexError, TypeError) as e:
+        raise AIDecisionError(
+            f"AI response missing choices/message/content (model={model}): {e} "
+            f"Full response: {str(data)[:500]!r}",
+            retryable=True) from e
+    
+    return content, data
 
 
 def _post_once(messages: list, model: str) -> str:
@@ -802,8 +873,14 @@ def nemotron_decision(bundle: dict, deadline: Optional[float] = None) -> dict:
     def _parse(content: str) -> dict:
         # NOTE: any 'reasoning' field in the response is deliberately ignored —
         # only the final JSON answer is ever used downstream.
-        log.info("AI raw response for %s: %.300s", bundle["symbol"], content)
-        return parse_ai_response(content, bundle["current_price"])
+        # Log full response for debugging (will be truncated if > 1000 chars in the log)
+        log.info("AI response for %s: %.1000s", bundle["symbol"], content)
+        try:
+            return parse_ai_response(content, bundle["current_price"])
+        except AIDecisionError as e:
+            log.error("AI parsing failed for %s: %s. Response was (up to 2000 chars): %s",
+                      bundle["symbol"], e, content[:2000])
+            raise
 
     return _complete(_messages(build_prompt(bundle)), parse=_parse, deadline=deadline)
 

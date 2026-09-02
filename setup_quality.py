@@ -169,11 +169,16 @@ def _exhaustion_factor(direction: str, htf_snap: Optional[dict],
         reversal setup at the extreme — its location penalty is halved;
       * strong continuation (fresh BOS *and* displacement in the direction)
         survives RSI/BB exhaustion — a genuine breakout can be extended.
+    
+    IMPROVED: penalties are accumulated separately, then combined with a floor
+    (min 0.5) to prevent excessive stacking (0.55 * 0.90 * 0.70 = 0.35 was
+    killing 65% of the score). This way one severe penalty doesn't cascade.
     """
     reasons: list[str] = []
-    factor = 1.0
+    penalties: list[float] = []  # will combine with min floor
+    
     if not htf_snap:
-        return factor, reasons                      # safe-degrade: no 1H context
+        return 1.0, reasons                      # safe-degrade: no 1H context
 
     want = _want(direction)
     strong_continuation = (
@@ -199,7 +204,7 @@ def _exhaustion_factor(direction: str, htf_snap: Optional[dict],
             tier, label = None, ""
         if tier is not None:
             effective = 1.0 - (1.0 - tier) * (cfg.QUALITY_SWEEP_EXEMPT_FACTOR if ready else 1.0)
-            factor *= effective
+            penalties.append(effective)
             reasons.append(f"range_pos={range_pos:.2f} {label}"
                            + (" (confirmed sweep halves the penalty)" if ready and effective > tier else ""))
 
@@ -208,10 +213,10 @@ def _exhaustion_factor(direction: str, htf_snap: Optional[dict],
     rsi = htf_snap.get("rsi")
     if rsi is not None and not strong_continuation:
         if direction == "SHORT" and rsi <= cfg.QUALITY_RSI_OVERSOLD:
-            factor *= cfg.QUALITY_RSI_EXHAUSTION_FACTOR
+            penalties.append(cfg.QUALITY_RSI_EXHAUSTION_FACTOR)
             reasons.append(f"RSI={rsi:.0f} oversold into the short")
         elif direction == "LONG" and rsi >= cfg.QUALITY_RSI_OVERBOUGHT:
-            factor *= cfg.QUALITY_RSI_EXHAUSTION_FACTOR
+            penalties.append(cfg.QUALITY_RSI_EXHAUSTION_FACTOR)
             reasons.append(f"RSI={rsi:.0f} overbought into the long")
 
     # --- 3. Bollinger extreme: context, never a signal by itself
@@ -219,10 +224,10 @@ def _exhaustion_factor(direction: str, htf_snap: Optional[dict],
     bb_lower, bb_upper = htf_snap.get("bb_lower"), htf_snap.get("bb_upper")
     if close is not None and not strong_continuation:
         if direction == "SHORT" and bb_lower is not None and close <= bb_lower:
-            factor *= cfg.QUALITY_BB_EXTREME_FACTOR
+            penalties.append(cfg.QUALITY_BB_EXTREME_FACTOR)
             reasons.append("at/below the lower Bollinger band")
         elif direction == "LONG" and bb_upper is not None and close >= bb_upper:
-            factor *= cfg.QUALITY_BB_EXTREME_FACTOR
+            penalties.append(cfg.QUALITY_BB_EXTREME_FACTOR)
             reasons.append("at/above the upper Bollinger band")
 
     # --- 4. volume behind the intended move
@@ -231,11 +236,20 @@ def _exhaustion_factor(direction: str, htf_snap: Optional[dict],
     vol_avg = htf_snap.get("volume_avg20")
     if vol is not None and vol_avg:
         if vol < cfg.PA_VOLUME_WEAK * vol_avg:
-            factor *= cfg.QUALITY_WEAK_VOLUME_FACTOR
+            penalties.append(cfg.QUALITY_WEAK_VOLUME_FACTOR)
             reasons.append("weak 1H volume vs avg20")
         elif vol_prev is not None and vol < vol_prev:
-            factor *= cfg.QUALITY_DECLINING_VOLUME_FACTOR
+            penalties.append(cfg.QUALITY_DECLINING_VOLUME_FACTOR)
             reasons.append("declining 1H volume")
+
+    # --- Combine penalties: instead of pure multiplication (0.55*0.90*0.70=0.35),
+    #     use the minimum of all penalties with a floor at 0.5 to prevent
+    #     excessive cascading. A single severe penalty doesn't kill everything.
+    if not penalties:
+        factor = 1.0
+    else:
+        # Take the worst (minimum) penalty, but never cut more than 50% total
+        factor = max(0.5, min(penalties))
 
     return round(factor, 4), reasons
 
