@@ -7,7 +7,7 @@ The bot now decides on a **deterministic price-action & market-context core**
 LONG/SHORT/NO_TRADE; RSI/EMA/VWAP/Bollinger are **secondary confirmation only**.
 The owner's handwritten note (**[strategy_spec.md](strategy_spec.md)**) is the
 documented secondary layer. The LLM writes the **explanation** and audits the
-verdict in the background — it never decides. **468 unit tests pass.**
+verdict in the background — it never decides. **477 unit tests pass.**
 
 ## All decisions finalized
 - **Exchange:** Binance USDT-M **futures** (CCXT public, no keys, signals-only)
@@ -91,6 +91,26 @@ as a bounded confirmation sub-score (`scoring.indicator_confirmation`), not a ga
 - ✅ **Docs** — README/Architecture/rules/memory said "OpenRouter/Nemotron" and
   "chunked at 12"; config/main docstrings described an LLM *decision* stage that the
   scheduled scan never runs. Both now describe the audit stage that exists.
+
+## Credential + .env hardening (2026-09-02, after the owner pasted the live .env)
+- 🔑 **The live Telegram token is in public Git history** — `tests/test_credentials.py`
+  pasted it verbatim as a fixture (commit `18474b4`, on `main`). History cannot be
+  un-leaked; **the token must be revoked at @BotFather.** The OpenRouter key seen in
+  the chat is NOT in the repo (verified across all commits) but is pasted-in-chat
+  compromised: rotate at openrouter.ai/api-keys. Its prefix is now in
+  `_EXPOSED_OPENROUTER_KEYS`, so every boot warns until it is replaced.
+- ✅ The fixture uses synthetic values derived from the config prefixes, and a new
+  test scans every tracked file for a full-shaped secret so this cannot recur.
+- ✅ `config.check_config_warnings()` (logged by main at startup as `CONFIG:`)
+  catches the bug that explains the silent AI failures: `AI_BASE_URL` had been
+  saved as a **markdown link** (`[https://openrouter.ai/api/v1](…)`) — requests
+  then raised MissingSchema, `_post_once` treated it as transient, retried 3x, and
+  each attempt consumed AI_DAILY_BUDGET. Also flags an empty AI_MODEL, a fallback
+  equal to the primary, and a model with no key.
+- ℹ️ Production model right now = whatever `.env` pins: `nvidia/nemotron-3-ultra-550b-a55b:free`
+  at `openrouter.ai/api/v1` with fallback `z-ai/glm-5.2:free`; the repo default
+  (`deepseek-v4-flash` @ AgentRouter, no fallback) applies only if those lines are
+  removed. Check with `journalctl -u crypto-signal-bot | grep "Bot starting"`.
 
 ## Live-log hardening, part 2 (same session — the leftovers from the audit)
 - ✅ **Owner gate fails closed** — `_is_owner` returned True whenever
