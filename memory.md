@@ -189,7 +189,11 @@ was running `main`. Owner-side `.env` fix confirmed applied: `AI_BASE_URL=https:
 openrouter.ai/api/v1` (it had held a markdown link, which failed every AI call and
 burned `AI_DAILY_BUDGET` on retries).
 
-## Merged into `main` (2026-09-02, PR #2) — what the deployed build now is
+## Merged into `main` (PR #2 merged 2026-09-02 13:29 UTC, `main` = `9a2b571`) — what the deployed build now is
+Merged with `gh pr merge 2 --merge` and **no `--delete-branch`**; `main`'s tree is byte-identical
+to this branch and the suite is 533 passed. Rollback reference for the server: `f7dcbda` was what
+it last ran, `84b910b` was `main` before the merge. `origin/README-AGENT.md` is the only unmerged
+branch left and carries no work; PR #1 closed unmerged as superseded.
 `main` now equals this branch: the reachable-target gate, the restored
 `no_clear_target`/`poor_rr`/`no_structure_stop` checks, the AI output contract
 (JSON mode + tolerant extraction + correction/escalation retries), the audit-only
