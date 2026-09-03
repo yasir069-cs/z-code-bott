@@ -178,14 +178,23 @@ class LiquidationCache:
                     "price_delta_pct": round((event["price"] / current_price - 1) * 100, 4)
                     if event["price"] else None,
                 })
-        if available and sr:
+        if available and sr and current_price:
+            # How far each nearby zone sits from the traded price, in percent.
+            # `zone["distance"]` was read here but support_resistance never emits
+            # such a key (zones carry lo/hi/mid/touches/side), so every entry was
+            # a permanent None. The distance is derived from the zone mid and the
+            # price the caller already has — and without a price there is nothing
+            # honest to report, so no block is emitted at all.
             levels = []
             for key in ("nearest_support", "nearest_resistance"):
-                zone = sr.get(key)
-                if zone:
-                    levels.append({"type": key, "mid": zone.get("mid"),
-                                   "distance": zone.get("distance")})
-            price_context.append({"nearby_sr": levels})
+                zone = sr.get(key) or {}
+                mid = zone.get("mid")
+                if not zone or not isinstance(mid, (int, float)) or not current_price:
+                    continue
+                levels.append({"type": key, "mid": mid, "side": zone.get("side"),
+                               "distance_pct": round((mid / float(current_price) - 1) * 100, 4)})
+            if levels:
+                price_context.append({"nearby_sr": levels})
         freshness = round(max(0.0, now - latest["timestamp"]), 1) if latest else None
         return {"available": available, "warning": warning,
                 "connected": stream["status"] != "DISCONNECTED",

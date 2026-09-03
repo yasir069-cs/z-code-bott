@@ -136,8 +136,11 @@ def _upframe(n, freq, start="2026-08-14 00:00"):
     return make_candles([100 + i * 0.4 for i in range(n)], start=start, freq=freq, wick=0.05)
 
 
-def _long(entry=100.0):
-    return {"decision": "LONG", "entry": entry, "sl": entry - 2, "tp": entry + 4, "rr": 2.0}
+def _long(entry=100.0, quality=70.0):
+    """A LONG that clears the live alert floor (ALERT_QUALITY_MIN) — replay
+    scores an alertable setup, so the fixture has to look like one."""
+    return {"decision": "LONG", "entry": entry, "sl": entry - 2, "tp": entry + 4,
+            "rr": 2.0, "setup_quality": quality}
 
 
 def _ohlcv(df):
@@ -249,3 +252,69 @@ def test_replay_real_core_is_wired_and_look_ahead_safe():
     for r in out:
         assert r["signal"] in ("BUY", "SELL")
         assert r["outcome"] in ("WIN", "LOSS", "OPEN", "NO_DATA")
+
+
+# ── what the replay is allowed to count as a signal ──────────────────────────
+
+def test_replay_applies_the_live_alert_floor():
+    """A LONG below ALERT_QUALITY_MIN is log-only in production, so scoring it
+    here would report alerts the owner never received."""
+    closes = [100.0] * 8 + [104.2] + [104.0] * 3
+    entry_df = make_candles(closes, start="2026-08-14 00:00", freq="5min", wick=0.05)
+    frames = {"1h": _upframe(10, "1h"), "15m": _upframe(20, "15min"), "5m": entry_df}
+    target = entry_df.index[5]
+
+    def stub(fr):
+        if fr["5m"].index[-1] != target:
+            return {"decision": "NO_TRADE"}
+        return _long(quality=config.ALERT_QUALITY_MIN - 1)
+
+    stats: dict = {}
+    out = backtest.replay_strategy("BTC/USDT:USDT", frames, decide_fn=stub, stats=stats)
+    assert out == []
+    assert stats["logged_only"] == 1 and stats["alerted"] == 0
+
+    # the same setup at the floor is scored, and the floor is overridable
+    def at_floor(fr):
+        if fr["5m"].index[-1] != target:
+            return {"decision": "NO_TRADE"}
+        return _long(quality=config.ALERT_QUALITY_MIN)
+
+    assert len(backtest.replay_strategy("BTC/USDT:USDT", frames, decide_fn=at_floor)) == 1
+    assert len(backtest.replay_strategy("BTC/USDT:USDT", frames, decide_fn=stub,
+                                       min_quality=0)) == 1
+
+
+def test_missing_rr_is_derived_from_the_levels_not_defaulted():
+    """The old `RR or 2.0` credited every row without an RR as a 2R win. The R a
+    TP hit actually delivers is |TP-entry| / |entry-SL| — geometry, no guess."""
+    start = datetime(2026, 8, 15, 13, 40, tzinfo=timezone.utc)
+    frame = _path(start, [(103.5, 99.8, 100.2), (104.5, 100.1, 104.2)])
+    row = _sig_row(TP=103.0, RR=None)          # 3 reward / 2 risk -> 1.5R
+    out = backtest.evaluate_signal(row, _fetcher(frame))
+    assert out["outcome"] == "WIN" and out["RR"] == 1.5 and out["r"] == 1.5
+
+    # a blank string from the CSV behaves like a missing value
+    assert backtest.evaluate_signal(_sig_row(TP=103.0, RR=""), _fetcher(frame))["RR"] == 1.5
+    # and a real logged RR is honoured verbatim
+    assert backtest.evaluate_signal(_sig_row(TP=103.0, RR=3.0),
+                                    _fetcher(frame))["RR"] == 3.0
+
+
+def test_strategy_report_declares_what_it_cannot_reproduce(tmp_path):
+    """--strategy reads like "the live bot on history", so the report has to name
+    the live inputs it cannot reconstruct."""
+    per_tf = {"1h": _ohlcv(_upframe(40, "1h")), "15m": _ohlcv(_upframe(80, "15min")),
+              "5m": _ohlcv(_upframe(120, "5min"))}
+    ex = _FakeExchange(per_tf)
+    report = backtest.run_strategy_backtest("BTC/USDT:USDT", ex, horizon_hours=24)
+    assert report["mode"] == "strategy-replay"
+    assert {"logged_only", "bars_evaluated", "limitations"} <= set(report)
+    assert report["bars_evaluated"] == 120
+    joined = " ".join(report["limitations"])
+    assert "funding" in joined and "open-interest" in joined and "alert floor" in joined
+
+    out = tmp_path / "report.txt"
+    backtest.write_report(report, out)
+    written = out.read_text()
+    assert "Replay limits" in written and "log-only, below the alert floor" in written

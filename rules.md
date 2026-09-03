@@ -7,7 +7,8 @@
 ## Libraries to use
 - `ccxt` → exchange data only (Binance USDT-M futures, public mode)
 - `pandas-ta` → ALL indicator calculations (never manual math)
-- `requests` → OpenRouter HTTP (AI explanation + chat assistant)
+- `requests` → the AI provider's HTTP endpoint (`AI_BASE_URL`, AgentRouter by
+  default) for the AI explanation, the opinion audit and the chat assistant
 - `python-telegram-bot` → alerts + chat listener
 - `APScheduler` → timer (never `sleep()` loops)
 - `python-dotenv` → load `.env` secrets
@@ -40,6 +41,11 @@
 - Check the duplicate guard **before** fetching OHLCV for a coin.
 - OHLCV TTL cache keyed `(symbol, timeframe)`; concurrent fetch capped at
   `FETCH_MAX_WORKERS` with a shared token bucket.
+- Only CLOSED candles, and never invent history: a frame shorter than the
+  requested window is served at its real length when it still covers
+  `FRAME_MIN_CANDLES` (40) candles — a fresh listing is readable, just with less
+  indicator warm-up — and dropped (with one WARNING) below that. Rejecting on
+  "fewer rows than asked for" made every newly listed perp permanently invisible.
 
 ## Indicator rules
 - RSI period 14 · EMA period 21 · VWAP daily · Bollinger 20/2 · ATR 14.
@@ -76,16 +82,69 @@
 - Alert tiers (owner's rule, 2026-09-01): quality < 30 → ignored (log-only);
   30-40 → LOW alert; 40-50 → NORMAL alert; 50-60 → HIGH alert; 60+ → STRONGEST alert.
 
-## AI rules (ai_decision.py — explanation only)
-- The LLM **never decides** and never returns signal/levels. It turns a finished
-  decision into prose; a slow, failed, or missing LLM is cosmetic.
-- Provider OpenRouter. Primary `AI_MODEL`, secondary `AI_MODEL_FALLBACK`, then the
+## AI transport rules (shared by every provider call)
+- The endpoint is `chat_completions_url()`, resolved on **every call**. A
+  module-level constant frozen from `config.AI_BASE_URL` at import kept posting to
+  the old host whenever the base URL changed later.
+- Headers come from one place: auth, JSON accept, and the browser-like
+  `User-Agent` the provider's WAF requires (bare `python-requests` gets
+  challenged). Every caller reuses it rather than copying the dict.
+- `stream: False` is explicit — some gateways default to SSE and the reply then
+  fails JSON parsing.
+
+## AI rules (ai_decision.py — explanation + background audit)
+- The LLM **never decides** what is emitted. It turns a finished decision into
+  prose and, in the background, records an independent opinion; a slow, failed, or
+  missing LLM is cosmetic.
+- The audit answer is graded against the emitted verdict in `ai_opinions.csv`
+  (`AGREE` / `DISAGREE` / `VETO_PROPOSED` / `SIGNAL_PROPOSED` / `NO_ANSWER`) and
+  `final_decision` always names what actually shipped. An opinion can earn trust
+  over time; it cannot buy a veto.
+- `--force-llm` is the only harness where a verdict is applied, and only after the
+  hard gates re-validate it (data validity, level sanity, stop width, min R/R,
+  quality floor).
+- Provider AgentRouter (`AI_BASE_URL`). Primary `AI_MODEL`
+  (`deepseek-v4-flash`), optional `AI_MODEL_FALLBACK` (empty by default), then the
   local template. Explanations are written by the local template **today**.
-- **Batch** candidates (sorted by `setup_quality`, chunked at `AI_BATCH_MAX=12`)
+- **Batch** candidates (sorted by `setup_quality`, chunked at `AI_BATCH_MAX=20`)
   into one request → JSON array keyed by symbol.
 - **Retry** `AI_RETRY_MAX=3` per model with exponential backoff on 429/5xx/timeout/bad-JSON.
 - `AI_MAX_TOKENS=2000`; `AI_REASONING_ENABLED=False` (token cap starves JSON if on).
-- Per-IST-day budget `AI_DAILY_BUDGET=50`; notify Telegram once when exhausted.
+- Per-IST-day budget `AI_DAILY_BUDGET=50`; notify Telegram once when exhausted —
+  the worker calls `ai_decision.budget_exhausted_notice()` after every batch, since
+  retries spend the budget too and silence would otherwise be indistinguishable
+  from "nothing worth alerting".
+- Prompt fidelity: what the model is told must match what the code measured. The
+  scheduled scan carries `feat_1h` into the bundle (the 1H sweep is real, not
+  "none detected"); liquidity flags are named by the pool they swept
+  (`long_ready` = a swept SELL-side pool, i.e. supports LONG); `range_pos` is
+  labelled against `CANDLE_LIMIT` (50), not the 20-candle swing window.
+
+## AI output-contract rules (ai_decision.py)
+- The JSON requirement is enforced in the REQUEST, not only in the prompt:
+  decision calls send `response_format={"type":"json_object"}` when the provider
+  accepts it. A 400 that names `response_format` disables the capability for the
+  process (one wasted request, never one per scan) and the audit line reports
+  `json_mode=off`.
+- Parsing is tolerant of punctuation, never of absence. Prose before/after the JSON
+  is skipped, fences stripped, an envelope key unwound, and a truncated block is
+  cut back to its last complete element. A verdict that never arrived is **absent**
+  — the setup keeps the deterministic answer. No repair may fabricate one.
+- The two failure classes are retried differently. Transport (429/5xx/timeout) is
+  retried identically; a parse failure (`AIDecisionError.parse_failure`) is retried
+  with an explicit correction turn, plus a larger `max_tokens` up to
+  `AI_MAX_TOKENS_RETRY_CAP` when `finish_reason=length` (or an unterminated block)
+  says the reply was cut off. Re-sending the same prompt to a model that answered in
+  prose is how the live box spent 9 budget units a scan for nothing.
+- Every batch logs one `AI AUDIT <scan>: n/m answered | LONG x SHORT y NO_TRADE z |
+  applied=never (audit-only) | json_mode=…` line, and `AIOpinionWorker.status()`
+  carries the same tallies for `/status`. The counters reset at the START of a run,
+  so a batch that dies mid-flight reports 0 answered rather than the previous
+  scan's success.
+- `ai_used` means "a model verdict replaced the deterministic one" and stays False
+  on scheduled scans by design. It must not be repurposed as an "AI is working"
+  signal, and never make the model a decision stage to make it True — the owner's
+  rule is audit-only until `agreement` in `ai_opinions.csv` justifies a change.
 
 ## Fallback rules (fallback.py)
 - The **decision** never falls back — the deterministic core always decides.
@@ -94,14 +153,77 @@
 - Alert footer: `Decision by deterministic core · explanation generated locally`.
 
 ## Duplicate guard rules
-- Track last signal timestamp per coin; same coin within 15 min → skip silently.
-- Applies to every decision (BUY/SELL/HOLD) to prevent log spam.
-- Reset at session end.
+- Two independent windows, both reset at session end (23:00 IST):
+  - **Alert cooldown** `DUPLICATE_COOLDOWN_MIN` (15): checked for every candidate
+    before its 15M/5M fetch, recorded only for alerted BUY/SELL. A HOLD must never
+    occupy it — that would mute a real setup appearing minutes later.
+  - **HOLD log cooldown** `HOLD_LOG_COOLDOWN_MIN` (30): an identical rejection
+    (same verdict + same blocking reason) is appended once per window per coin; a
+    changed verdict or reason is new information and is always written.
 
 ## Signal log rules
 - Append every BUY/SELL/HOLD to `signals_log.csv`; never delete or truncate.
 - Row built generically from `config.CSV_COLUMNS` (28 columns).
-- On startup, `migrate_csv_header()` archives a stale-header file to `.vN.bak`.
+- On startup, `migrate_csv_header()` archives a stale-header file to `.vN.bak`;
+  `ai_opinions.csv` reconciles its header the same way before appending.
+- CSV first, Telegram second: the row is persisted before delivery, and a write
+  error is contained per row (`main._persist` → `log_failed`) so one bad row can
+  never cost the rest of the scan its alerts.
+- Log level: BUY/SELL at INFO, HOLD at DEBUG — the audit trail keeps the row, the
+  journal keeps the events.
+
+## Risk-gate rules (risk_gate.py)
+- SL comes off structure, padded by `RISK_SL_BUFFER_ATR`; TP comes off the nearest
+  **usable** opposing zone, padded back by `RISK_TARGET_ZONE_PAD_ATR`.
+- "Usable" means the zone lies beyond the entry and the padded level stays on the
+  right side of it. Zones are scanned nearest-first (`RISK_TARGET_SCAN_ZONES`) and
+  an unusable one is skipped, not fatal — the price of the old nearest-only rule was
+  21/37 live coins rejected as "no achievable target" while a valid level sat a few
+  ATR deeper.
+- A level that cannot be reached is reported as `no_clear_target` with **no** TP;
+  a TP is never fabricated on the wrong side of the entry for a row that HOLDs.
+- `into_opposing_zone` (price already pressing into the zone) stays a hard reject:
+  that is no room, not a measurement gap.
+
+## Telegram command rules (telegram_bot.py)
+- `/scan_on` and `/scan_off` are **owner-only**, and the check **fails closed**:
+  `TELEGRAM_CHAT_ID` is the allow-list (comma-separated for several chats), and an
+  unset value authorises *nobody*. It used to authorise *everybody* — "no
+  restriction if chat_id not configured" handed a 24/7 scan session and the AI
+  daily budget to anyone who found the bot.
+- A refusal names its reason: unconfigured says set `TELEGRAM_CHAT_ID`,
+  non-owner says access denied. Both paths return before any command side effect,
+  so a regression in the guard shows up as a failed assertion, not a live scan
+  started from a test.
+- Read-only commands (`/status`, `/signals`, `/strategy`, `/help`, `/clear`, the
+  chat assistant) stay open to whoever can reach the bot; only *control* is gated.
+
+## Chat assistant rules (chat_assistant.py)
+- The assistant shares `ai_decision`'s transport (`ai_decision.complete_chat`) —
+  same endpoint resolved per call, same browser-like User-Agent, same retry
+  ladder and the same daily budget. Hand-rolling a second `requests.post` gave it
+  none of that: it died on the first 503 and its requests were invisible to the
+  cap they were spending.
+- Chat consumes the AI budget and says so via `budget_status()`; it is a provider
+  request like any other, not free.
+- A failed call answers with a clear "not answering right now", never an invented
+  reply. `/status`, `/signals`, `/strategy` work without the AI entirely.
+
+## Secrets and .env rules
+- Never paste a credential into this repo — not in docs, not in a test fixture.
+  The leak-watchdog in `config.py` stores **prefixes only**
+  (`_EXPOSED_TELEGRAM_TOKENS` / `_EXPOSED_OPENROUTER_KEYS`); a full value in the
+  list would be the very leak it exists to detect. `test_credentials.py` once held
+  the live bot token verbatim, which is how it reached public Git history — a test
+  now scans every tracked file for a full-shaped secret so it cannot come back.
+- Rotate first, then extend the prefix list with the leaked value's prefix, so
+  startup keeps warning until every host is updated. The warning silences itself
+  once `.env` carries a new credential.
+- Startup validates the AI config (`config.check_config_warnings()`) and logs
+  `CONFIG:` lines for a malformed `AI_BASE_URL` (quotes, spaces, a copied
+  markdown link), an empty `AI_MODEL`, a fallback equal to the primary, and a
+  model with no key. Those are silent-failure modes: the visible symptom is an
+  `ai_opinions.csv` full of FAILED rows while the daily budget keeps burning.
 
 ## Error handling
 - Exchange fetch fails → retry with backoff → skip coin.

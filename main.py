@@ -8,19 +8,26 @@ Every 5 minutes between 18:00 and 23:00 IST (60 scans/session):
     STEP 4 duplicate guard (15 min per coin) — checked BEFORE 15M/5M fetches
     STEP 5 15M confirmation + 5M entry; deterministic decision core over
            1H/15M/5M (structure, S/R, liquidity, price action, MTF, risk)
-    STEP 6 LLM decision stage — every shortlisted coin goes to the model with
-           its FULL FACTUAL data (one batched request: indicators, location,
-           sweep, liquidation, measured structure/S-R/MTF/futures facts,
-           calculated SL/TP/RR, warnings). NO Python verdict, NO_TRADE
-           reasons or quality scores are shown to the model — it chooses
-           LONG/SHORT/NO_TRADE independently.
-    STEP 7 post-LLM hard safety validation — the LLM's choice faces the hard
-           gates only (data validity, invalid levels, stop width, minimum
-           R/R, quality threshold); AI-unavailable falls back to the
-           deterministic decision
-    STEP 8 leverage suggestion + position size
-    STEP 9 Telegram alert (BUY/SELL at quality >= ALERT_QUALITY_MIN only,
-           everything else log-only) + signals_log.csv for every signal
+    STEP 6 deterministic emission (critical path) — the Python core's verdict
+           is what ships. Nothing here waits on, or is changed by, the model.
+    STEP 7 AI OPINION AUDIT (background, off the critical path) — every
+           shortlisted coin goes to the model with its FULL FACTUAL data (one
+           batched request: indicators, location, sweep, liquidation, measured
+           structure/S/R/MTF/futures facts, calculated SL/TP/RR, warnings) and
+           NO Python verdict, NO_TRADE reasons or quality scores, so the answer
+           is independent. It is recorded in ai_opinions.csv with an `agreement`
+           grade (AGREE / DISAGREE / VETO_PROPOSED / SIGNAL_PROPOSED / NO_ANSWER)
+           and can never change an emitted signal. Auditing is what makes the
+           stage honest: the owner can read how often the model would have
+           disagreed before ever handing it a veto.
+    STEP 8-9 rank by setup_quality, PERSIST to signals_log.csv FIRST, then the
+           Telegram alert (BUY/SELL at quality >= ALERT_QUALITY_MIN only,
+           everything else log-only; a blocked setup logs a silent HOLD row at
+           most once per HOLD_LOG_COOLDOWN_MIN)
+
+    `--force-llm` is the ONE place where an LLM verdict is applied (post-LLM
+    hard safety gates re-validate it): a test harness for what a real decision
+    stage would look like, never part of the schedule.
 
 Fetching is concurrent and batched per timeframe; a hard per-scan deadline
 (config.SCAN_DEADLINE_SECONDS) guarantees a scan can never bleed into the next
@@ -73,7 +80,13 @@ log = logging.getLogger("main")
 # (scheduled job, /scan_on session, --once) enters run_scan, which claims the
 # coordinator before touching the network.
 _coordinator = scan_coordinator.ScanCoordinator(duplicate_guard.DuplicateGuard)
-_ai_worker = scan_coordinator.AIOpinionWorker(ai_decision.llm_verdicts)
+# notify + budget_notice_fn wire the one-time "AI budget spent" Telegram line:
+# the audit stage is cosmetic, but going silent on it should never be a mystery.
+_ai_worker = scan_coordinator.AIOpinionWorker(
+    ai_decision.llm_verdicts,
+    notify=alerts.send_telegram_text,
+    budget_notice_fn=ai_decision.budget_exhausted_notice,
+)
 
 
 def get_coordinator() -> scan_coordinator.ScanCoordinator:
@@ -152,6 +165,21 @@ def _fmt_zone(zone: dict | None) -> str:
         return ""
     tag = "major" if zone.get("major") else "minor"
     return f"{tag}@{zone.get('mid')}"
+
+
+def _target_zone_label(risk: dict | None, opp_zone: dict | None) -> str:
+    """Which zone the TP came from, for the alert's "Target zone" line.
+
+    The risk gate's own answer wins, because it may have skipped a nearer zone
+    that straddles the entry: crediting `nearest_support`/`nearest_resistance`
+    in that case would name a level the TP was never taken from.
+    """
+    risk = risk or {}
+    zone = (risk.get("target_zone") or "").strip()
+    skipped = int(risk.get("target_skipped") or 0)
+    if not zone:
+        return _fmt_zone(opp_zone)
+    return f"{zone} (+{skipped} nearer zone(s) skipped)" if skipped else zone
 
 
 def _aligned_sweep(liq: dict | None, signal: str) -> dict | None:
@@ -258,7 +286,7 @@ def _build_sig(symbol: str, d: dict, signal: str, snap5: dict | None,
         "setup_quality": round(quality, 1),
         "htf_bias": d.get("htf_bias"),
         "structure": _summarize_structure(struct),
-        "sr_zone": _fmt_zone(opp_zone),
+        "sr_zone": _target_zone_label(d.get("risk"), opp_zone),
         "liquidity": _summarize_liquidity(liq, signal),
         "no_trade_reason": ", ".join(d.get("no_trade_reasons") or []),
         "data_warnings": ", ".join(d.get("data_warnings") or []),
@@ -371,6 +399,33 @@ def _apply_llm_verdict(d: dict, verdict: dict | None,
     # direction the core rejected): the hard safety gates decide, not opinions.
     out = decision_core.post_llm_validate(d, want)
     return out, _SIGNAL_MAP.get(out.get("decision"), "HOLD"), True, verdict.get("reason")
+
+
+def _hold_reason_key(sig: dict) -> str:
+    """Dedupe signature for a silent NO_TRADE row: verdict + blocking reasons.
+
+    Two identical rejections five minutes apart are the same information; a coin
+    whose blocking reason changed (`poor_rr` -> `counter_htf`) is a setup moving,
+    and that must stay in the log.
+    """
+    return f"{sig.get('decision')}|{sig.get('no_trade_reason')}"
+
+
+def _persist(sig: dict, summary: dict) -> bool:
+    """Append one row to signals_log.csv, containing any disk failure.
+
+    The write happens BEFORE the Telegram send, so it must never take the rest of
+    the scan down with it: one unwritable row used to abort the persist loop and
+    cost every remaining candidate its alert. The error is counted and logged.
+    """
+    try:
+        logger.log_signal(sig)
+        return True
+    except OSError as exc:
+        summary["log_failed"] = summary.get("log_failed", 0) + 1
+        log.error("signal log write failed for %s (%s) — continuing",
+                  sig.get("coin"), exc)
+        return False
 
 
 def _emission_kind(signal: str, quality: float) -> str:
@@ -535,8 +590,8 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         funding_rates = {}
     summary = {"scanned": len(symbols), "pass_1h": 0, "pass_15m": 0, "pass_5m": 0,
                "funding_rejected": 0, "duplicates": 0, "gate_rejected": 0,
-               "ai_used": 0, "llm_vetoed": 0, "signals": 0, "log_only": 0,
-               "holds": 0, "telegram_failed": 0, "ai_status": "QUEUED"}
+               "signals": 0, "log_only": 0, "holds": 0, "hold_deduped": 0,
+               "telegram_failed": 0, "log_failed": 0, "ai_status": "QUEUED"}
 
     # --- STEP 1+2: batch-fetch 1H for every symbol; structure funnel ---
     with _coordinator.stage("ohlcv_1h"):
@@ -570,8 +625,12 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                 log.debug("%s: duplicate within cooldown - skipped before LTF fetch", symbol)
                 continue
 
+            # feat_1h travels with the candidate: it carries the 1H sweep and the
+            # indicator snapshot the LLM bundle and the alert both read. Dropping
+            # it here made every scheduled scan tell the model "sweep: none
+            # detected" even when filter_1h had found one.
             candidates.append({"symbol": symbol, "direction": direction,
-                               "df_1h": df_1h, "fr": fr})
+                               "df_1h": df_1h, "feat_1h": feat, "fr": fr})
 
     # --- STEP 5a: batch-fetch 15M (setup TF) for the survivors ---
     with _coordinator.stage("ohlcv_15m"):
@@ -619,7 +678,6 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                                      symbol=symbol)
             last_price = ((tickers_last or {}).get(symbol) or d.get("entry")
                           or (snap5 or {}).get("close"))
-            c["feat_1h"] = c.get("feat_1h") or {}
             analysed.append((d, c, snap5, rsi_bounce, last_price))
 
             # per-symbol diagnostics live at DEBUG — the INFO funnel stays
@@ -637,23 +695,54 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         _coordinator.end(summary)
         return summary
 
-    # --- STEP 6: deterministic emission (critical path) ---
-    # Signals are built from the deterministic core, PERSISTED and alerted
-    # now. The AI opinion stage runs afterwards in the background (audit
-    # only) so a slow/failing model can never delay or block this scan.
-    decided = []   # (setup_quality, signal, sig, symbol) for ranked emission
-    ai_records = []   # audit rows for the background AI worker
+        # --- STEP 6: AI primary decision (critical path) ---
+    # AI decides LONG/SHORT/NO_TRADE from collected data.
+    # Python deterministic decision is fallback only (AI unavailable/timeout/budget).
+    decided = []
+    ai_records = []
+
+    # Build bundles for all analysed candidates
+    bundles_for_ai = []
+    analysed_map = {}
+    for d, c, snap5, rsi_bounce, last_price in analysed:
+        symbol = c["symbol"]
+        bundle = _build_decision_bundle(c, d, snap5, last_price)
+        if bundle:
+            bundles_for_ai.append(bundle)
+            analysed_map[symbol] = (d, c, snap5, rsi_bounce, last_price)
+
+    # Call AI for all candidates in one batch
+    ai_verdicts = {}
+    if config.LLM_DECISION_ENABLED and bundles_for_ai:
+        try:
+            raw_verdicts = llm_verdicts(bundles_for_ai)
+            for symbol, verdict in (raw_verdicts or {}).items():
+                ai_verdicts[symbol] = verdict
+        except Exception as exc:
+            log.warning("AI batch call failed — falling back to Python for all: %s", exc)
+
     for d, c, snap5, rsi_bounce, last_price in analysed:
         symbol, fr = c["symbol"], c["fr"]
-        signal = _SIGNAL_MAP.get(d.get("decision"), "HOLD")
-        quality = float(d.get("setup_quality") or 0.0)
+
+        verdict = ai_verdicts.get(symbol)
+        d_out, signal, ai_used, ai_reason = _apply_llm_verdict(d, verdict, symbol)
+
+        if not ai_used:
+            # Fallback: Python deterministic decision
+            signal = _SIGNAL_MAP.get(d.get("decision"), "HOLD")
+            d_out = d
+            log.info("[FALLBACK] %s — AI unavailable, Python decision used: %s", symbol, signal)
+
+        quality = float(d_out.get("setup_quality") or 0.0)
         if signal == "HOLD":
             summary["gate_rejected"] += 1
-            gates = ", ".join(d.get("no_trade_reasons") or []) or "insufficient confluence"
+            gates = ", ".join(d_out.get("no_trade_reasons") or []) or "insufficient confluence"
             log.debug("GATE %s: %s blocked — %s (quality=%.0f)", symbol,
-                      d.get("direction") or "n/a", gates, quality)
+                      d_out.get("direction") or "n/a", gates, quality)
 
-        sig = _build_sig(symbol, d, signal, snap5, rsi_bounce, fr, last_price)
+        sig = _build_sig(symbol, d_out, signal, snap5, rsi_bounce, fr, last_price)
+        sig["ai_used"] = ai_used
+        sig["ai_reason"] = ai_reason or ""
         base = symbol.split("/")[0].split(":")[0]
         sig["signal_id"] = f"{scan_id}-{base}-{signal}"
         decided.append((quality, signal, sig, symbol))
@@ -662,7 +751,6 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
             "signal_id": sig["signal_id"],
             "deterministic_decision": d.get("decision") or "NO_TRADE",
         })
-
     # --- STEP 8-9: rank by setup-quality; PERSIST FIRST, then alert ---
     # Strongest setups first. Emission rule (owner's tier system): HOLD
     # log-only; BUY/SELL below ALERT_QUALITY_MIN (50) log-only; at/above it
@@ -674,15 +762,26 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         for quality, signal, sig, symbol in decided:
             kind = _emission_kind(signal, quality)
             if kind == "hold":
-                logger.log_signal(sig)      # NO_TRADE: logged, no alert, no cooldown
-                summary["holds"] += 1
+                # NO_TRADE: logged, never alerted, never cooled down. The same
+                # blocked setup reappears on every scan, so an identical verdict
+                # + reason is written once per HOLD_LOG_COOLDOWN_MIN; a change in
+                # either is new information and always lands. The stamp goes on
+                # only after a successful write, so a disk error retries next scan.
+                hold_key = _hold_reason_key(sig)
+                if guard.hold_logged_recently(symbol, now_ist, hold_key):
+                    summary["hold_deduped"] += 1
+                    log.debug("%s HOLD already logged (reason unchanged)", symbol)
+                    continue
+                if _persist(sig, summary):
+                    guard.record_hold(symbol, now_ist, hold_key)
+                    summary["holds"] += 1
             elif kind == "log_only":
-                logger.log_signal(sig)      # below the Telegram quality threshold
+                _persist(sig, summary)      # below the Telegram quality threshold
                 summary["log_only"] += 1
                 log.debug("%s %s log-only (quality %.0f < %d)", symbol, signal,
                           quality, config.ALERT_QUALITY_MIN)
             else:
-                logger.log_signal(sig)      # PERSISTED before delivery
+                _persist(sig, summary)      # PERSISTED before delivery
                 with _coordinator.stage("telegram"):
                     sent = alerts.send_alert(sig)   # bounded (20s), failure logged
                 if not sent:
@@ -694,31 +793,27 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                          sig["leverage"], sig["position_size"])
                 guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
 
-    # --- STEP 7 (background): AI opinions, off the critical path ---
-    if config.LLM_DECISION_ENABLED:
-        bundles = [b for b in (_build_decision_bundle(c, d, snap5, last_price)
-                               for d, c, snap5, _rb, last_price in analysed) if b]
-        if _ai_worker.submit(scan_id, ai_records, bundles):
-            summary["ai_status"] = "QUEUED"
-
+      # --- STEP 7: AI already ran on critical path (see STEP 6) ---
+    summary["ai_status"] = "PRIMARY" if config.LLM_DECISION_ENABLED else "OFF"
     _log_funnel_summary(scan_id, summary)
     _coordinator.end(summary)
     return summary
-
-
 def _log_funnel_summary(scan_id: str, summary: dict) -> None:
     """One concise INFO block per scan (per-symbol detail stays at DEBUG)."""
     stages = _coordinator.stages
     critical_ms = sum(v for k, v in stages.items() if k != "telegram")
     log.info(
-        "SCAN #%s COMPLETE | universe %d | 1H %d | funnel %d/%d/%d | "
-        "gate_rejected %d | signals %d (log_only %d, holds %d) | "
-        "telegram_failed %d | critical %.1fs | AI %s",
+        "SCAN #%s COMPLETE | universe %d | 1H directional %d | decided %d | "
+        "funding %d | duplicates %d | gate_rejected %d | "
+        "alerts %d (log_only %d, holds %d, hold_deduped %d) | "
+        "log_failed %d | telegram_failed %d | "
+        "critical %.1fs | AI %s",
         scan_id, summary.get("scanned", 0), summary.get("pass_1h", 0),
-        summary.get("pass_15m", 0), summary.get("pass_5m", 0),
-        summary.get("pass_5m", 0), summary.get("gate_rejected", 0),
+        summary.get("pass_5m", 0), summary.get("funding_rejected", 0),
+        summary.get("duplicates", 0), summary.get("gate_rejected", 0),
         summary.get("signals", 0), summary.get("log_only", 0),
-        summary.get("holds", 0), summary.get("telegram_failed", 0),
+        summary.get("holds", 0), summary.get("hold_deduped", 0),
+        summary.get("log_failed", 0), summary.get("telegram_failed", 0),
         critical_ms / 1000.0, summary.get("ai_status", "OFF"))
 
 
@@ -873,10 +968,30 @@ def main() -> None:
     logger.migrate_csv_header()  # reconcile signals_log.csv to the current column set
     for warning in config.check_exposed_credentials():
         log.warning("SECURITY: %s", warning)
+    # .env mistakes that would otherwise surface as "the AI went quiet"
+    for warning in config.check_config_warnings():
+        log.warning("CONFIG: %s", warning)
     log.info("=== Crypto Signal Bot starting (model=%s @ %s, telegram=%s, ai_key=%s) ===",
              config.AI_MODEL, config.AI_BASE_URL,
              "configured" if config.TELEGRAM_TOKEN else "NOT configured",
              "configured" if config.OPENROUTER_API_KEY else "NOT configured")
+
+    # One line that states what the AI stage actually is, because "AI enabled" was
+    # readable four different ways: which model, whether the provider is being
+    # asked for JSON it must obey, how the token budget is sized, and — the one
+    # people keep getting wrong — that the answer is AUDITED, never applied. When
+    # `ai_used=False` shows up on every row, this line is the first thing to read:
+    # it is the expected value for a scheduled scan, not a failure.
+       log.info("AI CONTRACT: primary decision-maker (Python is fallback only) | "
+             "queue=every decided setup incl. HOLDs | model=%s fallback=%s | "
+             "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
+             "batch=%d retries=%d budget=%d/day | LLM_DECISION_ENABLED=%s",
+             config.AI_MODEL, config.AI_MODEL_FALLBACK or "none",
+             "on" if config.AI_JSON_MODE else "off",
+             "on" if config.AI_REASONING_ENABLED else "off",
+             config.AI_MAX_TOKENS, config.AI_MAX_TOKENS_RETRY_CAP,
+             config.AI_TIMEOUT_SECONDS, config.AI_BATCH_MAX, config.AI_RETRY_MAX,
+             config.AI_DAILY_BUDGET, config.LLM_DECISION_ENABLED)
 
     # News verification engine: discovery -> deterministic verification ->
     # (VERIFIED only) AI summary + impact analysis -> Telegram. Verification
