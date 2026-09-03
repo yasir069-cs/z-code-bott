@@ -1,0 +1,18 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+bot.log*
+# The signal log and every rotation of it. `.v1.bak` files were once committed on
+# main and they carry live rows; a history dump is not a repo object. (gitignore
+# takes no trailing comments, so these notes stay on their own lines.)
+signals_log*.csv
+signals_log*.csv*
+ai_opinions.csv
+ai_opinions.csv*
+backtest_report*
+backtest_strategy_report*
+news_alerted.json
+.pytest_cache/
+specs/
+*.bak

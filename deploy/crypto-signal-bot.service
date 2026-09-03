@@ -1,0 +1,26 @@
+# systemd service for Linux VMs (Oracle Cloud Always Free, GCP, etc.)
+# Install:
+#   sudo cp deploy/crypto-signal-bot.service /etc/systemd/system/
+#   sudo nano /etc/systemd/system/crypto-signal-bot.service   # fix User= and paths
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now crypto-signal-bot
+#   journalctl -u crypto-signal-bot -f                        # live logs
+
+[Unit]
+Description=Crypto Signal Bot (signals only, never trades)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# change to your VM username and project path
+User=ubuntu
+WorkingDirectory=/home/ubuntu/z-code-bott
+ExecStart=/home/ubuntu/z-code-bott/.venv/bin/python main.py
+Restart=always
+RestartSec=30
+# secrets come from .env (never committed to git)
+EnvironmentFile=/home/ubuntu/z-code-bott/.env
+
+[Install]
+WantedBy=multi-user.target
