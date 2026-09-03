@@ -73,8 +73,8 @@
   just below the STRONG tier) and is labelled in the alert. The **primary** sweep
   logic lives in `liquidity.py`
   (sweep + reclaim + mandatory confirmation, `LIQ_CONFIRM_REQUIRED`).
-- Alert tiers (owner's rule, 2026-09-01): quality < 50 → ignored (log-only);
-  50-60 → NORMAL alert; 60-70 → HIGH alert; 70+ → STRONGEST alert.
+- Alert tiers (owner's rule, 2026-09-01): quality < 30 → ignored (log-only);
+  30-40 → LOW alert; 40-50 → NORMAL alert; 50-60 → HIGH alert; 60+ → STRONGEST alert.
 
 ## AI rules (ai_decision.py — explanation only)
 - The LLM **never decides** and never returns signal/levels. It turns a finished
