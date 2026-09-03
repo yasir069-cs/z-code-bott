@@ -1,5 +1,24 @@
 # Config Tuning — Aggressive Loosening to Allow Signals Through
 
+> **Status 2026-09-02, superseded — read this first.** These commits never ran on the
+> server. Its HEAD is `f7dcbda` (the loosened floors), not `7b58611`/`94d7d9b`/
+> `84b910b`, so the gate reasons were never commented out there — which is exactly
+> why `no_clear_target`, `poor_rr` and `no_structure_stop` still fill
+> `signals_log.csv`. The scans after the "breakthrough" (`journalctl` Sep 02 12:07
+> and 12:20 **UTC** = 17:37/17:50 IST, i.e. 40 min later) still ended
+> `gate_rejected 41 | signals 0 (holds 41)`. Two reasons, both repaired in PR #2:
+> the reward side was *measured* wrongly (target read from the nearest opposing
+> zone, which is usually a wall the price sits inside — so `RR=0.01`-style values
+> and `no achievable target`), and zeroing `QUALITY_RR_NONE_PENALTY` /
+> `QUALITY_RR_MISS_PENALTY` while also commenting out `poor_rr` left reward:risk
+> enforced nowhere. The AI-side change here was a clearer error message that
+> *rejected* any reply starting with prose; the extractor now reads the JSON out of
+> the reply instead, and the provider is asked to constrain output to JSON.
+> The floors are now `.env`-tunable (`MIN_RR`, `QUALITY_MIN`, `QUALITY_PRIMARY_FLOOR`,
+> `ALERT_QUALITY_MIN`, `MIN_SCORE_*`) with defaults back at the spec values, and
+> `config.check_config_warnings()` reports a policy override at startup.
+> Kept as the record of what was tried, not as instructions.
+
 ## Changes Made (Sep 02)
 
 ### Primary Quality Gates

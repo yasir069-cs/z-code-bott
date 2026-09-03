@@ -321,11 +321,13 @@ def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str,
                 use_cache: bool = True) -> Optional[pd.DataFrame]:
     """Fetch CLOSED candles for symbol/timeframe.
 
-    Returns the last `limit + warmup` closed candles: the final `limit`
+    Returns up to `limit + warmup` closed candles: the final `limit`
     rows are the strategy window (zone/swing/volume logic), the earlier
     `warmup` rows let the pandas-ta recursions converge to TradingView
-    values. The still-forming candle is dropped. Returns None after 3
-    failed attempts (caller skips the coin).
+    values. The still-forming candle is dropped. A history shorter than the
+    full window is served as-is (a fresh listing is still readable — see
+    `FRAME_MIN_CANDLES`); only frames shorter than that minimum, or an
+    exchange that fails 3 times, return None and the caller skips the coin.
 
     Served from the candle-boundary cache when a valid frame is held.
     """
@@ -343,9 +345,8 @@ def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str,
         try:
             _bucket.acquire()
             rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=want + 1)
-            if not rows or len(rows) < want:
-                log.warning("%s %s: exchange returned %d rows (< %d), skipping",
-                            symbol, timeframe, len(rows or []), want)
+            if not rows:
+                log.warning("%s %s: exchange returned no rows, skipping", symbol, timeframe)
                 return None
             df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
@@ -354,11 +355,18 @@ def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str,
             now = datetime.now(timezone.utc)
             tf_delta = _TIMEFRAME_DELTA[timeframe]
             closed = df[df.index + tf_delta <= pd.Timestamp(now)]
-            if len(closed) < want:  # fresh listing; not enough closed history
-                log.warning("%s %s: only %d closed candles available, skipping",
-                            symbol, timeframe, len(closed))
+            if len(closed) < config.FRAME_MIN_CANDLES:  # fresh listing / thin history
+                log.warning("%s %s: only %d closed candles (< %d minimum), skipping",
+                            symbol, timeframe, len(closed), config.FRAME_MIN_CANDLES)
                 return None
             result = closed.tail(want)
+            if len(result) < want:
+                # A thin history is served, not rejected: the structural core reads
+                # the last 50 candles and needs only pivots, so a 44-bar frame is
+                # still a valid read — it just has less indicator warm-up, which
+                # the decision records as fewer converged values, not as a bug.
+                log.info("%s %s: short history (%d/%d candles) — indicator warm-up reduced",
+                         symbol, timeframe, len(result), want)
             if use_cache:
                 _ohlcv_cache.put(symbol, timeframe, want, result)
             return result

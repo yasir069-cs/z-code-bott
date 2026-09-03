@@ -17,12 +17,9 @@ never publishes an incomplete or overreaching message.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Optional
-
-import requests
 
 import config
 
@@ -187,41 +184,50 @@ def _validate(raw: dict, event) -> dict:
 
 
 def _parse_json(content: str) -> dict:
-    text = content.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-z]*\n?|\n?```$", "", text).strip()
+    """Parse the model's object — through the SHARED extractor, not a local regex.
+
+    The private version stripped a fence only when the reply *started* with one and
+    then fell back to `re.search(r"{.*}")`, which spans prose greedily and dies on a
+    reply truncated mid-object. `ai_decision` already learned how to read JSON out of
+    a messy reply (and how to report truncation); the news path now fails and
+    succeeds exactly like the decision path instead of having its own rules.
+    """
+    import ai_decision
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise AINewsError("AI response is not valid JSON")
+        parsed = ai_decision._extract_json(content)
+    except ai_decision.AIDecisionError as exc:
+        raise AINewsError(f"AI response is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise AINewsError(f"AI response is not a JSON object: {type(parsed).__name__}")
+    return parsed
 
 
 def _post(payload: dict) -> str:
-    def _request(p: dict) -> "requests.Response":
-        return requests.post(
-            f"{config.AI_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
-                     "Content-Type": "application/json"},
-            json=p, timeout=config.AI_TIMEOUT_SECONDS,
-        )
+    """The news transport is the shared one.
 
-    resp = _request(payload)
-    if resp.status_code == 400 and payload.get("response_format") is not None:
-        # Some models reject response_format outright; retry once without it.
-        # The JSON parser already copes with fenced/extracted JSON, so this
-        # is a safe retry, not a behaviour change.
-        log.info("News AI: response_format rejected; retrying without it")
-        payload = {k: v for k, v in payload.items() if k != "response_format"}
-        resp = _request(payload)
-    if resp.status_code != 200:
-        raise AINewsError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    This was the fourth hand-rolled `requests.post` in the codebase: same endpoint,
+    none of the guarantees — no browser-like User-Agent (the provider sits behind a
+    WAF that challenges the bare python-requests agent), no retry ladder, no
+    fallback model, and invisible to the daily budget it was spending. It also kept
+    its own `response_format` probe, so a gateway that rejects that field cost the
+    news path a request every time instead of learning once per process.
+
+    `analyze_event(event, market, _fetch=…)` keeps its payload-in signature, so the
+    injection point used by tests and callers is unchanged; only the transport under
+    it moved. `AIDecisionError` is re-thrown as `AINewsError` because the news
+    engine's contract to its caller is "skip this alert", never "raise at the scan".
+    """
+    import ai_decision
+
     try:
-        return resp.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, ValueError) as exc:
-        raise AINewsError(f"malformed response: {exc}") from exc
+        return ai_decision.complete_chat(
+            payload["messages"],
+            max_tokens=int(payload.get("max_tokens") or config.AI_MAX_TOKENS),
+            temperature=float(payload.get("temperature", config.AI_TEMPERATURE)),
+            json_mode=bool(payload.get("response_format")),
+        )
+    except ai_decision.AIDecisionError as exc:
+        raise AINewsError(str(exc)) from exc
 
 
 def analyze_event(event, market: Optional[dict] = None,

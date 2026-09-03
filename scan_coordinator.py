@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import csv
 import logging
+from collections import Counter
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +55,42 @@ class _StageTimer:
         return False
 
 
+def _json_mode_state() -> str:
+    """Whether the provider is currently accepting `response_format`.
+
+    Imported lazily: this module is deliberately import-light (it is constructed
+    before the AI layer in main), and a missing capability report must never
+    break the audit path that reports it.
+    """
+    try:
+        import ai_decision
+        caps = ai_decision.provider_caps()
+    except Exception:  # pragma: no cover - defensive: logging helper only
+        return "json_mode=unknown"
+    return ("json_mode=on" if caps.get("json_object")
+            else "json_mode=off (provider rejected response_format)")
+
+
+def _agreement(deterministic: str, verdict: dict) -> str:
+    """Grade one AI opinion against the verdict that was actually emitted.
+
+    The stage is audit-only, so disagreement is information for the owner rather
+    than a veto — VETO_PROPOSED marks "the model would have suppressed this
+    signal", SIGNAL_PROPOSED marks "the model would have alerted this HOLD".
+    """
+    opinion = (verdict or {}).get("signal")
+    if not opinion:
+        return "NO_ANSWER"
+    det = (deterministic or "NO_TRADE").upper()
+    if opinion == det:
+        return "AGREE"
+    if opinion == "NO_TRADE" and det in ("LONG", "SHORT"):
+        return "VETO_PROPOSED"
+    if det == "NO_TRADE" and opinion in ("LONG", "SHORT"):
+        return "SIGNAL_PROPOSED"
+    return "DISAGREE"
+
+
 class AIOpinionWorker:
     """Single-worker background executor for AI opinions.
 
@@ -64,8 +101,17 @@ class AIOpinionWorker:
     bounded, and the worker never emits alerts.
     """
 
-    def __init__(self, verdicts_fn: Callable):
+    def __init__(self, verdicts_fn: Callable,
+                 notify: Optional[Callable[[str], bool]] = None,
+                 budget_notice_fn: Optional[Callable[[], Optional[str]]] = None):
         self._verdicts_fn = verdicts_fn
+        # notify / budget_notice_fn are injected (main wires alerts + ai_decision)
+        # so this module stays import-light and testable. The provider's daily cap
+        # is spent on retries too, so the owner is told once per day when the audit
+        # stage goes quiet — otherwise ai_opinions.csv just fills with UNAVAILABLE
+        # rows and nothing explains why.
+        self._notify = notify
+        self._budget_notice_fn = budget_notice_fn
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai-worker")
         self._pending = 0
         self._lock = threading.Lock()
@@ -73,6 +119,14 @@ class AIOpinionWorker:
         self.last_finished_at: Optional[datetime] = None
         self.last_duration_s: float = 0.0
         self.last_queue_delay_s: float = 0.0
+        # What the last batch actually produced, so "is the AI stage working?" is
+        # answerable from /status and the journal instead of by opening
+        # ai_opinions.csv: how many of the queued setups got a verdict, the
+        # LONG/SHORT/NO_TRADE counts, and the failure text when none did.
+        self.last_answered: int = 0
+        self.last_expected: int = 0
+        self.last_tally: dict[str, int] = {}
+        self.last_error: str = ""
 
     def submit(self, scan_id: str, records: list, bundles: list) -> bool:
         """Queue one AI opinion batch. Returns False when the queue is full
@@ -100,11 +154,13 @@ class AIOpinionWorker:
             except Exception as exc:
                 name = type(exc).__name__
                 self.last_status = "TIMEOUT" if "timeout" in str(exc).lower() else "FAILED"
+                self.last_error = f"{name}: {exc}"[:200]
                 log.warning("AI opinion batch for scan %s failed (%s: %s) — scan "
                             "unaffected, deterministic signals stand", scan_id, name, exc)
             finally:
                 self.last_duration_s = round(time.monotonic() - started, 2)
                 self.last_finished_at = datetime.now(config.TZ)
+                self._notify_budget_exhausted()
 
         self._pool.submit(_task)
         return True
@@ -112,6 +168,13 @@ class AIOpinionWorker:
     def _run(self, scan_id: str, records: list, bundles: list) -> None:
         """Fetch verdicts and write the audit rows. AI failure states map to
         distinct statuses; malformed responses surface as FAILED, not crash."""
+        # Reset before the call, not after it: a batch that dies mid-flight must
+        # leave "0 of n answered" behind, or /status keeps reporting the previous
+        # scan's success and the outage is invisible exactly when it matters.
+        self.last_expected = len(records)
+        self.last_answered = 0
+        self.last_tally = {}
+        self.last_error = ""
         verdicts: dict = {}
         try:
             verdicts = self._verdicts_fn(bundles)
@@ -122,16 +185,42 @@ class AIOpinionWorker:
             raise
 
         self._write_rows(scan_id, records, verdicts, "SUCCESS", "")
+        tally = Counter((verdicts.get(rec["symbol"]) or {}).get("signal") or "NO_ANSWER"
+                        for rec in records)
+        agreement = Counter(_agreement(rec["deterministic_decision"],
+                                       verdicts.get(rec["symbol"]) or {}) for rec in records)
+        self.last_tally = {
+            "LONG": tally.get("LONG", 0), "SHORT": tally.get("SHORT", 0),
+            "NO_TRADE": tally.get("NO_TRADE", 0), "NO_ANSWER": tally.get("NO_ANSWER", 0),
+            "AGREE": agreement.get("AGREE", 0), "DISAGREE": agreement.get("DISAGREE", 0),
+            "VETO_PROPOSED": agreement.get("VETO_PROPOSED", 0),
+            "SIGNAL_PROPOSED": agreement.get("SIGNAL_PROPOSED", 0),
+        }
+        self.last_answered = sum(tally.get(sig, 0) for sig in ("LONG", "SHORT", "NO_TRADE"))
+        # The single line that answers "did the model actually answer, and was it
+        # used?" — it is not used, by design: the deterministic verdict shipped
+        # before this batch returned, and the audit row records the disagreement
+        # instead of acting on it. Reading the CSV to learn this was the old way.
+        log.info("AI AUDIT %s: %d/%d answered | LONG %d SHORT %d NO_TRADE %d no-answer %d | "
+                 "agreement AGREE %d VETO_PROPOSED %d SIGNAL_PROPOSED %d DISAGREE %d | "
+                 "applied=never "
+                 "(audit-only) | %s",
+                 scan_id, self.last_answered, len(records),
+                 self.last_tally["LONG"], self.last_tally["SHORT"], self.last_tally["NO_TRADE"],
+                 self.last_tally["NO_ANSWER"], self.last_tally["AGREE"],
+                 self.last_tally["VETO_PROPOSED"], self.last_tally["SIGNAL_PROPOSED"],
+                 self.last_tally["DISAGREE"], _json_mode_state())
         for rec in records:
             verdict = verdicts.get(rec["symbol"])
-            log.info("AI opinion %s: deterministic=%s ai=%s status=%s",
-                     rec["symbol"], rec["deterministic_decision"],
-                     (verdict or {}).get("signal"),
-                     "SUCCESS" if verdict else "UNAVAILABLE")
+            log.debug("AI opinion %s: deterministic=%s ai=%s status=%s",
+                      rec["symbol"], rec["deterministic_decision"],
+                      (verdict or {}).get("signal"),
+                      "SUCCESS" if verdict else "UNAVAILABLE")
 
     def _write_rows(self, scan_id: str, records: list, verdicts: dict,
                     status: str, error: str) -> None:
         try:
+            self._reconcile_header()
             new_file = not config.AI_OPINIONS_LOG_FILE.exists()
             with open(config.AI_OPINIONS_LOG_FILE, "a", newline="",
                       encoding="utf-8") as fh:
@@ -159,16 +248,73 @@ class AIOpinionWorker:
                         "ai_status": ai_status,
                         "ai_confidence": verdict.get("confidence", ""),
                         "ai_reason": (verdict.get("reason") or error or "")[:300],
+                        "agreement": _agreement(rec["deterministic_decision"], verdict),
+                        # audit-only stage: what shipped is the deterministic call
                         "final_decision": rec["deterministic_decision"],
                     })
         except OSError as exc:
             log.warning("ai_opinions.csv write failed: %s", exc)
 
+    def _notify_budget_exhausted(self) -> None:
+        """One Telegram line per IST day, the first time the AI budget is spent.
+
+        `ai_decision.budget_exhausted_notice()` hands out its text exactly once a
+        day; this is the only caller that ever delivers it.
+        """
+        if self._budget_notice_fn is None or self._notify is None:
+            return
+        try:
+            notice = self._budget_notice_fn()
+            if notice:
+                self._notify("<b>\U0001F916 AI opinion budget</b>\n" + notice)
+        except Exception as exc:            # a failed notice must never break the worker
+            log.warning("AI budget notice failed (%s)", exc)
+
+    def _reconcile_header(self) -> None:
+        """Archive ai_opinions.csv when its header no longer matches the columns.
+
+        Same rule signals_log.csv follows: history is never rewritten in place and
+        a DictWriter must never put new fields under an old header.
+        """
+        path = config.AI_OPINIONS_LOG_FILE
+        if not path.exists():
+            return
+        try:
+            with open(path, newline="", encoding="utf-8") as fh:
+                header = next(csv.reader(fh), None)
+        except OSError as exc:
+            log.warning("could not read %s header: %s", path.name, exc)
+            return
+        if header == list(config.AI_OPINION_COLUMNS):
+            return
+        bak = path.parent / (path.name + ".v1.bak")
+        n = 2
+        while bak.exists():
+            bak = path.parent / (path.name + ".v%d.bak" % n)
+            n += 1
+        try:
+            path.rename(bak)
+            log.warning("%s columns changed (%d -> %d); archived old file to %s",
+                        path.name, len(header or []), len(config.AI_OPINION_COLUMNS),
+                        bak.name)
+        except OSError as exc:
+            log.warning("could not archive stale %s: %s", path.name, exc)
+
     def status(self) -> dict:
+        """The last batch's outcome, for /status and the health snapshot.
+
+        `answered`/`expected` is the number that separates "the AI stage is
+        working" from "the audit is silently empty" — an UNAVAILABLE-filled
+        ai_opinions.csv and a healthy-looking journal looked identical before.
+        """
         return {"last_status": self.last_status,
                 "pending": self._pending,
                 "last_duration_s": self.last_duration_s,
-                "last_queue_delay_s": self.last_queue_delay_s}
+                "last_queue_delay_s": self.last_queue_delay_s,
+                "answered": self.last_answered,
+                "expected": self.last_expected,
+                "tally": dict(self.last_tally),
+                "last_error": self.last_error}
 
 
 class ScanCoordinator:
