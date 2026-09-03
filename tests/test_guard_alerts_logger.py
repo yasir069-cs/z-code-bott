@@ -109,7 +109,7 @@ def test_no_sweep_alert_caps_confidence_and_labels_it():
     sig = _sig(confidence=config.NO_SWEEP_CONFIDENCE_CAP, confluence=66.0,
                sweep=dict(detected=False))
     text = alerts.format_alert(sig)
-    assert "HIGH" in text                       # 69.0 -> below the 70 STRONG gate
+    assert "HIGH" in text                       # 59.0 -> below the 60 STRONG gate
     assert "Not detected" in text and "capped" in text
 
 

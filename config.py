@@ -20,12 +20,12 @@ TZ = ZoneInfo("Asia/Kolkata")  # IST = UTC+5:30, no DST
 # ------------------------------------------------------------------ secrets
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-# NVIDIA is the active provider. We accept legacy OpenRouter/AgentRouter names as
-# fallbacks so older .env files continue to work without breaking the app.
+# OpenRouter is the default provider. Legacy NVIDIA/AgentRouter key names remain
+# accepted so existing deployments keep working when their endpoint is explicit.
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "").strip()
-OPENROUTER_API_KEY = (NVIDIA_API_KEY
+OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY")
                       or os.getenv("AGENTROUTER_API_KEY")
-                      or os.getenv("OPENROUTER_API_KEY", "")).strip()
+                      or NVIDIA_API_KEY).strip()
 
 # ------------------------------------------------------------------ scanner
 EXCHANGE_ID = "binance"
@@ -128,9 +128,9 @@ CONFLUENCE_W_15M = 0.30
 CONFLUENCE_W_5M = 0.30
 
 # Sweep is required for the STRONGEST alert tier: without it the confidence is
-# capped just below ALERT_TIER_STRONG_MIN (70) and the alert is labelled
+# capped just below ALERT_TIER_STRONG_MIN (60) and the alert is labelled
 # "no sweep" — a no-sweep setup can reach HIGH but never STRONG.
-NO_SWEEP_CONFIDENCE_CAP = 69.0
+NO_SWEEP_CONFIDENCE_CAP = 59.0
 
 # ------------------------------------------------------------------ liquidation sweep
 # Values below were tuned by hand on the live server (loosened from 5/2.0 after
@@ -157,13 +157,11 @@ RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "2.0"))  # max 2% ris
 LEV_ATR_LOW = 0.01               # ATR < 1% of price -> high leverage OK
 LEV_ATR_HIGH = 0.03              # ATR > 3% of price -> low leverage only
 
-# ------------------------------------------------------------------ AI (NVIDIA / OpenAI-compatible)
-# NVIDIA is the active default endpoint for the DeepSeek v4 Flash model.
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
-AI_MODEL = os.getenv("AI_MODEL", "deepseek-ai/deepseek-v4-flash-0731")
-# Secondary model, tried when the primary fails every retry. Empty by default:
-# set AI_MODEL_FALLBACK in .env when the provider offers a second usable model.
-# Only after both paths fail does the run fall back to the pure-Python indicator decision.
+# ------------------------------------------------------------------ AI (OpenAI-compatible)
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free").strip()
+# The fallback setting accepts one model or a comma-separated ladder. Each model
+# gets the same bounded retry policy.
 AI_MODEL_FALLBACK = os.getenv("AI_MODEL_FALLBACK", "").strip()
 AI_MAX_TOKENS = 8000            # 2000 was too small for 20-coin batches: the
                                 # model burned the budget on chain-of-thought

@@ -156,23 +156,22 @@ def test_flip_rejection_reasons_are_deterministic_not_llm_opinion():
 def test_emission_rule():
     """Owner's tier system: below 50 ignored (log-only), 50+ alerts."""
     assert _emission_kind("HOLD", 90.0) == "hold"
-    assert _emission_kind("BUY", 49.9) == "log_only"
-    assert _emission_kind("SELL", 49.99) == "log_only"
-    assert _emission_kind("BUY", 50.0) == "alert"
-    assert _emission_kind("SELL", 55.0) == "alert"
-    assert _emission_kind("BUY", 65.0) == "alert"
+    assert _emission_kind("BUY", 29.9) == "log_only"
+    assert _emission_kind("SELL", 29.99) == "log_only"
+    assert _emission_kind("BUY", 30.0) == "alert"
+    assert _emission_kind("SELL", 35.0) == "alert"
+    assert _emission_kind("BUY", 45.0) == "alert"
     assert _emission_kind("SELL", 80.0) == "alert"
 
 
 def test_alert_quality_tiers_from_config():
-    """The tier boundaries live in config: 50 floor, NORMAL 50-60, HIGH 60-70,
-    STRONG 70+. The no-sweep cap sits just below STRONG so a no-sweep setup
-    can reach HIGH but never the strongest tier."""
-    assert config.ALERT_QUALITY_MIN == 50
-    assert config.ALERT_TIER_NORMAL_MIN == 50
-    assert config.ALERT_TIER_HIGH_MIN == 60
-    assert config.ALERT_TIER_STRONG_MIN == 70
-    assert config.QUALITY_MIN == 50            # decision gate matches the alert floor
+    """The tier boundaries live in config: 30 floor, NORMAL 40-50, HIGH 50-60,
+    STRONG 60+. The no-sweep cap sits just below STRONG."""
+    assert config.ALERT_QUALITY_MIN == 30
+    assert config.ALERT_TIER_NORMAL_MIN == 40
+    assert config.ALERT_TIER_HIGH_MIN == 50
+    assert config.ALERT_TIER_STRONG_MIN == 60
+    assert config.QUALITY_MIN == 42
     assert config.NO_SWEEP_CONFIDENCE_CAP < config.ALERT_TIER_STRONG_MIN
 
 
@@ -181,12 +180,12 @@ def test_alert_tier_labels():
     Telegram message."""
     import alerts
     assert alerts._conf_label(75.0)[1] == "STRONG"
-    assert alerts._conf_label(70.0)[1] == "STRONG"
-    assert alerts._conf_label(69.9)[1] == "HIGH"
-    assert alerts._conf_label(60.0)[1] == "HIGH"
-    assert alerts._conf_label(59.9)[1] == "NORMAL"
-    assert alerts._conf_label(50.0)[1] == "NORMAL"
-    assert alerts._conf_label(45.0)[1] == "LOW"     # below floor: defensive only
+    assert alerts._conf_label(60.0)[1] == "STRONG"
+    assert alerts._conf_label(59.9)[1] == "HIGH"
+    assert alerts._conf_label(50.0)[1] == "HIGH"
+    assert alerts._conf_label(49.9)[1] == "NORMAL"
+    assert alerts._conf_label(40.0)[1] == "NORMAL"
+    assert alerts._conf_label(35.0)[1] == "LOW"     # below floor: defensive only
     assert alerts._conf_label("strong")[1] == "STRONG"
 
 

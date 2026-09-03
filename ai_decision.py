@@ -821,8 +821,11 @@ def _complete(messages: list, parse=None, deadline: Optional[float] = None):
         raise AIDecisionError("OPENROUTER_API_KEY not configured")
 
     models = [config.AI_MODEL]
-    if config.AI_MODEL_FALLBACK and config.AI_MODEL_FALLBACK != config.AI_MODEL:
-        models.append(config.AI_MODEL_FALLBACK)
+    configured_fallbacks = config.AI_MODEL_FALLBACK.split(",")
+    for fallback_model in configured_fallbacks:
+        fallback_model = fallback_model.strip()
+        if fallback_model and fallback_model not in models:
+            models.append(fallback_model)
 
     last: Optional[AIDecisionError] = None
     for model_index, model in enumerate(models):

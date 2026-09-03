@@ -316,9 +316,8 @@ def test_reasoning_never_leaks_into_signal(monkeypatch):
 
 
 # ------------------------------------------------------ AI provider transport
-def test_llm_transport_defaults_to_agentrouter(monkeypatch):
-    """The AI layer talks to AgentRouter by default: key from
-    OPENROUTER_API_KEY, endpoint derived from AI_BASE_URL, model deepseek-v4-flash."""
+def test_llm_transport_defaults_to_openrouter(monkeypatch):
+    """The AI layer defaults to OpenRouter's OpenAI-compatible endpoint."""
     import importlib
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
@@ -327,14 +326,13 @@ def test_llm_transport_defaults_to_agentrouter(monkeypatch):
     monkeypatch.delenv("AI_MODEL_FALLBACK", raising=False)
     cfg = importlib.reload(config)
     assert cfg.OPENROUTER_API_KEY == "sk-or-test"
-    assert cfg.AI_BASE_URL == "https://agentrouter.org/v1"
-    assert cfg.AI_MODEL == "deepseek-v4-flash"
-    assert ai_decision.OPENROUTER_URL == "https://agentrouter.org/v1/chat/completions"
+    assert cfg.AI_BASE_URL == "https://openrouter.ai/api/v1"
+    assert cfg.AI_MODEL == "nvidia/nemotron-3-ultra-550b-a55b:free"
+    assert ai_decision.OPENROUTER_URL == "https://openrouter.ai/api/v1/chat/completions"
 
 
 def test_empty_fallback_model_disables_the_second_model(monkeypatch):
-    """With AI_MODEL_FALLBACK empty (the AgentRouter default — the key serves
-    one model) the retry ladder stops after the primary model's attempts."""
+    """An empty fallback setting stops after the primary model's attempts."""
     monkeypatch.setattr(config, "OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.setattr(config, "AI_MODEL_FALLBACK", "")
     state = _counting_post(monkeypatch, [_Resp(status=503, text="down")])
