@@ -982,7 +982,7 @@ def main() -> None:
     # people keep getting wrong — that the answer is AUDITED, never applied. When
     # `ai_used=False` shows up on every row, this line is the first thing to read:
     # it is the expected value for a scheduled scan, not a failure.
-       log.info("AI CONTRACT: primary decision-maker (Python is fallback only) | "
+    log.info("AI CONTRACT: primary decision-maker (Python is fallback only) | "
              "queue=every decided setup incl. HOLDs | model=%s fallback=%s | "
              "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
              "batch=%d retries=%d budget=%d/day | LLM_DECISION_ENABLED=%s",
