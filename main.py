@@ -695,23 +695,54 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         _coordinator.end(summary)
         return summary
 
-    # --- STEP 6: deterministic emission (critical path) ---
-    # Signals are built from the deterministic core, PERSISTED and alerted
-    # now. The AI opinion stage runs afterwards in the background (audit
-    # only) so a slow/failing model can never delay or block this scan.
-    decided = []   # (setup_quality, signal, sig, symbol) for ranked emission
-    ai_records = []   # audit rows for the background AI worker
+        # --- STEP 6: AI primary decision (critical path) ---
+    # AI decides LONG/SHORT/NO_TRADE from collected data.
+    # Python deterministic decision is fallback only (AI unavailable/timeout/budget).
+    decided = []
+    ai_records = []
+
+    # Build bundles for all analysed candidates
+    bundles_for_ai = []
+    analysed_map = {}
+    for d, c, snap5, rsi_bounce, last_price in analysed:
+        symbol = c["symbol"]
+        bundle = _build_decision_bundle(c, d, snap5, last_price)
+        if bundle:
+            bundles_for_ai.append(bundle)
+            analysed_map[symbol] = (d, c, snap5, rsi_bounce, last_price)
+
+    # Call AI for all candidates in one batch
+    ai_verdicts = {}
+    if config.LLM_DECISION_ENABLED and bundles_for_ai:
+        try:
+            raw_verdicts = llm_verdicts(bundles_for_ai)
+            for symbol, verdict in (raw_verdicts or {}).items():
+                ai_verdicts[symbol] = verdict
+        except Exception as exc:
+            log.warning("AI batch call failed — falling back to Python for all: %s", exc)
+
     for d, c, snap5, rsi_bounce, last_price in analysed:
         symbol, fr = c["symbol"], c["fr"]
-        signal = _SIGNAL_MAP.get(d.get("decision"), "HOLD")
-        quality = float(d.get("setup_quality") or 0.0)
+
+        verdict = ai_verdicts.get(symbol)
+        d_out, signal, ai_used, ai_reason = _apply_llm_verdict(d, verdict, symbol)
+
+        if not ai_used:
+            # Fallback: Python deterministic decision
+            signal = _SIGNAL_MAP.get(d.get("decision"), "HOLD")
+            d_out = d
+            log.info("[FALLBACK] %s — AI unavailable, Python decision used: %s", symbol, signal)
+
+        quality = float(d_out.get("setup_quality") or 0.0)
         if signal == "HOLD":
             summary["gate_rejected"] += 1
-            gates = ", ".join(d.get("no_trade_reasons") or []) or "insufficient confluence"
+            gates = ", ".join(d_out.get("no_trade_reasons") or []) or "insufficient confluence"
             log.debug("GATE %s: %s blocked — %s (quality=%.0f)", symbol,
-                      d.get("direction") or "n/a", gates, quality)
+                      d_out.get("direction") or "n/a", gates, quality)
 
-        sig = _build_sig(symbol, d, signal, snap5, rsi_bounce, fr, last_price)
+        sig = _build_sig(symbol, d_out, signal, snap5, rsi_bounce, fr, last_price)
+        sig["ai_used"] = ai_used
+        sig["ai_reason"] = ai_reason or ""
         base = symbol.split("/")[0].split(":")[0]
         sig["signal_id"] = f"{scan_id}-{base}-{signal}"
         decided.append((quality, signal, sig, symbol))
@@ -720,7 +751,6 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
             "signal_id": sig["signal_id"],
             "deterministic_decision": d.get("decision") or "NO_TRADE",
         })
-
     # --- STEP 8-9: rank by setup-quality; PERSIST FIRST, then alert ---
     # Strongest setups first. Emission rule (owner's tier system): HOLD
     # log-only; BUY/SELL below ALERT_QUALITY_MIN (50) log-only; at/above it
@@ -763,18 +793,11 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                          sig["leverage"], sig["position_size"])
                 guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
 
-    # --- STEP 7 (background): AI opinions, off the critical path ---
-    if config.LLM_DECISION_ENABLED:
-        bundles = [b for b in (_build_decision_bundle(c, d, snap5, last_price)
-                               for d, c, snap5, _rb, last_price in analysed) if b]
-        if _ai_worker.submit(scan_id, ai_records, bundles):
-            summary["ai_status"] = "QUEUED"
-
+      # --- STEP 7: AI already ran on critical path (see STEP 6) ---
+    summary["ai_status"] = "PRIMARY" if config.LLM_DECISION_ENABLED else "OFF"
     _log_funnel_summary(scan_id, summary)
     _coordinator.end(summary)
     return summary
-
-
 def _log_funnel_summary(scan_id: str, summary: dict) -> None:
     """One concise INFO block per scan (per-symbol detail stays at DEBUG)."""
     stages = _coordinator.stages
@@ -959,8 +982,7 @@ def main() -> None:
     # people keep getting wrong — that the answer is AUDITED, never applied. When
     # `ai_used=False` shows up on every row, this line is the first thing to read:
     # it is the expected value for a scheduled scan, not a failure.
-    log.info("AI CONTRACT: audit-only (deterministic verdict is what ships; "
-             "--force-llm is the only path that applies a model verdict) | "
+       log.info("AI CONTRACT: primary decision-maker (Python is fallback only) | "
              "queue=every decided setup incl. HOLDs | model=%s fallback=%s | "
              "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
              "batch=%d retries=%d budget=%d/day | LLM_DECISION_ENABLED=%s",
