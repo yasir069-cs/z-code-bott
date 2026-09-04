@@ -715,7 +715,7 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
     ai_verdicts = {}
     if config.LLM_DECISION_ENABLED and bundles_for_ai:
         try:
-            raw_verdicts = llm_verdicts(bundles_for_ai)
+            raw_verdicts = llm_verdicts(bundles_for_ai, deadline=deadline)
             for symbol, verdict in (raw_verdicts or {}).items():
                 ai_verdicts[symbol] = verdict
         except Exception as exc:
@@ -889,6 +889,7 @@ def build_scheduler() -> BlockingScheduler:
     session = {"streak": 0, "scans": 0, "signals": 0}
 
     def scan_job() -> None:
+        t0 = time.monotonic()
         try:
             tickers = exchange.fetch_tickers()
             funding_rates = scanner.fetch_funding_rates(exchange)
@@ -904,6 +905,11 @@ def build_scheduler() -> BlockingScheduler:
                     f"⚠️ <b>Bot health warning</b>\n"
                     f"3 scans in a row failed (last: {type(exc).__name__}). "
                     f"Signals may be paused — check the server.")
+        finally:
+            elapsed = time.monotonic() - t0
+            if elapsed > config.SCAN_INTERVAL_MIN * 60 * 0.8:  # >80% of 5min slot
+                log.warning("⚠️ Scan took %.1fs (slot is %ds) — next scan may be skipped!",
+                            elapsed, config.SCAN_INTERVAL_MIN * 60)
 
     # 18:00:15, 18:05:15 ... 22:55:15 -> 60 scans, no hour-boundary overlap
     scheduler.add_job(
