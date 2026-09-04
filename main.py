@@ -715,7 +715,7 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
     ai_verdicts = {}
     if config.LLM_DECISION_ENABLED and bundles_for_ai:
         try:
-            raw_verdicts = llm_verdicts(bundles_for_ai, deadline=deadline)
+            raw_verdicts = ai_decision.llm_verdicts(bundles_for_ai, deadline=deadline)
             for symbol, verdict in (raw_verdicts or {}).items():
                 ai_verdicts[symbol] = verdict
         except Exception as exc:
