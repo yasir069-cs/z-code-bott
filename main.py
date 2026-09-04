@@ -8,26 +8,33 @@ Every 5 minutes between 18:00 and 23:00 IST (60 scans/session):
     STEP 4 duplicate guard (15 min per coin) — checked BEFORE 15M/5M fetches
     STEP 5 15M confirmation + 5M entry; deterministic decision core over
            1H/15M/5M (structure, S/R, liquidity, price action, MTF, risk)
-    STEP 6 deterministic emission (critical path) — the Python core's verdict
-           is what ships. Nothing here waits on, or is changed by, the model.
-    STEP 7 AI OPINION AUDIT (background, off the critical path) — every
-           shortlisted coin goes to the model with its FULL FACTUAL data (one
-           batched request: indicators, location, sweep, liquidation, measured
-           structure/S/R/MTF/futures facts, calculated SL/TP/RR, warnings) and
-           NO Python verdict, NO_TRADE reasons or quality scores, so the answer
-           is independent. It is recorded in ai_opinions.csv with an `agreement`
-           grade (AGREE / DISAGREE / VETO_PROPOSED / SIGNAL_PROPOSED / NO_ANSWER)
-           and can never change an emitted signal. Auditing is what makes the
-           stage honest: the owner can read how often the model would have
-           disagreed before ever handing it a veto.
+    STEP 6 LLM PRIMARY DECISION (critical path, budget/quality-gated) — only
+           candidates whose deterministic setup_quality clears
+           config.MIN_QUALITY_FOR_AI (and at most config.MAX_CANDIDATES_FOR_AI
+           per scan, ranked by quality) go to the model with their FULL
+           FACTUAL data (one batched request: indicators, location, sweep,
+           liquidation, measured structure/S/R/MTF/futures facts, calculated
+           SL/TP/RR, warnings) and NO Python verdict, NO_TRADE reasons or
+           quality scores, so the answer is independent. The model's
+           LONG/SHORT/NO_TRADE verdict ships as the signal, subject to the
+           post-LLM hard safety gates (decision.post_llm_validate). A coin
+           that does not clear the eligibility gate, or that the AI could not
+           answer (unavailable/timeout/budget exhausted), falls back to the
+           Python deterministic decision — that fallback is expected and
+           logged, not a failure.
+    STEP 7 (historical name) — every eligible coin's AI call happens inside
+           STEP 6 above; there is no separate background audit pass in the
+           scheduled path. `ai_decision.llm_verdicts` and the AIOpinionWorker
+           remain available for a future background-audit mode.
     STEP 8-9 rank by setup_quality, PERSIST to signals_log.csv FIRST, then the
            Telegram alert (BUY/SELL at quality >= ALERT_QUALITY_MIN only,
            everything else log-only; a blocked setup logs a silent HOLD row at
            most once per HOLD_LOG_COOLDOWN_MIN)
 
-    `--force-llm` is the ONE place where an LLM verdict is applied (post-LLM
-    hard safety gates re-validate it): a test harness for what a real decision
-    stage would look like, never part of the schedule.
+    `--force-llm` is a TEST harness that bypasses every gate (including the
+    quality eligibility gate above) and sends the top-N setups straight to
+    the LLM regardless of their deterministic verdict — never part of the
+    schedule, logged only.
 
 Fetching is concurrent and batched per timeframe; a hard per-scan deadline
 (config.SCAN_DEADLINE_SECONDS) guarantees a scan can never bleed into the next
@@ -438,6 +445,29 @@ def _emission_kind(signal: str, quality: float) -> str:
     return "alert" if quality >= config.ALERT_QUALITY_MIN else "log_only"
 
 
+def _select_ai_eligible(analysed: list) -> list:
+    """Which decided candidates are worth an AI request, and how many.
+
+    `analysed` holds EVERY coin that survived through the decision core,
+    including setup_quality=0 rejects — sending all of them was what emptied
+    the daily AI budget inside a single scan (live 2026-09-04: 47/47 sent, 3
+    batched HTTP requests, budget hit 50/50 before the scan even finished, and
+    every remaining coin for the rest of the day silently fell back to the
+    Python decision). A coin that already scores below
+    config.MIN_QUALITY_FOR_AI on the deterministic core was going to be a
+    Python HOLD regardless of the model's opinion, so it is not worth a
+    request. The survivors are ranked by quality and capped at
+    config.MAX_CANDIDATES_FOR_AI so one scan can never alone exhaust the
+    budget even when the market is unusually strong.
+    """
+    eligible = [
+        t for t in analysed
+        if float(t[0].get("setup_quality") or 0.0) >= config.MIN_QUALITY_FOR_AI
+    ]
+    eligible.sort(key=lambda t: float(t[0].get("setup_quality") or 0.0), reverse=True)
+    return eligible[:config.MAX_CANDIDATES_FOR_AI]
+
+
 def run_force_llm(exchange, top_n: int = 3) -> dict:
     """TESTING ONLY: bypass every gate and send the top-N setups to the LLM.
 
@@ -542,9 +572,8 @@ def run_scan(exchange, guard: duplicate_guard.DuplicateGuard | None = None,
     immediately and says so.
 
     Critical path = universe -> funding -> OHLCV -> deterministic decision ->
-    risk gate -> persist -> Telegram, all stage-timed and deadline-bounded.
-    AI runs in the BACKGROUND afterwards (audit-only, never blocks the scan
-    and never changes an already-persisted signal).
+    AI eligibility gate -> LLM (or Python fallback) -> risk gate -> persist ->
+    Telegram, all stage-timed and deadline-bounded.
 
     *tickers* is the raw dict from exchange.fetch_tickers(); when provided it
     is forwarded to the scanner so fetch_tickers() is called once per cycle.
@@ -591,7 +620,8 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
     summary = {"scanned": len(symbols), "pass_1h": 0, "pass_15m": 0, "pass_5m": 0,
                "funding_rejected": 0, "duplicates": 0, "gate_rejected": 0,
                "signals": 0, "log_only": 0, "holds": 0, "hold_deduped": 0,
-               "telegram_failed": 0, "log_failed": 0, "ai_status": "QUEUED"}
+               "telegram_failed": 0, "log_failed": 0, "ai_status": "QUEUED",
+               "ai_eligible": 0, "ai_sent": 0, "ai_answered": 0}
 
     # --- STEP 1+2: batch-fetch 1H for every symbol; structure funnel ---
     with _coordinator.stage("ohlcv_1h"):
@@ -695,29 +725,49 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         _coordinator.end(summary)
         return summary
 
-        # --- STEP 6: AI primary decision (critical path) ---
-    # AI decides LONG/SHORT/NO_TRADE from collected data.
-    # Python deterministic decision is fallback only (AI unavailable/timeout/budget).
+    # --- STEP 6: LLM primary decision (critical path, budget/quality-gated) ---
+    # Only candidates that already look tradeable on the deterministic score
+    # are worth an AI request (see config.MIN_QUALITY_FOR_AI /
+    # MAX_CANDIDATES_FOR_AI and _select_ai_eligible's docstring for why —
+    # sending every decided candidate, including setup_quality=0 rejects,
+    # was what emptied a whole day's free-tier budget in one scan). A
+    # candidate that does not clear the gate skips the AI call entirely and
+    # goes straight to the Python fallback below — that is expected behaviour,
+    # not a broken AI stage.
     decided = []
     ai_records = []
 
-    # Build bundles for all analysed candidates
+    ai_eligible = _select_ai_eligible(analysed)
+    summary["ai_eligible"] = len(ai_eligible)
+
     bundles_for_ai = []
-    analysed_map = {}
-    for d, c, snap5, rsi_bounce, last_price in analysed:
+    for d, c, snap5, rsi_bounce, last_price in ai_eligible:
         symbol = c["symbol"]
         bundle = _build_decision_bundle(c, d, snap5, last_price)
         if bundle:
             bundles_for_ai.append(bundle)
-            analysed_map[symbol] = (d, c, snap5, rsi_bounce, last_price)
+    summary["ai_sent"] = len(bundles_for_ai)
 
-    # Call AI for all candidates in one batch
+    if ai_eligible:
+        log.info("AI eligibility: %d/%d decided candidates cleared quality>=%.0f "
+                 "(cap %d) -> sending %d: %s",
+                 len(ai_eligible), len(analysed), config.MIN_QUALITY_FOR_AI,
+                 config.MAX_CANDIDATES_FOR_AI, len(bundles_for_ai),
+                 ", ".join(f"{d.get('symbol', c['symbol'])}(q={d.get('setup_quality', 0):.0f})"
+                          for d, c, *_ in ai_eligible) if ai_eligible else "none")
+    else:
+        log.info("AI eligibility: 0/%d decided candidates cleared quality>=%.0f — "
+                 "skipping AI call this scan, Python fallback for all",
+                 len(analysed), config.MIN_QUALITY_FOR_AI)
+
+    # Call AI for eligible candidates only, in one batch
     ai_verdicts = {}
     if config.LLM_DECISION_ENABLED and bundles_for_ai:
         try:
             raw_verdicts = ai_decision.llm_verdicts(bundles_for_ai, deadline=deadline)
             for symbol, verdict in (raw_verdicts or {}).items():
                 ai_verdicts[symbol] = verdict
+            summary["ai_answered"] = len(ai_verdicts)
         except Exception as exc:
             log.warning("AI batch call failed — falling back to Python for all: %s", exc)
 
@@ -728,10 +778,12 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         d_out, signal, ai_used, ai_reason = _apply_llm_verdict(d, verdict, symbol)
 
         if not ai_used:
-            # Fallback: Python deterministic decision
+            # Fallback: Python deterministic decision (either the coin never
+            # cleared the AI eligibility gate, or the AI call failed/timed
+            # out/ran out of budget for it specifically)
             signal = _SIGNAL_MAP.get(d.get("decision"), "HOLD")
             d_out = d
-            log.info("[FALLBACK] %s — AI unavailable, Python decision used: %s", symbol, signal)
+            log.debug("[FALLBACK] %s — no AI verdict, Python decision used: %s", symbol, signal)
 
         quality = float(d_out.get("setup_quality") or 0.0)
         if signal == "HOLD":
@@ -793,11 +845,12 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                          sig["leverage"], sig["position_size"])
                 guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
 
-      # --- STEP 7: AI already ran on critical path (see STEP 6) ---
     summary["ai_status"] = "PRIMARY" if config.LLM_DECISION_ENABLED else "OFF"
     _log_funnel_summary(scan_id, summary)
     _coordinator.end(summary)
     return summary
+
+
 def _log_funnel_summary(scan_id: str, summary: dict) -> None:
     """One concise INFO block per scan (per-symbol detail stays at DEBUG)."""
     stages = _coordinator.stages
@@ -805,12 +858,15 @@ def _log_funnel_summary(scan_id: str, summary: dict) -> None:
     log.info(
         "SCAN #%s COMPLETE | universe %d | 1H directional %d | decided %d | "
         "funding %d | duplicates %d | gate_rejected %d | "
+        "AI eligible %d sent %d answered %d | "
         "alerts %d (log_only %d, holds %d, hold_deduped %d) | "
         "log_failed %d | telegram_failed %d | "
         "critical %.1fs | AI %s",
         scan_id, summary.get("scanned", 0), summary.get("pass_1h", 0),
         summary.get("pass_5m", 0), summary.get("funding_rejected", 0),
         summary.get("duplicates", 0), summary.get("gate_rejected", 0),
+        summary.get("ai_eligible", 0), summary.get("ai_sent", 0),
+        summary.get("ai_answered", 0),
         summary.get("signals", 0), summary.get("log_only", 0),
         summary.get("holds", 0), summary.get("hold_deduped", 0),
         summary.get("log_failed", 0), summary.get("telegram_failed", 0),
@@ -989,9 +1045,11 @@ def main() -> None:
     # `ai_used=False` shows up on every row, this line is the first thing to read:
     # it is the expected value for a scheduled scan, not a failure.
     log.info("AI CONTRACT: primary decision-maker (Python is fallback only) | "
-             "queue=every decided setup incl. HOLDs | model=%s fallback=%s | "
+             "eligibility: quality>=%.0f, max %d candidates/scan | "
+             "model=%s fallback=%s | "
              "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
              "batch=%d retries=%d budget=%d/day | LLM_DECISION_ENABLED=%s",
+             config.MIN_QUALITY_FOR_AI, config.MAX_CANDIDATES_FOR_AI,
              config.AI_MODEL, config.AI_MODEL_FALLBACK or "none",
              "on" if config.AI_JSON_MODE else "off",
              "on" if config.AI_REASONING_ENABLED else "off",
