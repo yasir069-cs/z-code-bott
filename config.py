@@ -468,6 +468,20 @@ DECISION_ENABLED = True
 # "because the model decides anyway". The docs now describe the audit stage.)
 LLM_DECISION_ENABLED = True      # False -> no AI audit; alerts are identical
 
+# ---- LLM eligibility gate (budget protection) ----
+# The AI stage is expensive relative to a free-tier daily cap (see AI_DAILY_BUDGET
+# above): sending every decided candidate — including setup_quality=0 rejects —
+# burned the whole day's budget inside the first few scans of a session (live
+# 2026-09-04: 47/47 candidates sent, budget hit 50/50 in ONE scan, and every
+# candidate for the rest of the day fell back to the Python decision, which is
+# indistinguishable in the logs from "the AI is broken"). Only candidates that
+# already look tradeable on the deterministic score are worth spending a request
+# on; a quality=0 setup was going to be a Python HOLD regardless of what the
+# model says. MAX_CANDIDATES_FOR_AI additionally caps the batch size per scan so
+# one strong scan cannot alone exhaust several days of budget.
+MIN_QUALITY_FOR_AI = _env_number("MIN_QUALITY_FOR_AI", 35.0)
+MAX_CANDIDATES_FOR_AI = int(_env_number("MAX_CANDIDATES_FOR_AI", 8))
+
 # ---- alert tier system (owner's rule, 2026-09-01) ----
 # Below 50: ignored (log-only, never alerts). 50-60: NORMAL alert.
 # 60-70: HIGH alert. 70-100: STRONGEST alert. The tier is read from the
@@ -620,6 +634,16 @@ def check_config_warnings() -> list[str]:
         warnings.append(f"ALERT_QUALITY_MIN ({ALERT_QUALITY_MIN:g}) is above QUALITY_MIN "
                         f"({QUALITY_MIN:g}): setups clear the decision gate and are then "
                         "dropped as log-only, which reads like gate rejections in the funnel")
+    if MIN_QUALITY_FOR_AI > 0 and MAX_CANDIDATES_FOR_AI > 0 and AI_DAILY_BUDGET > 0:
+        # Rough sanity check: warn if a single session could still burn the whole
+        # daily budget in its opening scans (60 scans/session, worst case every
+        # scan fills MAX_CANDIDATES_FOR_AI and each needs ~1 retry-inflated request).
+        worst_case_requests_per_scan = max(1, -(-MAX_CANDIDATES_FOR_AI // AI_BATCH_MAX)) * 2
+        if worst_case_requests_per_scan >= AI_DAILY_BUDGET:
+            warnings.append(f"AI_DAILY_BUDGET ({AI_DAILY_BUDGET}) is small enough that a single "
+                            f"scan sending MAX_CANDIDATES_FOR_AI ({MAX_CANDIDATES_FOR_AI}) could "
+                            "exhaust it by itself if retries are needed — raise the budget or "
+                            "lower MAX_CANDIDATES_FOR_AI")
     return warnings
 
 CSV_COLUMNS = ["timestamp", "signal_id", "coin", "signal", "entry", "SL", "TP", "RR",
