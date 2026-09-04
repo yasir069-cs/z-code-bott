@@ -278,7 +278,7 @@ SCAN_MISFIRE_GRACE_SEC = 120
 # Hard deadline: past this the scan stops calling the AI, falls back to the
 # Python decision for whatever is left, and warns. A scan can then never bleed
 # into the next 5-minute slot.
-SCAN_DEADLINE_SECONDS = 240
+SCAN_DEADLINE_SECONDS = 210
 
 # ---- hardening: bounded services, watchdogs, isolation
 LIQ_STALE_SECONDS = 1800        # no forceOrder message for 30 min -> stream

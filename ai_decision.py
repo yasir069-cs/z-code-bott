@@ -904,7 +904,7 @@ def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
 
 def _post_once(messages: list, model: str, *, max_tokens: Optional[int] = None,
                temperature: Optional[float] = None, json_mode: bool = False,
-               meta: Optional[dict] = None) -> str:
+               meta: Optional[dict] = None, deadline: Optional[float] = None) -> str:
     """One HTTP round trip. Returns the message content, or raises AIDecisionError
     tagged with whether another attempt is worth making.
 
@@ -943,12 +943,18 @@ def _post_once(messages: list, model: str, *, max_tokens: Optional[int] = None,
     if config.AI_REASONING_ENABLED:
         payload["reasoning"] = {"enabled": True}
     response = None
+    req_timeout = config.AI_TIMEOUT_SECONDS
+    if deadline is not None:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            raise requests.exceptions.Timeout(f"AI deadline reached before HTTP call on {model}")
+        req_timeout = max(1.0, min(req_timeout, rem))
     try:
         response = requests.post(
             chat_completions_url(),
             headers=provider_headers(),
             json=payload,
-            timeout=config.AI_TIMEOUT_SECONDS,
+            timeout=req_timeout,
         )
         log.info("AI provider HTTP status: %s (model=%s, reasoning=%s, json_mode=%s, "
                  "max_tokens=%s)", response.status_code, model,
@@ -1071,7 +1077,7 @@ def _complete(messages: list, parse=None, deadline: Optional[float] = None,
     for model_index, model in enumerate(models):
         is_last_model = model_index == len(models) - 1
         for attempt in range(1, config.AI_RETRY_MAX + 1):
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline is not None and (deadline - time.monotonic()) < 5.0:
                 raise AIDecisionError(
                     f"AI deadline reached after {attempt - 1} attempt(s) on {model}"
                     + (f"; last error: {last}" if last else ""))
@@ -1084,7 +1090,7 @@ def _complete(messages: list, parse=None, deadline: Optional[float] = None,
             try:
                 content = _post_once(active, model, max_tokens=tokens,
                                      temperature=temperature, json_mode=json_mode,
-                                     meta=meta)
+                                     meta=meta, deadline=deadline)
                 return content if parse is None else parse(content)
             except AIDecisionError as exc:
                 last = exc
