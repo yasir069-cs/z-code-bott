@@ -1,35 +1,24 @@
-"""Phase 7 — LLM decision engine (AgentRouter / DeepSeek v4 Flash).
+"""Phase 7 — LLM decision engine, multi-provider fallback pool.
 
 Called ONLY after the Python filters passed (rules.md). The Python engine
-grades every candidate 0-100 per timeframe (scoring.py); this module hands
-the model that grading *plus* the raw numbers behind it, and the model makes
-the final BUY / SELL / HOLD call. Expected output per setup is strict JSON:
+grades every candidate 0-100 per timeframe; this module hands the model that
+grading plus the raw numbers behind it, and the model makes the final
+BUY / SELL / HOLD call. Expected output per setup is strict JSON.
 
-    {"signal": "BUY|SELL|HOLD", "entry": float, "stop_loss": float,
-     "take_profit": float, "rr": float, "confidence": 0-100,
-     "reason": "one line", "rsi_bounce_detected": bool}
-
-Three properties this module is responsible for:
-
-  1. **Batching.** One HTTP request carries every candidate from a scan and
-     returns a JSON array, collapsing a 5-candidate scan from 5 requests
-     into 1 round trip.
-  2. **Retry.** Providers return 429/5xx regularly. Every failure used to
-     drop straight to the indicator-only fallback. Now: AI_RETRY_MAX
-     attempts with exponential backoff, then the secondary model (when
-     configured), and only then the Python path.
-  3. **Truth in the prompt.** The zone line used to be hardcoded from
-     `direction` — the model was told "bottom 30% (BUY zone)" even when the
-     coin sat at the top of its range. It now reports the measured
-     `range_pos` and the graded zone score, and every threshold quoted in the
-     system prompt is interpolated from config so it cannot drift again.
-
-The transport is provider-agnostic (any OpenAI-compatible gateway) via
-config.AI_BASE_URL; the default is AgentRouter serving deepseek-v4-flash.
+TRANSPORT: instead of one fixed base_url/api_key/model, every call goes
+through config.AI_PROVIDERS — an ORDERED LIST of independent providers (each
+its own base_url, api_key, model, and daily budget counter). `_complete()`
+walks the list: on a provider it tries up to AI_RETRY_MAX times (with the
+existing truncation/parse-correction escalation), and moves to the NEXT
+provider when the current one is exhausted (budget), fails unretryably, or
+runs out of retries. This is what turns "AgentRouter has a bad day" or "this
+OpenRouter account hit its free 50/day" into an automatic switch instead of a
+silent fallback to the indicator-only Python decision.
 
 The model's reasoning output is NEVER exposed to Telegram/alerts — only the
-final JSON answer is used. Any unrecoverable failure raises AIDecisionError
-so the caller falls back to the Python indicator decision (Phase 8).
+final JSON answer is used. Any unrecoverable failure (every provider
+exhausted/failed) raises AIDecisionError so the caller falls back to the
+Python indicator decision.
 """
 import json
 import logging
@@ -45,89 +34,91 @@ import config
 
 log = logging.getLogger("ai_decision")
 
-def chat_completions_url() -> str:
-    """The provider endpoint, resolved on every call.
-
-    It used to be a module constant built from `config.AI_BASE_URL` at import, so
-    a base URL changed after import (`.env` re-read in a test, a long-lived
-    process reloading config) kept POSTing to the stale host while every other
-    setting looked correct. `OPENROUTER_URL` below stays for scripts/diagnostics as
-    the import-time snapshot; production paths must call this.
-    """
-    return f"{config.AI_BASE_URL.rstrip('/')}/chat/completions"
-
-
-# Import-time snapshot, kept for `scripts/openrouter_diagnose.py` and as a
-# readable default; nothing in the bot reads this any more.
-OPENROUTER_URL = f"{config.AI_BASE_URL}/chat/completions"
-
-# A browser-like UA is a hard requirement, not a nicety: the provider sits behind
-# a WAF (Aliyun, seen live) that challenges the bare `python-requests/x.y` agent.
+# A browser-like UA is a hard requirement, not a nicety: some providers sit
+# behind a WAF that challenges the bare `python-requests/x.y` agent.
 PROVIDER_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 
-def provider_headers() -> dict:
-    """The headers every provider call sends, from one place.
+def chat_completions_url(base_url: Optional[str] = None) -> str:
+    """The provider endpoint for `base_url` (or the pool's first provider /
+    the legacy AI_BASE_URL when none is given — diagnostics scripts only)."""
+    if base_url is None:
+        base_url = config.AI_PROVIDERS[0]["base_url"] if config.AI_PROVIDERS else config.AI_BASE_URL
+    return f"{base_url.rstrip('/')}/chat/completions"
 
-    Decisions and the chat assistant must not drift apart on this: a caller that
-    hand-rolls its own dict loses the User-Agent and starts failing 403/WAF
-    challenges that the rest of the bot has already been fixed for.
-    """
+
+# Import-time snapshot, kept for scripts/diagnostics; production paths always
+# pass an explicit base_url through chat_completions_url().
+OPENROUTER_URL = f"{config.AI_BASE_URL.rstrip('/')}/chat/completions"
+
+
+def provider_headers(api_key: Optional[str] = None) -> dict:
+    """The headers for a call using `api_key` (or the legacy
+    OPENROUTER_API_KEY when none is given — diagnostics scripts only)."""
+    if api_key is None:
+        api_key = config.OPENROUTER_API_KEY
     return {
-        "Authorization": f"Bearer {config.OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": PROVIDER_USER_AGENT,
     }
 
+
+def describe_providers() -> str:
+    """One-line summary of the configured fallback ladder, for startup logs."""
+    if not config.AI_PROVIDERS:
+        return "NONE CONFIGURED"
+    return " -> ".join(f"{p['name']}[{p['model']}]" for p in config.AI_PROVIDERS)
+
+
 # Statuses worth retrying: rate limits, timeouts and provider-side faults.
-# 400/401/403/404 mean the request itself is wrong — retrying just burns budget.
 _RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
-# Capabilities the provider has actually confirmed, learned at runtime.
-# `response_format={"type":"json_object"}` is what turns "please return only
-# JSON" from a request into a constraint, but it is not universal: a gateway that
-# rejects the field must not cost every scan a failed attempt, so the first 400
-# that names `response_format` switches it off for the process and the retry
-# continues without it. `provider_caps()` exposes the state for the startup and
-# audit log lines, so a silently degraded contract is visible in the journal.
+# JSON-object capability, tracked PER BASE_URL (a gateway that rejects
+# response_format is a property of the gateway, not of one API key).
 _CAPS_LOCK = threading.Lock()
-_CAPS = {"json_object": True}
+_CAPS: dict[str, dict] = {}
 
 
-def provider_caps() -> dict:
-    """Copy of the runtime provider capabilities (json_object may be off)."""
+def _caps_for(base_url: str) -> dict:
     with _CAPS_LOCK:
-        return dict(_CAPS)
+        if base_url not in _CAPS:
+            _CAPS[base_url] = {"json_object": bool(getattr(config, "AI_JSON_MODE", True))}
+        return dict(_CAPS[base_url])
+
+
+def provider_caps(base_url: Optional[str] = None) -> dict:
+    """Copy of the runtime capabilities for `base_url` (json_object may be off)."""
+    if base_url is None:
+        base_url = config.AI_PROVIDERS[0]["base_url"] if config.AI_PROVIDERS else config.AI_BASE_URL
+    return _caps_for(base_url)
 
 
 def _reset_provider_caps() -> None:
-    """Restore every capability — for tests and for a reconfigured base URL."""
+    """Forget every learned capability — for tests and a reconfigured pool."""
     with _CAPS_LOCK:
-        _CAPS["json_object"] = bool(getattr(config, "AI_JSON_MODE", True))
+        _CAPS.clear()
 
 
-def _disable_cap(name: str, reason: str) -> None:
+def _disable_cap(base_url: str, name: str, reason: str) -> None:
     with _CAPS_LOCK:
-        already_off = not _CAPS.get(name, True)
-        _CAPS[name] = False
+        current = _CAPS.setdefault(base_url, {"json_object": True})
+        already_off = not current.get(name, True)
+        current[name] = False
     if not already_off:
-        log.warning("AI provider does not support %s (%s) — disabled for this process",
-                    name, reason)
+        log.warning("AI provider %s does not support %s (%s) — disabled for this process",
+                    base_url, name, reason)
 
 
 def _build_system_prompt() -> str:
-    """Advanced system prompt for the LLM decision engine (DeepSeek v4).
+    """Advanced system prompt for the LLM decision engine.
 
-    Interpolates the live config values so the prompt can never again claim
-    thresholds the code does not use (it used to assert "volume > 1.5x average"
-    and "15M confirmation score 4/5" — neither was true). Structured for
-    DeepSeek v4's strengths: an explicit output contract up front, a strict
-    evidence-weighing order, and unambiguous JSON discipline (DeepSeek models
-    drift into prose or fenced blocks when the format is not nailed down).
+    Interpolates the live config values so the prompt can never claim
+    thresholds the code does not use.
     """
-    return f"""You are DeepSeek v4, the senior decision analyst of a USDT-M perpetual
+    return f"""You are the senior decision analyst of a USDT-M perpetual
 futures signal bot on Binance. Active session: New York overlap
 ({config.SESSION_START} - {config.SESSION_END} IST). High volatility window.
 Your job is NOT to execute trades. You only decide: BUY / SELL / HOLD.
@@ -156,14 +147,9 @@ Your job is NOT to execute trades. You only decide: BUY / SELL / HOLD.
 8. Futures context (OI + funding) — crowding/squeeze context
 
 A decision must be supported by CONVERGENCE of several layers. Any single
-factor alone — including a spectacular liquidation spike, an extreme RSI or
-one huge candle — is never sufficient. When layers conflict, downgrade to
-HOLD rather than average them into a weak trade.
+factor alone is never sufficient. When layers conflict, downgrade to HOLD.
 
 === HOW THE PYTHON ENGINE GRADED THIS SETUP ===
-Each timeframe is scored 0-100 against the owner's strategy note, and the
-scores you are shown are already the result of these rules:
-
   1H  = zone {config.W_1H_ZONE} + RSI {config.W_1H_RSI} + volume {config.W_1H_VOLUME} \
 + Bollinger {config.W_1H_BB} + liquidation sweep {config.W_1H_SWEEP}
   15M = RSI {config.W_LTF_RSI} + volume {config.W_LTF_VOLUME} + Bollinger {config.W_LTF_BB}
@@ -171,7 +157,7 @@ scores you are shown are already the result of these rules:
   Confluence = {config.CONFLUENCE_W_1H:.2f}*1H + {config.CONFLUENCE_W_15M:.2f}*15M + {config.CONFLUENCE_W_5M:.2f}*5M
 
   Zone     : price in the bottom {config.ZONE_FULL_PCT:.0%} of the 1H range (BUY) scores full;
-             {config.ZONE_FULL_PCT:.0%}-{config.ZONE_MAX_PCT:.0%} ("in-between") tapers down; beyond \
+             {config.ZONE_FULL_PCT:.0%}-{config.ZONE_MAX_PCT:.0%} tapers down; beyond \
 {config.ZONE_MAX_PCT:.0%} the setup was already rejected. SELL mirrors from the top.
   RSI      : BUY {config.RSI_BUY_FULL_MIN:.0f}-{config.RSI_BUY_FULL_MAX:.0f} scores full, \
 {config.RSI_BUY_TOL_MIN:.0f}-{config.RSI_BUY_TOL_MAX:.0f} scores half.
@@ -185,52 +171,36 @@ band scores full; between band and mid-line scores {config.BB_MID_FRACTION:.0%}.
 scores {config.SWEEP_PARTIAL_FRACTION:.0%}, <= {config.SWEEP_AGE_STALE} scores \
 {config.SWEEP_STALE_FRACTION:.0%}, older or absent scores zero.
 
-EMA21 and VWAP are hard gates, already passed: for a BUY price closed above
-both, for a SELL below both. Do not re-litigate direction on those two.
+EMA21 and VWAP are hard gates, already passed. Do not re-litigate direction on those two.
 
 A LOW component score is real information, not noise. If the sweep score is 0
-there was no recent liquidation sweep, and the owner's note treats the sweep as
-part of the setup — say so in your reason and lower confidence accordingly.
+there was no recent liquidation sweep — say so in your reason and lower
+confidence accordingly.
 
 === WEBSOCKET LIQUIDATION DATA ===
-When provided, the liquidation context shows per-window long/short liquidation
-counts, notional and burst flags. Analyse it IN CONTEXT of all other factors:
-a long-liquidation burst near support can fuel a reversal long; a short squeeze
-near resistance can extend a move. But data marked unavailable or stale carries
-NO information — do not infer or fabricate liquidation activity from price
-action, and NEVER make a trade decision based on a liquidation spike alone.
+Analyse it IN CONTEXT of all other factors. Data marked unavailable or stale
+carries NO information — never fabricate liquidation activity from price
+action, and never decide on a liquidation spike alone.
 
 === RSI 50 BOUNCE LOGIC (HIGHEST PRIORITY PATTERN) ===
-Check this first when reading the RSI history:
-
-BUY Bounce: RSI was above 50, dipped but held above 47 (did not break 50 support), now rising again
-  Example: RSI history [54, 56, 50.2, 53, 55] = STRONG BUY signal (bulls defended 50)
-  Even if RSI did not reach exactly 50, a dip to 47-50.9 and recovery = valid bounce
-
-SELL Bounce: RSI was below 50, bounced but held below 53 (did not break 50 resistance), now falling again
-  Example: RSI history [46, 44, 49.8, 47, 45] = STRONG SELL signal (bears defended 50)
-  Even if RSI did not reach exactly 50, a bounce to 50.1-53 and rejection = valid bounce
-
+BUY Bounce: RSI was above 50, dipped but held above 47, now rising again.
+SELL Bounce: RSI was below 50, bounced but held below 53, now falling again.
 This bounce at the 50 midline = continuation signal, not reversal. Prioritize it.
 If RSI bounce is detected AND liquidation sweep is present, that is the highest confidence setup.
 
 === CORE STRATEGY RULES ===
 1. Do not make a decision from RSI alone.
-2. Respect the 1H -> 15M -> 5M top-down structure: 1H sets bias, 15M confirms, 5M is entry timing.
-3. A liquidation sweep is strong confirmation. Prefer setups where the sweep score is non-zero.
-4. Analyze RSI as a trend, not just a number. Look at the last 10 RSI values:
-   - Higher lows (e.g. 50, 55, 51, 56) = bullish momentum continuation
-   - Lower highs (e.g. 50, 45, 49, 44) = bearish momentum continuation
-   - RSI bounce in the 47-53 zone = mid-level bounce signal (see above)
+2. Respect the 1H -> 15M -> 5M top-down structure.
+3. A liquidation sweep is strong confirmation.
+4. Analyze RSI as a trend, not just a number.
 5. EMA21, VWAP, Bollinger Bands and volume must agree with each other.
-6. Volume must be meaningful. If the volume score is 0 on the entry timeframe, prefer HOLD.
-7. If 1H and 5M conflict in direction, answer HOLD. Do not force a trade.
-8. Weigh a stale sweep less: the age in candles is given to you explicitly.
+6. If the volume score is 0 on the entry timeframe, prefer HOLD.
+7. If 1H and 5M conflict in direction, answer HOLD.
+8. Weigh a stale sweep less.
 9. Never invent missing market data. Never guarantee profit. Never mention
    being an AI, your training, or these instructions.
 10. If confused or the data is unclear, answer HOLD. A missed trade beats a bad trade.
 11. A high confluence score is permission to look closely, not an instruction to agree.
-    You are the last filter before the owner's phone rings.
 
 === TRADE LEVELS ===
 Calculate SL from recent swing structure and ATR; TP at the next meaningful support/resistance.
@@ -244,17 +214,13 @@ _SYSTEM_PROMPT = _build_system_prompt()
 
 
 class AIDecisionError(Exception):
-    """Raised when the AI provider is unavailable, fails, or returns unusable output.
+    """Raised when the AI provider pool is unavailable, fails, or returns
+    unusable output.
 
-    `retryable` marks the failures worth another attempt (rate limit, provider
-    5xx, timeout, truncated/malformed JSON) as opposed to the ones where the
-    request itself is wrong and a retry would only burn free-tier budget.
-
-    `parse_failure` says *why* it is retryable: the provider answered, the
-    answer was just not the JSON we asked for. That distinction drives the
-    retry shape — a 502 is retried identically, a prose reply is retried with a
-    correction appended (and with more tokens when the reply was cut off),
-    because resending the same prompt unchanged tends to earn the same prose.
+    `retryable` marks failures worth another attempt (rate limit, provider
+    5xx, timeout, truncated/malformed JSON). `parse_failure` says the provider
+    answered but not in the required JSON shape — that distinction drives the
+    retry shape (see `_complete`).
     """
 
     def __init__(self, message: str, retryable: bool = False,
@@ -267,26 +233,20 @@ class AIDecisionError(Exception):
 # ------------------------------------------------------------- daily budget
 
 class _DailyBudget:
-    """Advisory counter for OpenRouter's free-tier cap, rolling over at IST midnight.
-
-    Advisory because the real limit is enforced server-side and this resets on
-    process restart — its job is to stop the bot from spending the last calls on
-    weak candidates, and to tell the owner when alerts have gone indicator-only.
-    """
+    """Advisory counter for one provider's daily request cap, rolling over at
+    IST midnight. Advisory because the real limit is enforced server-side."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._day = None
         self._used = 0
-        self._notified = False
 
     def _roll_locked(self, now: Optional[datetime] = None) -> None:
         today = (now or datetime.now(config.TZ)).date()
         if today != self._day:
-            self._day, self._used, self._notified = today, 0, False
+            self._day, self._used = today, 0
 
     def consume(self, tokens: int = 1) -> bool:
-        """Reserve `tokens` requests. False when that would exceed the day's cap."""
         with self._lock:
             self._roll_locked()
             if self._used + tokens > config.AI_DAILY_BUDGET:
@@ -304,37 +264,75 @@ class _DailyBudget:
                 "remaining": max(0, config.AI_DAILY_BUDGET - self._used),
             }
 
-    def exhausted_notice(self) -> Optional[str]:
-        """The one-time message for Telegram, or None if already sent / not due."""
-        with self._lock:
-            self._roll_locked()
-            if self._used < config.AI_DAILY_BUDGET or self._notified:
-                return None
-            self._notified = True
-            return (f"AI budget exhausted for {self._day.isoformat()} "
-                    f"({self._used}/{config.AI_DAILY_BUDGET} requests). Signals continue on "
-                    f"indicator-only logic until IST midnight.")
-
     def reset(self) -> None:
         with self._lock:
-            self._day, self._used, self._notified = None, 0, False
+            self._day, self._used = None, 0
 
 
-_budget = _DailyBudget()
+_budgets_lock = threading.Lock()
+_budgets: dict[str, _DailyBudget] = {}
+
+
+def _get_budget(provider_name: str) -> _DailyBudget:
+    with _budgets_lock:
+        if provider_name not in _budgets:
+            _budgets[provider_name] = _DailyBudget()
+        return _budgets[provider_name]
 
 
 def budget_status() -> dict:
-    """Today's AI request usage, for /status and the scan summary."""
-    return _budget.status()
+    """Aggregate + per-provider status. Flat keys (used/limit/remaining/day)
+    stay backward-compatible with any caller expecting the single-provider
+    shape; `providers` holds the breakdown."""
+    today = datetime.now(config.TZ).date().isoformat()
+    per_provider = {}
+    total_used = total_limit = 0
+    for p in config.AI_PROVIDERS:
+        s = _get_budget(p["name"]).status()
+        per_provider[p["name"]] = s
+        total_used += s["used"]
+        total_limit += s["limit"]
+    return {
+        "day": today,
+        "used": total_used,
+        "limit": total_limit,
+        "remaining": max(0, total_limit - total_used),
+        "providers": per_provider,
+    }
+
+
+_notice_lock = threading.Lock()
+_notice_day = None
+_notice_sent = False
 
 
 def budget_exhausted_notice() -> Optional[str]:
-    """Returns the alert text once, the first time the day's budget runs out."""
-    return _budget.exhausted_notice()
+    """The one-time Telegram message for the day EVERY provider in the pool
+    is exhausted — not just one of them (that case is a silent internal
+    fallback to the next provider, exactly as designed)."""
+    global _notice_day, _notice_sent
+    with _notice_lock:
+        today = datetime.now(config.TZ).date()
+        if today != _notice_day:
+            _notice_day, _notice_sent = today, False
+        if _notice_sent:
+            return None
+        status = budget_status()
+        if status["remaining"] > 0 or not status["providers"]:
+            return None
+        _notice_sent = True
+    lines = "; ".join(f"{name}: {s['used']}/{s['limit']}" for name, s in status["providers"].items())
+    return (f"AI budget exhausted on ALL {len(status['providers'])} configured provider(s) "
+            f"today ({lines}). Signals continue on indicator-only logic until reset.")
 
 
 def reset_budget() -> None:
-    _budget.reset()
+    with _budgets_lock:
+        for b in _budgets.values():
+            b.reset()
+    global _notice_sent
+    with _notice_lock:
+        _notice_sent = False
 
 
 # ------------------------------------------------------------ prompt building
@@ -353,12 +351,6 @@ def _fmt_snap(snap) -> str:
 
 
 def _zone_line(bundle: dict) -> str:
-    """The measured zone, replacing the hardcoded "bottom 30% (BUY zone)".
-
-    The old line was derived from `direction` alone, so the model was told the
-    coin was in the bottom zone whatever `range_pos` actually said — and then
-    dutifully parroted it back in every logged reason.
-    """
     snap = bundle.get("ind_1h") or {}
     direction = bundle.get("direction", "BUY")
     range_pos = snap.get("range_pos")
@@ -372,7 +364,7 @@ def _zone_line(bundle: dict) -> str:
     elif depth <= config.ZONE_MAX_PCT:
         band = (f"IN-BETWEEN — {depth:.0%} in from the {edge}, past the "
                 f"{config.ZONE_FULL_PCT:.0%} sweet spot but inside the {config.ZONE_MAX_PCT:.0%} limit")
-    else:  # scoring.zone_score rejects this, so it should never reach the model
+    else:
         band = f"WRONG half of the range for a {direction} ({depth:.0%} in from the {edge})"
 
     zone_pts = (bundle.get("score_breakdown_1h") or {}).get("zone")
@@ -382,8 +374,6 @@ def _zone_line(bundle: dict) -> str:
 
 
 def _score_line(bundle: dict) -> str:
-    """What the Python engine concluded, so the model can argue with a number
-    instead of re-deriving one."""
     s1h, s15, s5 = bundle.get("score_1h"), bundle.get("score_15m"), bundle.get("score_5m")
     if s1h is None and s15 is None and s5 is None:
         return ""
@@ -401,19 +391,14 @@ def _score_line(bundle: dict) -> str:
 def _sweep_line(bundle: dict) -> str:
     sweep = bundle.get("sweep")
     if sweep is None:
-        return ("Liquidation sweep: NONE detected — the owner's note lists the sweep as part of "
-                "the setup, so treat this as a weaker entry and cap confidence accordingly")
+        return ("Liquidation sweep: NONE detected — treat this as a weaker entry and "
+                "cap confidence accordingly")
     return (f"Liquidation sweep: {sweep['direction']} side, {sweep['age_candles']} candles ago, "
             f"swept level={sweep['level']:.6g}, wick={sweep['wick']:.6g} "
             f"({sweep['wick_body_ratio']:.1f}x body), volume={sweep['volume_ratio']:.1f}x avg20")
 
 
 def _liquidation_line(bundle: dict) -> str:
-    """Render cached websocket data without implying availability when absent.
-
-    Windows come from the summary itself (config-driven via
-    config.LIQUIDATION_WINDOWS), each with long/short notional+count and the
-    burst flag — the same fields the cache aggregates."""
     summary = bundle.get("liquidation") or {}
     if not summary.get("available"):
         warning = summary.get("warning") or "no liquidation events in cache"
@@ -433,7 +418,6 @@ def _liquidation_line(bundle: dict) -> str:
 
 
 def _candidate_block(bundle: dict) -> str:
-    """The per-setup body shared by the single and batched prompts."""
     snap5 = bundle["ind_5m"]
     trend = "UP (higher lows)" if bundle["direction"] == "BUY" else "DOWN (lower highs)"
     confirm = bundle.get("score_15m", bundle.get("confirm_score"))
@@ -467,7 +451,6 @@ _JSON_SHAPE = ('{"signal": "BUY|SELL|HOLD", "entry": 0, "stop_loss": 0, "take_pr
 
 
 def build_prompt(bundle: dict) -> str:
-    """Assemble the full-context prompt for a single candidate."""
     return (f"Analyze the following crypto market setup and return the JSON decision.\n\n"
             f"{_candidate_block(bundle)}\n\n"
             f"Analyse liquidation data in context of all other factors. Do NOT make trade decisions based on liquidation spike alone.\n\n"
@@ -475,11 +458,6 @@ def build_prompt(bundle: dict) -> str:
 
 
 def build_batch_prompt(bundles: list) -> str:
-    """One prompt covering every candidate from a scan.
-
-    The setups are independent — the model must judge each on its own evidence
-    and must not let a strong setup talk it into a weak one.
-    """
     n = len(bundles)
     blocks = []
     for i, bundle in enumerate(bundles, start=1):
@@ -500,29 +478,12 @@ def build_batch_prompt(bundles: list) -> str:
 
 
 # --------------------------------------------------------------- JSON parsing
-#
-# One provider reply must be a JSON payload and nothing else — but reasoning-
-# capable models (the live `nvidia/nemotron-…` is one) emit "Here is my
-# analysis:" paragraphs and code fences anyway, and when `max_tokens` runs out
-# they stop mid-array. Trusting the instruction alone is what produced the live
-# failure: 41 setups logged with `ai_used=False` and three identical doomed
-# attempts per model. So the contract is enforced twice — asked for explicitly,
-# and *tolerated* on the way in: prose around the JSON is skipped, fences are
-# stripped, a truncated block is cut back to its last complete element, and the
-# caller is told it was truncation so the retry changes instead of repeating.
-# Nothing here ever invents a verdict: an element that did not arrive is absent
-# from the result and the deterministic core stands, unchanged.
 
 _VERDICT_KEYS = ("signal", "decision", "action")
 _BATCH_ENVELOPE_KEYS = ("decisions", "results", "signals", "setups", "data")
 
 
 def _strip_fences(text: str) -> str:
-    """Drop ``` / ```json fence markers wherever the model put them.
-
-    Only a fence at the very start used to be removed, so an answer introduced by
-    one sentence of prose kept its backticks and failed to parse.
-    """
     cleaned = (text or "").strip()
     if "```" not in cleaned:
         return cleaned
@@ -541,13 +502,6 @@ def _is_verdict_array(value) -> bool:
 
 def _top_level_spans(text: str, opener: str, closer: str, *,
                      trust_quotes: bool = True) -> list[tuple[int, int, bool]]:
-    """Every top-level `opener`…`closer` block as (start, end, unterminated).
-
-    Quote-aware, because brackets inside strings ("position at [1] resistance")
-    would otherwise shift the depth count and mis-slice the payload. A block that
-    never closes is reported as unterminated — that is a truncated reply, and it
-    is worth a salvage attempt instead of a parse error.
-    """
     spans: list[tuple[int, int, bool]] = []
     depth = 0
     start = -1
@@ -578,12 +532,6 @@ def _top_level_spans(text: str, opener: str, closer: str, *,
 
 
 def _repair_truncated(text: str, opener: str, closer: str) -> Optional[str]:
-    """Cut a truncated block back to its last complete element and close it.
-
-    Only a genuine element boundary counts as a cut point, so a half-written
-    verdict is dropped rather than completed by guesswork: with `n` of `n+1`
-    setups answered, the missing one takes the deterministic path.
-    """
     depth = 0
     in_str = False
     esc = False
@@ -614,12 +562,6 @@ def _repair_truncated(text: str, opener: str, closer: str) -> Optional[str]:
 
 def _scan_blocks(text: str, opener: str, closer: str, accept=None,
                  meta: Optional[dict] = None):
-    """First JSON block accepted by `accept`, else the first parseable one.
-
-    `meta` (when given) records `truncated` / `salvaged` so the retry loop can
-    raise `max_tokens` instead of replaying a request the model will truncate
-    again.
-    """
     fallback = None
     for trust_quotes in (True, False):
         for start, end, unterminated in _top_level_spans(text, opener, closer,
@@ -629,10 +571,6 @@ def _scan_blocks(text: str, opener: str, closer: str, accept=None,
             try:
                 value = json.loads(chunk)
             except (json.JSONDecodeError, RecursionError):
-                # RecursionError is not a typo: a model that emits 60k nested
-                # brackets makes the JSON decoder itself blow up, and that has to
-                # read as "unparseable reply" (the deterministic verdict stands)
-                # rather than as an exception escaping the audit worker.
                 if not unterminated:
                     continue
                 if meta is not None:
@@ -647,7 +585,7 @@ def _scan_blocks(text: str, opener: str, closer: str, accept=None,
                 if meta is not None:
                     meta["salvaged"] = True
             if not value:
-                continue  # empty object/array carries no verdict
+                continue
             if accept is None or accept(value):
                 return value
             if fallback is None:
@@ -658,7 +596,6 @@ def _scan_blocks(text: str, opener: str, closer: str, accept=None,
 
 
 def _parse_fail(what: str, reply: str) -> "AIDecisionError":
-    """The error raised when a reply contained no usable JSON at all."""
     text = _strip_fences(reply or "")
     return AIDecisionError(
         f"{what}: reply was {len(text)} chars of prose/markdown, beginning "
@@ -666,7 +603,6 @@ def _parse_fail(what: str, reply: str) -> "AIDecisionError":
 
 
 def _extract_json(text: str, meta: Optional[dict] = None) -> dict:
-    """The JSON object out of a reply that may be fenced and wrapped in prose."""
     cleaned = _strip_fences(text)
     value = _scan_blocks(cleaned, "{", "}", _is_verdict_object, meta)
     if value is None:
@@ -675,15 +611,6 @@ def _extract_json(text: str, meta: Optional[dict] = None) -> dict:
 
 
 def _extract_json_array(text: str, meta: Optional[dict] = None) -> list:
-    """The verdict list out of a batch reply, in any shape the model chose.
-
-    Accepted: the required `{"decisions": [...]}` envelope, a bare array, a
-    fenced array, other envelope keys the models drift to, and a single bare
-    object for a one-setup batch. The point is that a *usable* answer is never
-    lost to punctuation around it — while a genuinely empty or truncated reply
-    still raises, because guessing which setups were meant to be in it is worse
-    than falling back to the deterministic verdict.
-    """
     cleaned = _strip_fences(text)
     direct = _scan_blocks(cleaned, "[", "]", _is_verdict_array, meta)
     if isinstance(direct, list):
@@ -700,14 +627,6 @@ def _extract_json_array(text: str, meta: Optional[dict] = None) -> list:
 
 
 def _shape_fail(message: str) -> "AIDecisionError":
-    """The model answered, but not in the shape the contract requires.
-
-    Retryable *and* tagged as a parse failure, so the ladder appends the
-    correction turn ("JSON only") instead of either giving up on a verdict that
-    was one key away or resending the same prompt to a model that never saw a
-    complaint. The reply is never repaired into a verdict: no usable answer
-    means the deterministic decision stands.
-    """
     return AIDecisionError(message, retryable=True, parse_failure=True)
 
 
@@ -721,8 +640,6 @@ def _to_float(value, field: str):
 
 
 def _validate_decision(data: dict, current_price: float) -> dict:
-    """Validate one decision object into the standard signal dict
-    (sl/tp are normalised from stop_loss/take_profit for the pipeline)."""
     required = ("signal", "entry", "stop_loss", "take_profit", "rr", "confidence", "reason")
     missing = [f for f in required if f not in data]
     if missing:
@@ -768,23 +685,10 @@ def _validate_decision(data: dict, current_price: float) -> dict:
 
 
 def parse_ai_response(text: str, current_price: float) -> dict:
-    """Validate a single-setup response into the standard signal dict."""
     return _validate_decision(_extract_json(text), current_price)
 
 
 def parse_batch_response(text: str, bundles: list) -> dict:
-    """Validate a batch response into {symbol: signal dict}.
-
-    Matching runs in two passes: every element that names a symbol we asked
-    about claims that symbol first, and only then are unlabelled elements
-    assigned to the still-unclaimed bundles in send order. One pass would let a
-    positional guess steal the slot an explicit label already owns — which is
-    how a coin ends up wearing another coin's stop-loss.
-
-    A single bad element is dropped with a warning rather than failing the
-    batch: that symbol takes the Python fallback while its neighbours keep
-    their AI decision.
-    """
     elements = _extract_json_array(text)
     by_symbol = {b["symbol"]: b for b in bundles}
     claimed: dict[str, dict] = {}
@@ -830,7 +734,6 @@ def parse_batch_response(text: str, bundles: list) -> dict:
 # ------------------------------------------------------------- HTTP transport
 
 def _backoff_sleep(attempt: int, deadline: Optional[float] = None) -> None:
-    """Exponential backoff 1s -> 2s -> 4s, never sleeping past the scan deadline."""
     delay = config.AI_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
     if deadline is not None:
         delay = min(delay, max(0.0, deadline - time.monotonic()))
@@ -839,10 +742,6 @@ def _backoff_sleep(attempt: int, deadline: Optional[float] = None) -> None:
 
 
 def _join_sse_deltas(body: str) -> str:
-    """Join the content deltas of an SSE (text/event-stream) chat-completion
-    body into one string. Some OpenAI-compatible gateways stream even when
-    `stream` was not requested; an SSE body is not JSON, so without this the
-    response looks like 'Expecting value: line 1 column 1'."""
     parts: list[str] = []
     for line in (body or "").splitlines():
         line = line.strip()
@@ -863,12 +762,6 @@ def _join_sse_deltas(body: str) -> str:
 
 
 def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
-    """Pull the assistant content out of a provider response.
-
-    Handles the three body shapes seen in the wild: a plain OpenAI JSON
-    object, an SSE stream (joined into one string) and — with a precise
-    diagnostic — anything else (empty/non-JSON bodies). Returns
-    (content, parsed_json_or_None)."""
     headers = getattr(response, "headers", None) or {}
     ctype = (headers.get("Content-Type") or "").lower()
     body = getattr(response, "text", "") or ""
@@ -882,17 +775,12 @@ def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
         return content, None
     try:
         data = response.json()
-    except ValueError as exc:  # requests' JSONDecodeError is a ValueError
+    except ValueError as exc:
         raise AIDecisionError(
             f"AI provider returned a non-JSON body (model={model}, "
             f"content-type={ctype or 'unknown'}): {exc} | body={body[:500]!r}",
             retryable=True) from exc
 
-    # A 200 without choices/message/content is its own failure class: naming the
-    # missing key (plus the truncated body) is the difference between a two-minute
-    # diagnosis and guessing which of the three was absent. Carried over from
-    # `main`, whose version raised a bare KeyError that the transport then reported
-    # as a generic "response malformed".
     try:
         content = (data["choices"][0]["message"].get("content") or "").strip()
     except (KeyError, IndexError, TypeError) as exc:
@@ -902,77 +790,78 @@ def _extract_content(response, model: str) -> tuple[str, Optional[dict]]:
     return content, data
 
 
-def _post_once(messages: list, model: str, *, max_tokens: Optional[int] = None,
+def _finish_reason(data) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+    try:
+        choice = data["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not isinstance(choice, dict):
+        return None
+    return choice.get("finish_reason")
+
+
+def _post_once(messages: list, provider: dict, *, max_tokens: Optional[int] = None,
                temperature: Optional[float] = None, json_mode: bool = False,
                meta: Optional[dict] = None, deadline: Optional[float] = None) -> str:
-    """One HTTP round trip. Returns the message content, or raises AIDecisionError
-    tagged with whether another attempt is worth making.
+    """One HTTP round trip to a specific provider. Returns the message
+    content, or raises AIDecisionError tagged with whether another attempt
+    (on this or the next provider) is worth making.
 
-    `max_tokens` / `temperature` let a non-decision caller (the chat assistant)
-    reuse this transport with its own sizing instead of duplicating the request
-    and losing the browser-like User-Agent that the provider's WAF requires.
-
-    `json_mode` asks the provider to constrain the reply to a JSON object (the
-    prompts require an object envelope, so this is the mode that ends the
-    "answered in prose" failure at the source). It is only ever sent for decision
-    calls — a chat answer is prose and must not be forced into JSON.
-
-    `meta` receives what the retry loop needs but the content string cannot
-    carry: `finish_reason`, `content_chars`, `status_code`, `json_mode_rejected`.
-    Without `finish_reason` a truncated reply looks identical to a disobedient
-    one, and the ladder cannot tell "give it more tokens" from "ask it again".
+    `provider` = {"name", "base_url", "api_key", "model"} — one entry from
+    config.AI_PROVIDERS.
     """
+    model = provider["model"]
+    base_url = provider["base_url"]
+    api_key = provider["api_key"]
+    name = provider["name"]
+
     tokens = config.AI_MAX_TOKENS if max_tokens is None else max_tokens
     want_json = bool(json_mode and getattr(config, "AI_JSON_MODE", True)
-                     and provider_caps().get("json_object"))
+                     and provider_caps(base_url).get("json_object"))
     payload = {
         "model": model,
         "messages": messages,
         "max_tokens": tokens,
         "temperature": config.AI_TEMPERATURE if temperature is None else temperature,
-        # Ask for a plain JSON body explicitly: a few gateways default to
-        # SSE streaming, which then fails json parsing ("Expecting value...").
         "stream": False,
     }
     if want_json:
         payload["response_format"] = {"type": "json_object"}
-    # The reasoning toggle is an OpenRouter-ism. Strict OpenAI-compatible
-    # gateways (e.g. AgentRouter) reject unknown body fields, so it is only
-    # sent when explicitly enabled (default off — reasoning starves the
-    # final JSON of tokens).
     if config.AI_REASONING_ENABLED:
         payload["reasoning"] = {"enabled": True}
+
     response = None
     req_timeout = config.AI_TIMEOUT_SECONDS
     if deadline is not None:
         rem = deadline - time.monotonic()
         if rem <= 0:
-            raise requests.exceptions.Timeout(f"AI deadline reached before HTTP call on {model}")
+            raise requests.exceptions.Timeout(f"AI deadline reached before HTTP call on {name}")
         req_timeout = max(1.0, min(req_timeout, rem))
+
     try:
         response = requests.post(
-            chat_completions_url(),
-            headers=provider_headers(),
+            chat_completions_url(base_url),
+            headers=provider_headers(api_key),
             json=payload,
             timeout=req_timeout,
         )
-        log.info("AI provider HTTP status: %s (model=%s, reasoning=%s, json_mode=%s, "
-                 "max_tokens=%s)", response.status_code, model,
+        log.info("AI provider HTTP status: %s (provider=%s, model=%s, reasoning=%s, "
+                 "json_mode=%s, max_tokens=%s)", response.status_code, name, model,
                  payload.get("reasoning", "off"), "on" if want_json else "off", tokens)
         if response.status_code != 200:
-            # safe diagnostic summary only — never the full provider body
-            # (payloads can be large and may echo provider internals)
-            log.warning("AI provider error: status=%s body=%.200s",
-                        response.status_code, response.text)
+            log.warning("AI provider error: provider=%s status=%s body=%.200s",
+                        name, response.status_code, response.text)
         if meta is not None:
             meta["status_code"] = response.status_code
         if response.status_code == 400 and want_json and \
                 "response_format" in (getattr(response, "text", "") or "").lower():
-            _disable_cap("json_object", "HTTP 400 on response_format")
+            _disable_cap(base_url, "json_object", "HTTP 400 on response_format")
             if meta is not None:
                 meta["json_mode_rejected"] = True
         response.raise_for_status()
-        content, data = _extract_content(response, model)
+        content, data = _extract_content(response, f"{name}:{model}")
     except AIDecisionError:
         raise
     except requests.exceptions.HTTPError as exc:
@@ -982,19 +871,19 @@ def _post_once(messages: list, model: str, *, max_tokens: Optional[int] = None,
         body = getattr(response, "text", "") or ""
         raise AIDecisionError(
             f"AI provider HTTP error: {exc} | status={status if status is not None else '?'} "
-            f"model={model} body={body[:200]}",
+            f"provider={name} model={model} body={body[:200]}",
             retryable=status in _RETRYABLE_STATUS) from exc
     except requests.exceptions.Timeout as exc:
         raise AIDecisionError(
             f"AI provider timeout after {config.AI_TIMEOUT_SECONDS}s "
-            f"(model={model})", retryable=True) from exc
-    except requests.exceptions.RequestException as exc:  # connection etc.
+            f"(provider={name} model={model})", retryable=True) from exc
+    except requests.exceptions.RequestException as exc:
         raise AIDecisionError(
-            f"AI provider request failed: {exc} (model={model})", retryable=True) from exc
-    except (KeyError, IndexError, ValueError) as exc:  # malformed response body
-        # HTTP 200 with a broken structure is a distinct failure class: log
-        # a safe summary, not the whole provider response
-        log.warning("AI provider malformed response (model=%s): %r", model, exc)
+            f"AI provider request failed: {exc} (provider={name} model={model})",
+            retryable=True) from exc
+    except (KeyError, IndexError, ValueError) as exc:
+        log.warning("AI provider malformed response (provider=%s model=%s): %r",
+                    name, model, exc)
         body = getattr(response, "text", "") or ""
         raise AIDecisionError(f"AI provider response malformed: {exc} | body={body[:200]}",
                               retryable=True) from exc
@@ -1006,27 +895,9 @@ def _post_once(messages: list, model: str, *, max_tokens: Optional[int] = None,
     if not content:
         finish = meta.get("finish_reason") if meta is not None else _finish_reason(data)
         raise AIDecisionError(
-            f"AI provider returned empty content (model={model}, "
-            f"finish={finish}, "
-            f"body={getattr(response, 'text', '')[:500]})", retryable=True)
+            f"AI provider returned empty content (provider={name} model={model}, "
+            f"finish={finish}, body={getattr(response, 'text', '')[:500]})", retryable=True)
     return content
-
-
-def _finish_reason(data) -> Optional[str]:
-    """`choices[0].finish_reason` from anywhere in a response body, or None.
-
-    `length` is the one that matters: it says the reply was cut off by
-    `max_tokens`, so the same prompt sent again will be cut off again.
-    """
-    if not isinstance(data, dict):
-        return None
-    try:
-        choice = data["choices"][0]
-    except (KeyError, IndexError, TypeError):
-        return None  # includes the SSE path, where there is no parsed body
-    if not isinstance(choice, dict):
-        return None
-    return choice.get("finish_reason")
 
 
 _PARSE_CORRECTION = (
@@ -1039,96 +910,80 @@ _PARSE_CORRECTION = (
 def _complete(messages: list, parse=None, deadline: Optional[float] = None,
               max_tokens: Optional[int] = None, temperature: Optional[float] = None,
               json_mode: bool = False):
-    """Request a completion, retrying the primary model then the secondary.
+    """Request a completion, walking the provider pool (config.AI_PROVIDERS)
+    in order.
 
-    This is where "one 502 kills the signal" is fixed: AI_RETRY_MAX attempts
-    per model with exponential backoff, the fallback model after that, and only
-    then does the caller drop to the Python indicator decision.
-
-    `parse` runs INSIDE the retry loop on purpose. A truncated or malformed JSON
-    body is a transient model failure exactly like a 502, and the old code
-    parsed after the single attempt, so one bad answer lost the signal. Returns
-    the parsed value, or the raw content when no parser is given.
-
-    The two failure classes are retried differently, which is the whole point of
-    the ladder. A transport failure (429/5xx/timeout) is worth the identical
-    request. A *parse* failure is not: the model answered, and sending the same
-    prompt unchanged normally earns the same prose — that is what burned three
-    budget units per batch on the live box. So a parse failure appends an
-    explicit correction turn, and when the reply also came back truncated
-    (`finish_reason=length` or an unterminated JSON block) the next attempt gets a
-    larger `max_tokens` up to `AI_MAX_TOKENS_RETRY_CAP`, because the answer was
-    cut off mid-object rather than refused. Both escalations carry across the
-    fallback model: a second model has the same budget to work with.
+    Each provider gets up to AI_RETRY_MAX attempts, with the same
+    truncation/parse-correction escalation as before. A provider is
+    abandoned — moving to the next one in the pool — when:
+      - its daily budget is exhausted,
+      - a request to it fails unretryably (bad request, auth error, etc.), or
+      - it exhausts AI_RETRY_MAX retryable attempts (429/5xx/timeout/bad JSON).
+    Only when EVERY provider in the pool is exhausted does this raise
+    AIDecisionError, which the caller turns into the Python fallback decision.
     """
-    if not config.OPENROUTER_API_KEY:
-        raise AIDecisionError("OPENROUTER_API_KEY not configured")
+    providers = config.AI_PROVIDERS
+    if not providers:
+        raise AIDecisionError("No AI providers configured — check .env "
+                              "(AI_BASE_URL/OPENROUTER_API_KEY/AI_MODEL or AI_PROVIDER_N_*)")
 
-    models = [config.AI_MODEL]
-    configured_fallbacks = config.AI_MODEL_FALLBACK.split(",")
-    for fallback_model in configured_fallbacks:
-        fallback_model = fallback_model.strip()
-        if fallback_model and fallback_model not in models:
-            models.append(fallback_model)
-
-    tokens = config.AI_MAX_TOKENS if max_tokens is None else max_tokens
-    active = messages
+    base_tokens = config.AI_MAX_TOKENS if max_tokens is None else max_tokens
+    original_messages = messages
     last: Optional[AIDecisionError] = None
-    for model_index, model in enumerate(models):
-        is_last_model = model_index == len(models) - 1
+
+    for p_index, provider in enumerate(providers):
+        is_last_provider = p_index == len(providers) - 1
+        budget = _get_budget(provider["name"])
+        active = original_messages
+        tokens = base_tokens
+
         for attempt in range(1, config.AI_RETRY_MAX + 1):
             if deadline is not None and (deadline - time.monotonic()) < 5.0:
                 raise AIDecisionError(
-                    f"AI deadline reached after {attempt - 1} attempt(s) on {model}"
-                    + (f"; last error: {last}" if last else ""))
-            if not _budget.consume():
-                status = _budget.status()
-                raise AIDecisionError(
-                    f"AI daily budget exhausted ({status['used']}/{status['limit']} "
-                    f"requests on {status['day']})")
+                    f"AI deadline reached during provider {provider['name']}, "
+                    f"attempt {attempt - 1}" + (f"; last error: {last}" if last else ""))
+            if not budget.consume():
+                log.warning("Provider %s daily budget exhausted (%s) — switching provider",
+                            provider["name"], budget.status())
+                last = AIDecisionError(f"provider {provider['name']} daily budget exhausted")
+                break
             meta: dict = {}
             try:
-                content = _post_once(active, model, max_tokens=tokens,
+                content = _post_once(active, provider, max_tokens=tokens,
                                      temperature=temperature, json_mode=json_mode,
                                      meta=meta, deadline=deadline)
                 return content if parse is None else parse(content)
             except AIDecisionError as exc:
                 last = exc
                 if meta.get("json_mode_rejected"):
-                    # The provider refused the *extra field*, not the request. The
-                    # capability is now off for the process, so repeating
-                    # immediately is a different (and valid) request — no backoff,
-                    # and this is the only case where a 400 is worth retrying.
-                    log.info("provider rejected response_format — retrying without it "
-                             "(attempt %d/%d on %s)", attempt, config.AI_RETRY_MAX, model)
+                    log.info("provider %s rejected response_format — retrying without it "
+                             "(attempt %d/%d)", provider["name"], attempt, config.AI_RETRY_MAX)
                     continue
                 if not exc.retryable:
-                    if is_last_model:
+                    if is_last_provider:
                         raise
-                    log.warning("%s failed unretryably (%s) — switching to %s",
-                                model, exc, models[model_index + 1])
+                    log.warning("%s failed unretryably (%s) — switching provider",
+                                provider["name"], exc)
                     break
                 log.warning("AI attempt %d/%d on %s failed: %s",
-                            attempt, config.AI_RETRY_MAX, model, exc)
+                            attempt, config.AI_RETRY_MAX, provider["name"], exc)
                 if attempt < config.AI_RETRY_MAX and getattr(exc, "parse_failure", False):
-                    active = list(messages) + [{"role": "user", "content": _PARSE_CORRECTION}]
-                    truncated = (meta.get("finish_reason") == "length"
-                                 or meta.get("truncated"))
+                    active = list(original_messages) + [{"role": "user", "content": _PARSE_CORRECTION}]
+                    truncated = (meta.get("finish_reason") == "length" or meta.get("truncated"))
                     cap = int(getattr(config, "AI_MAX_TOKENS_RETRY_CAP",
                                        max(tokens, config.AI_MAX_TOKENS)) or tokens)
                     if truncated and tokens < cap:
                         grown = min(cap, max(tokens * 2, tokens + 2000))
-                        log.warning("AI reply was truncated after %s chars — retrying with "
-                                    "max_tokens %d -> %d (salvaged partial answer: %s)",
-                                    meta.get("content_chars"), tokens, grown,
-                                    bool(meta.get("salvaged")))
+                        log.warning("AI reply truncated after %s chars — retrying with "
+                                    "max_tokens %d -> %d (provider=%s)",
+                                    meta.get("content_chars"), tokens, grown, provider["name"])
                         tokens = grown
                 if attempt < config.AI_RETRY_MAX:
                     _backoff_sleep(attempt, deadline)
         else:
-            if not is_last_model:
-                log.warning("%s exhausted %d attempts — trying fallback model %s",
-                            model, config.AI_RETRY_MAX, models[model_index + 1])
+            if not is_last_provider:
+                log.warning("%s exhausted %d attempts — trying next provider",
+                            provider["name"], config.AI_RETRY_MAX)
 
     raise last if last else AIDecisionError("AI call failed with no recorded error")
 
@@ -1137,18 +992,10 @@ def complete_chat(messages: list, *, max_tokens: int = 600,
                   temperature: float = 0.3,
                   deadline: Optional[float] = None,
                   json_mode: bool = False) -> str:
-    """One provider chat completion for non-decision callers.
-
-    The Telegram assistant used to build its own `requests.post` — no browser-like
-    User-Agent (the provider's WAF challenges the bare python-requests UA), no
-    retry, no fallback model, and no budget accounting, so assistant traffic was
-    invisible to the daily cap it was also consuming. Sharing the decision path's
-    transport means one place owns all of that; the sizing differs because a chat
-    answer is prose, not a JSON verdict.
-
-    Raises AIDecisionError when no model answered — callers must degrade to a
-    clear message, never a fabricated reply.
-    """
+    """One provider chat completion for non-decision callers (walks the same
+    provider pool as decisions). Raises AIDecisionError when no provider in
+    the pool answered — callers must degrade to a clear message, never a
+    fabricated reply."""
     return _complete(messages, parse=None, deadline=deadline,
                      max_tokens=max_tokens, temperature=temperature,
                      json_mode=json_mode) or ""
@@ -1162,11 +1009,10 @@ def _messages(user_prompt: str) -> list:
 # ------------------------------------------------------------- public callers
 
 def nemotron_decision(bundle: dict, deadline: Optional[float] = None) -> dict:
-    """Decide one candidate. Raises AIDecisionError once every model and retry
-    is exhausted (the caller then uses the Python fallback)."""
+    """Decide one candidate. Raises AIDecisionError once every provider in
+    the pool and every retry is exhausted (the caller then uses the Python
+    fallback)."""
     def _parse(content: str) -> dict:
-        # NOTE: any 'reasoning' field in the response is deliberately ignored —
-        # only the final JSON answer is ever used downstream.
         log.info("AI raw response for %s: %.300s", bundle["symbol"], content)
         return parse_ai_response(content, bundle["current_price"])
 
@@ -1205,7 +1051,7 @@ This signal goes to the owner's phone. You are the last filter.
 1. Market structure + location — 1H trend, BOS/CHoCH, range position
 2. Liquidity sweep — fresh and confirmed = strong weight; absent = lower confidence
 3. S/R room — clear space to TP required; price pressing into wall = NO_TRADE
-4. RSI trend + RSI-50 bounce pattern (see below)
+4. RSI trend + RSI-50 bounce pattern
 5. Volume — volume = 0 on entry timeframe = NO_TRADE
 6. EMA21 / VWAP / Bollinger — confirmation only, never standalone reason
 7. Websocket liquidation data — context only, never sole reason to trade
@@ -1217,9 +1063,7 @@ When layers conflict → NO_TRADE. A missed trade beats a bad trade.
 
 === RSI-50 BOUNCE PATTERN — CHECK THIS FIRST ===
 BUY bounce  : RSI was above 50, dipped to 47-50.9, now rising again
-              Example: [54, 56, 50.2, 53, 55] = strong continuation BUY
 SELL bounce : RSI was below 50, bounced to 50.1-53, now falling again
-              Example: [46, 44, 49.8, 47, 45] = strong continuation SELL
 RSI bounce + confirmed sweep = highest confidence setup.
 
 === CALL NO_TRADE IF ANY OF THESE ARE TRUE ===
@@ -1257,13 +1101,6 @@ def _fmt_lvl(v) -> str:
 
 
 def _facts_block(det: dict) -> str:
-    """Render FACTUAL evidence only — never a preliminary verdict.
-
-    The LLM must choose LONG/SHORT/NO_TRADE independently, so nothing here may
-    carry Python's decision, its NO_TRADE reasons, its quality scores or its
-    penalty narratives. What the model gets: measured structure events, zones,
-    liquidity, price action, MTF biases, futures context, the calculated
-    structural levels and data warnings."""
     structure = det.get("structure") or {}
     sr = det.get("sr") or {}
     liq = det.get("liquidity") or {}
@@ -1288,9 +1125,6 @@ def _facts_block(det: dict) -> str:
         + (", fresh CHoCH against the standing HTF trend" if mtf.get("choch_reversal") else ""),
         f"S/R: price at {(sr.get('at_zone') or {}).get('side', 'no zone')}"
         f"{' (major)' if (sr.get('at_zone') or {}).get('major') else ''}",
-        # labels must match liquidity.py's vocabulary: `long_ready` means a
-        # SELL-side pool was swept and reclaimed (the setup that supports a
-        # LONG). Calling it a "buy-side sweep" told the model the opposite.
         f"Liquidity: sell-side sweep confirmed (supports LONG)={liq.get('long_ready')}, "
         f"buy-side sweep confirmed (supports SHORT)={liq.get('short_ready')}, "
         f"equal lows={len(liq.get('equal_lows') or [])}, "
@@ -1314,13 +1148,6 @@ def _facts_block(det: dict) -> str:
 
 
 def _sweep_age_fact(liq: dict) -> str:
-    """The most recent sweep of either side, with age and confirmation status.
-
-    `liq["sweep"]` is the *younger* of the two directions liquidity.py detected —
-    not necessarily the confirmed one — so the line names which pool it took and
-    whether confirmation followed, instead of letting the model assume a sweep
-    exists whenever either flag is set.
-    """
     sweep = (liq or {}).get("sweep") or {}
     if not sweep:
         return "Most recent sweep: none detected on the setup timeframe"
@@ -1333,7 +1160,6 @@ def _sweep_age_fact(liq: dict) -> str:
 
 
 def _sweep_fact(bundle: dict) -> str:
-    """Neutral sweep rendering for the decision prompt (no verdict framing)."""
     sweep = bundle.get("sweep")
     if sweep is None:
         return "Liquidation sweep: none detected in recent 1H candles"
@@ -1344,11 +1170,8 @@ def _sweep_fact(bundle: dict) -> str:
 
 
 def _range_line(ind: dict) -> str:
-    """1H range location — a factual feature the model reads for itself."""
     rp = (ind or {}).get("range_pos")
     rp_s = f"{rp:.3f}" if isinstance(rp, (int, float)) else "n/a"
-    # range_pos spans the strategy window (CANDLE_LIMIT), NOT the 20-candle
-    # swing window — the old label told the model it was looking at 20 candles.
     span = getattr(config, "CANDLE_LIMIT", 50)
     return (f"1H range position: {rp_s} (0.000 = {span}-candle low, "
             f"1.000 = {span}-candle high); "
@@ -1357,9 +1180,6 @@ def _range_line(ind: dict) -> str:
 
 
 def build_decision_prompt(bundle: dict) -> str:
-    """Single-setup prompt for the LLM decision stage: factual structured
-    evidence only (indicators, location, sweep, liquidation, measured market
-    facts, calculated levels, warnings) — no Python verdict is included."""
     det = bundle["deterministic"]
     return f"""{_DECISION_INSTRUCTIONS}
 
@@ -1418,15 +1238,10 @@ An answer that is not parseable JSON is a failed answer for every setup in it.""
 
 
 def parse_verdict(content: str, current_price: float = None) -> dict:
-    """Validate one LLM decision-stage answer into the standard verdict dict.
-
-    Accepts the LONG/SHORT/NO_TRADE vocabulary as well as the legacy
-    BUY/SELL/HOLD; anything else is an error (the caller retries or falls
-    back to the deterministic core)."""
     raw = _extract_json(content)
     if not isinstance(raw, dict):
         raise _shape_fail(f"verdict is not a JSON object: {str(raw)[:120]}")
-    for key in _BATCH_ENVELOPE_KEYS:      # a one-setup request answered in batch shape
+    for key in _BATCH_ENVELOPE_KEYS:
         nested = raw.get(key)
         if isinstance(nested, list) and len(nested) == 1 and isinstance(nested[0], dict):
             raw = nested[0]
@@ -1445,8 +1260,6 @@ def parse_verdict(content: str, current_price: float = None) -> dict:
 
 
 def _parse_verdict_batch(content: str, bundles: list) -> dict:
-    """Validate a batch of verdicts into {symbol: verdict dict} (same
-    symbol-first / positional-second matching as parse_batch_response)."""
     elements = _extract_json_array(content)
     by_symbol = {b["symbol"]: b for b in bundles}
     claimed: dict[str, dict] = {}
@@ -1492,8 +1305,8 @@ def llm_verdicts(bundles: list, deadline: Optional[float] = None) -> dict:
     Returns {symbol: {"signal": LONG|SHORT|NO_TRADE, "confidence": float,
     "reason": str}}. A symbol absent from the result got no AI answer and
     takes the deterministic path — this function never substitutes one.
-    Sorted by deterministic quality descending so a mid-scan budget
-    exhaustion hits the weakest setups first."""
+    Sorted by deterministic quality descending so a mid-scan exhaustion of
+    the WHOLE provider pool hits the weakest setups first."""
     if not bundles:
         return {}
 
@@ -1530,8 +1343,8 @@ def llm_verdicts(bundles: list, deadline: Optional[float] = None) -> dict:
                         "for: %s", len(chunk), exc, ", ".join(symbols))
             continue
 
-    status = _budget.status()
-    log.info("LLM verdicts: %d/%d setups answered, %d/%d requests used today",
+    status = budget_status()
+    log.info("LLM verdicts: %d/%d setups answered, %d/%d requests used today (pool total)",
              len(out), len(bundles), status["used"], status["limit"])
     return out
 
@@ -1541,10 +1354,7 @@ def nemotron_decisions(bundles: list, deadline: Optional[float] = None) -> dict:
 
     Returns {symbol: signal dict} for the setups the model answered. A symbol
     absent from the result did not get an AI decision and must take the Python
-    fallback — the caller decides, this function never silently substitutes one.
-
-    Candidates are sorted by confluence descending, so if the daily budget runs
-    out mid-scan the strongest setups are the ones that got the AI.
+    fallback.
     """
     if not bundles:
         return {}
@@ -1562,15 +1372,12 @@ def nemotron_decisions(bundles: list, deadline: Optional[float] = None) -> dict:
         return out
 
     for chunk in _chunks(ordered, config.AI_BATCH_MAX):
-        symbols = [b["symbol"] for b in chunk]
+        symbols = [c["symbol"] for c in chunk]
 
         def _parse(content: str, chunk=chunk) -> dict:
             log.info("AI batch response for %d setups: %.300s", len(chunk), content)
             decisions = parse_batch_response(content, chunk)
             if not decisions:
-                # A partial answer is fine (the missing coins take the Python
-                # path), but zero usable elements means the whole body was
-                # unusable — worth another attempt before giving up on all of them.
                 raise AIDecisionError(
                     f"AI batch produced no usable decisions for {len(chunk)} setups",
                     retryable=True)
@@ -1584,7 +1391,7 @@ def nemotron_decisions(bundles: list, deadline: Optional[float] = None) -> dict:
                         len(chunk), exc, ", ".join(symbols))
             continue
 
-    status = _budget.status()
-    log.info("AI decisions: %d/%d setups answered, %d/%d requests used today",
+    status = budget_status()
+    log.info("AI decisions: %d/%d setups answered, %d/%d requests used today (pool total)",
              len(out), len(bundles), status["used"], status["limit"])
     return out
