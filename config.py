@@ -182,6 +182,11 @@ AI_CHAT_DEADLINE_SECONDS = _env_number("AI_CHAT_DEADLINE_SECONDS", 45.0)
 AI_TEMPERATURE = 0.1
 AI_REASONING_ENABLED = False    # reasoning burns the token budget on
                                 # chain-of-thought and the JSON never arrives
+# OpenAI-style reasoning_effort value forwarded verbatim in the request payload
+# ("" = do not send the field at all, keeping cloud providers untouched).
+# Ollama maps "none" to think:false — this is what makes qwen3:8b answer a
+# JSON verdict in ~25s instead of thinking for 10+ minutes.
+AI_REASONING_EFFORT = os.getenv("AI_REASONING_EFFORT", "").strip().lower()
 
 AI_BATCH_ENABLED = True
 AI_BATCH_MAX = int(_env_number("AI_BATCH_MAX", 8))
