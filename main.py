@@ -1043,25 +1043,24 @@ def main() -> None:
     # people keep getting wrong — that the answer is AUDITED, never applied. When
     # `ai_used=False` shows up on every row, this line is the first thing to read:
     # it is the expected value for a scheduled scan, not a failure.
- log.info("AI CONTRACT: primary decision-maker (Python is fallback only) | "
-         "eligibility: quality>=%.0f, max %d candidates/scan | "
-         "provider ladder (%d): %s | "
-         "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
-         "batch=%d retries=%d budget=%d/day/provider | LLM_DECISION_ENABLED=%s",
-         config.MIN_QUALITY_FOR_AI, 
-         config.MAX_CANDIDATES_FOR_AI,
-         len(config.AI_PROVIDERS), 
-         ai_decision.describe_providers(),
-         "on" if config.AI_JSON_MODE else "off",
-         "on" if config.AI_REASONING_ENABLED else "off",
-         config.AI_MAX_TOKENS,           # ← MISSING
-         config.AI_RETRY_CAP,            # ← MISSING
-         config.AI_TIMEOUT,              # ← MISSING
-         config.AI_BATCH_SIZE,           # ← MISSING (or appropriate value)
-         config.AI_MAX_RETRIES,          # ← MISSING
-         config.AI_DAILY_BUDGET,         # ← MISSING
-         "ON" if config.LLM_DECISION_ENABLED else "OFF"  # ← MISSING
-)  # ← CLOSING PARENTHESIS
+    log.info("AI CONTRACT: primary decision-maker (Python is fallback only) | "
+             "eligibility: quality>=%.0f, max %d candidates/scan | "
+             "provider ladder (%d): %s | "
+             "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
+             "batch=%d retries=%d budget=%d/day/provider | LLM_DECISION_ENABLED=%s",
+             config.MIN_QUALITY_FOR_AI,
+             config.MAX_CANDIDATES_FOR_AI,
+             len(config.AI_PROVIDERS),
+             ai_decision.describe_providers(),
+             "on" if config.AI_JSON_MODE else "off",
+             "on" if config.AI_REASONING_ENABLED else "off",
+             config.AI_MAX_TOKENS,
+             config.AI_MAX_TOKENS_RETRY_CAP,
+             config.AI_TIMEOUT_SECONDS,
+             config.AI_BATCH_MAX,
+             config.AI_RETRY_MAX,
+             config.AI_DAILY_BUDGET,
+             "ON" if config.LLM_DECISION_ENABLED else "OFF")
     # News verification engine: discovery -> deterministic verification ->
     # (VERIFIED only) AI summary + impact analysis -> Telegram. Verification
     # and interpretation stay separate; news never feeds trading signals.
