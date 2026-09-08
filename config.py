@@ -175,8 +175,10 @@ AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free").strip
 AI_MODEL_FALLBACK = os.getenv("AI_MODEL_FALLBACK", "").strip()
 
 AI_MAX_TOKENS = int(_env_number("AI_MAX_TOKENS", 2000))
-AI_TIMEOUT_SECONDS = 90.0
-AI_CHAT_DEADLINE_SECONDS = 45.0
+# Per-request timeout. 90s suits cloud providers; a self-hosted Ollama model
+# (e.g. qwen3:8b on CPU) needs more, so it is .env-overridable.
+AI_TIMEOUT_SECONDS = _env_number("AI_TIMEOUT_SECONDS", 90.0)
+AI_CHAT_DEADLINE_SECONDS = _env_number("AI_CHAT_DEADLINE_SECONDS", 45.0)
 AI_TEMPERATURE = 0.1
 AI_REASONING_ENABLED = False    # reasoning burns the token budget on
                                 # chain-of-thought and the JSON never arrives
@@ -263,7 +265,11 @@ SCAN_INTERVAL_MIN = 5           # every 5 minutes
 SCHEDULER_TZ = "Asia/Kolkata"
 SCAN_SECOND_OFFSET = 15
 SCAN_MISFIRE_GRACE_SEC = 120
-SCAN_DEADLINE_SECONDS = 210
+# Bounded wall-clock budget for one scan. 210s keeps a scan inside its 5-minute
+# slot on a cloud AI provider; a self-hosted local model (Ollama on CPU) can
+# need far longer per request, so the budget is .env-overridable without a code
+# edit. Overlapping slots are refused by the scan coordinator either way.
+SCAN_DEADLINE_SECONDS = _env_number("SCAN_DEADLINE_SECONDS", 210.0)
 
 # ---- hardening: bounded services, watchdogs, isolation
 LIQ_STALE_SECONDS = 1800
@@ -535,6 +541,13 @@ AI_OPINION_COLUMNS = ["timestamp", "scan_id", "signal_id", "symbol",
 
 def setup_logging() -> None:
     """Configure root logging: console + rotating file. Never print()."""
+    # A cp1252 Windows console cannot encode CJK/emoji symbols (Binance lists
+    # coins like 牛来/龙虾); one bad character used to raise inside the handler
+    # and drop the whole log line. Reconfigure stdout to UTF-8 when possible.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     handlers: list[logging.Handler] = [
         logging.StreamHandler(sys.stdout),
         logging.handlers.RotatingFileHandler(
