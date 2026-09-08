@@ -831,6 +831,13 @@ def _post_once(messages: list, provider: dict, *, max_tokens: Optional[int] = No
         payload["response_format"] = {"type": "json_object"}
     if config.AI_REASONING_ENABLED:
         payload["reasoning"] = {"enabled": True}
+    # Opt-in OpenAI reasoning_effort (config.AI_REASONING_EFFORT). Ollama maps
+    # "none" to think:false, which stops qwen3 from burning minutes in <think>
+    # before the JSON verdict. Empty string sends nothing (cloud providers see
+    # exactly the payload they saw before).
+    effort = getattr(config, "AI_REASONING_EFFORT", "")
+    if effort and not config.AI_REASONING_ENABLED:
+        payload["reasoning_effort"] = effort
 
     response = None
     req_timeout = config.AI_TIMEOUT_SECONDS
