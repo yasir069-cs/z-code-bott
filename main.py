@@ -769,6 +769,15 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         sig = _build_sig(symbol, d_out, signal, snap5, rsi_bounce, fr, last_price)
         sig["ai_used"] = ai_used
         sig["ai_reason"] = ai_reason or ""
+        # Always expose an AI BUY/SELL opinion to Telegram as a clearly
+        # labelled review, even when Python quality is below the executable
+        # alert threshold. This is separate from send_alert(): review output
+        # must never be mistaken for a validated trade signal.
+        if ai_used and verdict:
+            review_signal = str(verdict.get("signal") or "").upper()
+            if review_signal in ("BUY", "SELL"):
+                if not alerts.send_ai_review(sig, verdict):
+                    summary["telegram_failed"] += 1
         base = symbol.split("/")[0].split(":")[0]
         sig["signal_id"] = f"{scan_id}-{base}-{signal}"
         decided.append((quality, signal, sig, symbol))

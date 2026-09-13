@@ -671,7 +671,9 @@ def _validate_decision(data: dict, current_price: float) -> dict:
         raise _shape_fail(f"AI response missing fields: {missing}")
     rsi_bounce_detected = bool(data.get("rsi_bounce_detected", False))
 
-    signal = str(data["signal"]).upper()
+    signal = str(data["signal"]).upper().replace("-", "_").replace(" ", "_")
+    if signal == "NO_TRADE":
+        signal = "HOLD"
     if signal not in ("BUY", "SELL", "HOLD"):
         raise _shape_fail(f"invalid signal from AI: {signal!r}")
     if not isinstance(data["reason"], str):
