@@ -24,7 +24,7 @@
 - The deterministic core (`decision.decide`) owns every LONG/SHORT/NO_TRADE
   decision. The LLM only explains a finished decision — never call it to *decide*.
 - Indicators are **secondary**: they can never trigger or veto a trade on their own.
-- Never send a duplicate alert within `DUPLICATE_COOLDOWN_MIN` (15 min) for the same coin.
+- Never send a duplicate Telegram alert within `DUPLICATE_COOLDOWN_MIN` (20 min) for the same coin; this includes AI review summaries.
 - A scan must never bleed past `SCAN_DEADLINE_SECONDS` (240) into the next slot.
 
 ## Scheduler rules
@@ -159,7 +159,7 @@
 
 ## Duplicate guard rules
 - Two independent windows, both reset at session end (23:00 IST):
-  - **Alert cooldown** `DUPLICATE_COOLDOWN_MIN` (15): checked for every candidate
+- **Alert cooldown** `DUPLICATE_COOLDOWN_MIN` (20): checked for every candidate
     before its 15M/5M fetch, recorded only for alerted BUY/SELL. A HOLD must never
     occupy it — that would mute a real setup appearing minutes later.
   - **HOLD log cooldown** `HOLD_LOG_COOLDOWN_MIN` (30): an identical rejection

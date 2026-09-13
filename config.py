@@ -140,10 +140,10 @@ CONFLUENCE_W_5M = 0.30
 NO_SWEEP_CONFIDENCE_CAP = 59.0
 
 # ------------------------------------------------------------------ liquidation sweep
-SWEEP_SEARCH_CANDLES = 10       # how far back a sweep still counts
+SWEEP_SEARCH_CANDLES = 20       # how far back a sweep still counts
 SWEEP_WINDOW = 20               # swing high/low lookback (last 20 candles)
-SWEEP_WICK_BODY_RATIO = 2.0     # wick > 2x body
-SWEEP_VOL_RATIO = 1.5           # liquidation volume vs 20-candle average
+SWEEP_WICK_BODY_RATIO = 1.5     # meaningful wick relative to body
+SWEEP_VOL_RATIO = 1.2           # meaningful volume expansion vs 20-candle average
 
 # ------------------------------------------------------------------ shared tolerances
 BB_NEAR_PCT = 0.008             # 15M/5M: within 0.8% of the band (futures volatility)
@@ -259,7 +259,7 @@ def _build_provider_pool() -> list[dict]:
 AI_PROVIDERS = _build_provider_pool()
 
 # ------------------------------------------------------------------ duplicate guard
-DUPLICATE_COOLDOWN_MIN = 15     # same coin within 15 min -> skip (futures pace faster)
+DUPLICATE_COOLDOWN_MIN = 20     # same coin within 20 min -> suppress duplicate alert
 GUARD_RESET_TIME = "23:00"      # tracker resets at 11:00 PM IST
 HOLD_LOG_COOLDOWN_MIN = 30
 

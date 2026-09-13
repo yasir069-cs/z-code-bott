@@ -776,8 +776,14 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         # labelled summary, including HOLD. This is separate from send_alert():
         # review output must never be mistaken for a validated trade signal.
         if ai_used and verdict:
-            if not alerts.send_ai_review(sig, verdict):
+            review_sent = alerts.send_ai_review(sig, verdict)
+            if not review_sent:
                 summary["telegram_failed"] += 1
+            else:
+                # A review is still a Telegram alert from the user's point of
+                # view. Start the same per-symbol cooldown so repeated 5-minute
+                # scans cannot spam identical AI summaries.
+                guard.record(symbol, now_ist)
         base = symbol.split("/")[0].split(":")[0]
         sig["signal_id"] = f"{scan_id}-{base}-{signal}"
         decided.append((quality, signal, sig, symbol))
