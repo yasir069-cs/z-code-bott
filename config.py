@@ -201,7 +201,9 @@ AI_RETRY_BACKOFF_BASE = 1.0     # 1s, 2s, 4s
 # independent counter of this size — this is NOT a global total. Six
 # providers at 45/day = up to 270 requests/day across the whole pool, but any
 # single provider stops itself at 45 regardless of the others' state.
-AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "0"))  # 0 = unlimited (self-hosted)
+# Self-hosted Ollama has no provider request quota. Keep this code-level value
+# fixed so an old AI_DAILY_BUDGET=45 in .env cannot silently stop 24/7 scans.
+AI_DAILY_BUDGET = 0
 
 
 def _build_provider_pool() -> list[dict]:
