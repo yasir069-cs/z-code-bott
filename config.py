@@ -188,7 +188,7 @@ AI_REASONING_ENABLED = False    # reasoning burns the token budget on
 # JSON verdict in ~25s instead of thinking for 10+ minutes.
 AI_REASONING_EFFORT = os.getenv("AI_REASONING_EFFORT", "").strip().lower()
 
-AI_BATCH_ENABLED = True
+AI_BATCH_ENABLED = False       # user strategy: one coin, full data, one decision
 AI_BATCH_MAX = int(_env_number("AI_BATCH_MAX", 8))
 AI_JSON_MODE = _env_flag("AI_JSON_MODE", True)
 AI_RETRY_MAX = int(_env_number("AI_RETRY_MAX", 2))     # attempts PER PROVIDER before
@@ -396,9 +396,9 @@ LLM_DECISION_ENABLED = True      # False -> no AI call at all; Python decides ev
 # opinion. MAX_CANDIDATES_FOR_AI additionally caps the batch size per scan so
 # one unusually strong scan cannot alone exhaust several days of every
 # provider's budget.
-MIN_QUALITY_FOR_AI = _env_number("MIN_QUALITY_FOR_AI", 60.0)
+MIN_QUALITY_FOR_AI = _env_number("MIN_QUALITY_FOR_AI", 0.0)
 MIN_CONFLUENCE_FOR_AI = _env_number("MIN_CONFLUENCE_FOR_AI", 60.0)
-MAX_CANDIDATES_FOR_AI = int(_env_number("MAX_CANDIDATES_FOR_AI", 8))
+MAX_CANDIDATES_FOR_AI = int(_env_number("MAX_CANDIDATES_FOR_AI", 0))  # 0 = all survivors
 
 # ---- alert tier system (owner's rule, 2026-09-01) ----
 ALERT_QUALITY_MIN = _env_number("ALERT_QUALITY_MIN", 50.0)

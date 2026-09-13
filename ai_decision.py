@@ -1,8 +1,7 @@
 """Phase 7 — LLM decision engine, multi-provider fallback pool.
 
-Called ONLY after the Python filters passed (rules.md). The Python engine
-grades every candidate 0-100 per timeframe; this module hands the model that
-grading plus the raw numbers behind it, and the model makes the final
+Called after Python's cheap market/data prefilter. Each surviving coin is sent
+one-by-one with its complete 1H/15M/5M evidence; the model makes the primary
 BUY / SELL / HOLD call. Expected output per setup is strict JSON.
 
 TRANSPORT: instead of one fixed base_url/api_key/model, every call goes
@@ -13,7 +12,7 @@ existing truncation/parse-correction escalation), and moves to the NEXT
 provider when the current one is exhausted (budget), fails unretryably, or
 runs out of retries. This is what turns "AgentRouter has a bad day" or "this
 OpenRouter account hit its free 50/day" into an automatic switch instead of a
-silent fallback to the indicator-only Python decision.
+silent fallback to an indicator-only Python decision.
 
 The model's reasoning output is NEVER exposed to Telegram/alerts — only the
 final JSON answer is used. Any unrecoverable failure (every provider
@@ -1066,7 +1065,7 @@ _VERDICT_MAP = {"LONG": "LONG", "SHORT": "SHORT", "NO_TRADE": "NO_TRADE",
 _VERDICT_JSON_SHAPE = ('{"symbol": "...", "signal": "LONG|SHORT|NO_TRADE", '
                        '"confidence": 0, "reason": "short explanation"}')
 
-_DECISION_INSTRUCTIONS = """You are the senior decision analyst for this crypto futures signal bot.
+_DECISION_INSTRUCTIONS = """You are the primary independent decision-maker for this crypto futures signal bot.
 
 Python has already done all the work:
 - Collected OHLCV data across 1H, 15M, and 5M timeframes
@@ -1078,18 +1077,20 @@ Python has already done all the work:
 - Measured Risk/Reward ratio
 
 Your only job: independently assess the complete evidence and report LONG, SHORT,
-or NO_TRADE with a mandatory concise summary. The LLM is called only for setups
-whose measured confluence score is at least 60/100. Use this workflow strictly:
+or NO_TRADE with a mandatory concise summary. Python has only prefiltered the
+market universe and collected data; its deterministic score is evidence, not a
+decision veto. Use this workflow strictly:
 1H = market structure and directional bias; 15M = confirmation; 5M = entry timing.
 RSI, EMA21, VWAP, volume, range/location, S/R room, SL, TP, and RR are the core
 decision evidence. Liquidation sweep, websocket liquidations, funding, OI, and
 other context are optional supporting evidence: never invent them and never make
 them mandatory when unavailable.
 
-The deterministic Python core remains the final safety authority for executable
-alerts. Your model verdict decides the AI opinion, but it cannot bypass invalid
-levels, bad RR, duplicate protection, or a hard risk gate. A NO_TRADE opinion must
-always be respected as a no-trade recommendation.
+Your verdict is the primary trade opinion. Python may veto only malformed data,
+mathematically invalid SL/TP, impossible risk geometry, or duplicate delivery.
+The model may use any coherent rule supported by the supplied evidence (for
+example, RSI above 50 can support LONG when the other facts do not contradict it),
+but must explain that rule. A NO_TRADE opinion must always be respected.
 
 === WEIGH EVIDENCE IN THIS EXACT ORDER ===
 1. Market structure + location — 1H trend, BOS/CHoCH, range position

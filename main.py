@@ -8,11 +8,9 @@ Every 5 minutes between 18:00 and 23:00 IST (60 scans/session):
     STEP 4 duplicate guard (15 min per coin) — checked BEFORE 15M/5M fetches
     STEP 5 15M confirmation + 5M entry; deterministic decision core over
            1H/15M/5M (structure, S/R, liquidity, price action, MTF, risk)
-    STEP 6 LLM PRIMARY DECISION (critical path, budget/quality-gated) — only
-           candidates whose deterministic setup_quality clears
-           config.MIN_QUALITY_FOR_AI (and at most config.MAX_CANDIDATES_FOR_AI
-           per scan, ranked by quality) go to the model with their FULL
-           FACTUAL data (one batched request: indicators, location, sweep,
+    STEP 6 LLM PRIMARY DECISION (critical path, one coin at a time) — every
+           basic-filter survivor goes to the model with its FULL factual data
+           (indicators, location, sweep,
            liquidation, measured structure/S/R/MTF/futures facts, calculated
            SL/TP/RR, warnings) and NO Python verdict, NO_TRADE reasons or
            quality scores, so the answer is independent. The model's
@@ -371,15 +369,19 @@ def _build_decision_bundle(cand: dict, d: dict, snap5: dict | None,
 
 def _apply_llm_verdict(d: dict, verdict: dict | None,
                        symbol: str = "") -> tuple[dict, str, bool, str | None]:
-    """Attach an LLM explanation without allowing it to change the decision.
-
-    The deterministic core owns LONG/SHORT/NO_TRADE and all safety gates.
-    Ollama is advisory/audit-only: a timeout, malformed answer, disagreement,
-    or NO_TRADE opinion must never suppress a valid Python BUY/SELL signal.
-    """
+    """Apply the independent Ollama decision, then run hard Python safety checks."""
     if not verdict:
         return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), False, None
-    return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), True, verdict.get("reason")
+    raw = str(verdict.get("signal") or "").upper()
+    direction = {"LONG": "LONG", "BUY": "LONG", "SHORT": "SHORT",
+                 "SELL": "SHORT"}.get(raw)
+    if direction is None:
+        out = dict(d)
+        out["decision"] = "NO_TRADE"
+        out["no_trade_reasons"] = ["llm_no_trade"]
+        return out, "HOLD", True, verdict.get("reason")
+    out = decision_core.post_llm_validate(d, direction)
+    return out, _SIGNAL_MAP.get(out.get("decision"), "HOLD"), True, verdict.get("reason")
 
 
 def _hold_reason_key(sig: dict) -> str:
@@ -410,39 +412,27 @@ def _persist(sig: dict, summary: dict) -> bool:
 
 
 def _emission_kind(signal: str, quality: float) -> str:
-    """Post-LLM emission rule (owner's tier system): HOLD log-only; BUY/SELL
-    below ALERT_QUALITY_MIN (50) log-only; at/above it alert + log + cooldown.
-    The alert's tier (NORMAL 50-60 / HIGH 60-70 / STRONG 70+) is labelled by
-    alerts._conf_label from the computed confidence."""
+    """LLM-primary emission: HOLD is silent; validated BUY/SELL can alert."""
     if signal == "HOLD":
         return "hold"
-    return "alert" if quality >= config.ALERT_QUALITY_MIN else "log_only"
+    return "alert"
 
 
 def _select_ai_eligible(analysed: list) -> list:
-    """Which decided candidates are worth an AI request, and how many.
+    """Return all survivors with complete timeframe data for Ollama.
 
-    `analysed` holds EVERY coin that survived through the decision core,
-    including setup_quality=0 rejects — sending all of them was what emptied
-    the daily AI budget inside a single scan (live 2026-09-04: 47/47 sent, 3
-    batched HTTP requests, budget hit 50/50 before the scan even finished, and
-    every remaining coin for the rest of the day silently fell back to the
-    Python decision). A coin that already scores below
-    config.MIN_QUALITY_FOR_AI on the deterministic core was going to be a
-    Python HOLD regardless of the model's opinion, so it is not worth a
-    request. The survivors are ranked by quality and capped at
-    config.MAX_CANDIDATES_FOR_AI so one scan can never alone exhaust the
-    budget even when the market is unusually strong.
+    Python has already done the cheap prefilter (universe, 1H direction,
+    funding, duplicate guard, and 1H/15M/5M fetches). Its deterministic quality
+    score is evidence for the model, not a veto. Ollama independently decides
+    each coin from the complete bundle, one coin per request.
     """
-    eligible = [
-        t for t in analysed
-        if float(t[0].get("confluence", t[0].get("setup_quality") or 0.0) or 0.0)
-        >= config.MIN_CONFLUENCE_FOR_AI
-    ]
-    eligible.sort(key=lambda t: float(
-        t[0].get("confluence", t[0].get("setup_quality") or 0.0) or 0.0
-    ), reverse=True)
-    return eligible[:config.MAX_CANDIDATES_FOR_AI]
+    eligible = [t for t in analysed if all(
+        t[0].get("snaps", {}).get(tf) for tf in ("1h", "15m", "5m")
+    )]
+    eligible.sort(key=lambda t: float(t[0].get("setup_quality") or 0.0), reverse=True)
+    if config.MAX_CANDIDATES_FOR_AI > 0:
+        eligible = eligible[:config.MAX_CANDIDATES_FOR_AI]
+    return eligible
 
 
 def run_force_llm(exchange, top_n: int = 3) -> dict:
@@ -702,15 +692,9 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         _coordinator.end(summary)
         return summary
 
-    # --- STEP 6: LLM explanation/audit (optional, budget/quality-gated) ---
-    # Only candidates that already look tradeable on the deterministic score
-    # are worth an AI request (see config.MIN_QUALITY_FOR_AI /
-    # MAX_CANDIDATES_FOR_AI and _select_ai_eligible's docstring for why —
-    # sending every decided candidate, including setup_quality=0 rejects,
-    # was what emptied a whole day's free-tier budget in one scan). A
-    # candidate that does not clear the gate skips the AI call entirely and
-    # goes straight to the Python fallback below — that is expected behaviour,
-    # not a broken AI stage.
+    # --- STEP 6: one-by-one primary Ollama decisions over full data ---
+    # The Python decision object is evidence and risk geometry. It is not used
+    # as a quality veto before the model sees a basic-filter survivor.
     decided = []
     ai_records = []
 
@@ -726,16 +710,15 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
     summary["ai_sent"] = len(bundles_for_ai)
 
     if ai_eligible:
-        log.info("AI eligibility: %d/%d decided candidates cleared confluence>=%.0f "
-                 "(cap %d) -> sending %d: %s",
-                 len(ai_eligible), len(analysed), config.MIN_CONFLUENCE_FOR_AI,
+        log.info("AI eligibility: %d/%d basic-filter survivors -> one-by-one "
+                 "full-data Ollama calls (cap %d, sending %d): %s",
+                 len(ai_eligible), len(analysed),
                  config.MAX_CANDIDATES_FOR_AI, len(bundles_for_ai),
                  ", ".join(f"{d.get('symbol', c['symbol'])}(q={d.get('setup_quality', 0):.0f})"
                           for d, c, *_ in ai_eligible) if ai_eligible else "none")
     else:
-        log.info("AI eligibility: 0/%d decided candidates cleared confluence>=%.0f — "
-                 "skipping AI call this scan, Python fallback for all",
-                 len(analysed), config.MIN_CONFLUENCE_FOR_AI)
+        log.info("AI eligibility: 0/%d basic-filter survivors — no Ollama calls",
+                 len(analysed))
 
     # Call AI for eligible candidates only, in one batch
     ai_verdicts = {}
@@ -755,12 +738,14 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         d_out, signal, ai_used, ai_reason = _apply_llm_verdict(d, verdict, symbol)
 
         if not ai_used:
-            # Fallback: Python deterministic decision (either the coin never
-            # cleared the AI eligibility gate, or the AI call failed/timed
-            # out/ran out of budget for it specifically)
-            signal = _SIGNAL_MAP.get(d.get("decision"), "HOLD")
-            d_out = d
-            log.debug("[FALLBACK] %s — no AI verdict, Python decision used: %s", symbol, signal)
+            # AI-primary mode: no model verdict means no trade opinion. Python
+            # must never silently promote its own deterministic opinion to an
+            # alert when the requested independent model step failed.
+            signal = "HOLD"
+            d_out = dict(d)
+            d_out["decision"] = "NO_TRADE"
+            d_out["no_trade_reasons"] = ["llm_unavailable"]
+            log.warning("[AI PRIMARY] %s — no Ollama verdict; suppressing alert", symbol)
 
         quality = float(d_out.get("setup_quality") or 0.0)
         if signal == "HOLD":
@@ -769,21 +754,12 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
             log.debug("GATE %s: %s blocked — %s (quality=%.0f)", symbol,
                       d_out.get("direction") or "n/a", gates, quality)
 
-        sig = _build_sig(symbol, d_out, signal, snap5, rsi_bounce, fr, last_price)
+        sig = _build_sig(symbol, d_out, signal, snap5, rsi_bounce, fr, last_price,
+                         ai_used=ai_used, ai_reason=ai_reason)
         sig["ai_used"] = ai_used
         sig["ai_reason"] = ai_reason or ""
-        # Always expose every answered LLM opinion to Telegram as a clearly
-        # labelled summary, including HOLD. This is separate from send_alert():
-        # review output must never be mistaken for a validated trade signal.
-        if ai_used and verdict:
-            review_sent = alerts.send_ai_review(sig, verdict)
-            if not review_sent:
-                summary["telegram_failed"] += 1
-            else:
-                # A review is still a Telegram alert from the user's point of
-                # view. Start the same per-symbol cooldown so repeated 5-minute
-                # scans cannot spam identical AI summaries.
-                guard.record(symbol, now_ist)
+        # The AI summary is included in the one Telegram trade alert below;
+        # do not send a second review message for the same coin/scan.
         base = symbol.split("/")[0].split(":")[0]
         sig["signal_id"] = f"{scan_id}-{base}-{signal}"
         decided.append((quality, signal, sig, symbol))
@@ -834,7 +810,7 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                          sig["leverage"], sig["position_size"])
                 guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
 
-    summary["ai_status"] = "AUDIT" if config.LLM_DECISION_ENABLED else "OFF"
+    summary["ai_status"] = "PRIMARY" if config.LLM_DECISION_ENABLED else "OFF"
     _log_funnel_summary(scan_id, summary)
     _coordinator.end(summary)
     return summary
@@ -1026,18 +1002,11 @@ def main() -> None:
          len(config.AI_PROVIDERS), ai_decision.describe_providers(),
          "configured" if config.TELEGRAM_TOKEN else "NOT configured")
 
-    # One line that states what the AI stage actually is, because "AI enabled" was
-    # readable four different ways: which model, whether the provider is being
-    # asked for JSON it must obey, how the token budget is sized, and — the one
-    # people keep getting wrong — that the answer is AUDITED, never applied. When
-    # `ai_used=False` shows up on every row, this line is the first thing to read:
-    # it is the expected value for a scheduled scan, not a failure.
-    log.info("AI CONTRACT: explanation/audit only (Python is authoritative) | "
-             "eligibility: quality>=%.0f, max %d candidates/scan | "
+    log.info("AI CONTRACT: Ollama primary, Python data+hard-safety veto | "
+             "one-by-one full-data calls, all basic-filter survivors, cap %d | "
              "provider ladder (%d): %s | "
              "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
              "batch=%d retries=%d budget=%d/day/provider | LLM_DECISION_ENABLED=%s",
-             config.MIN_QUALITY_FOR_AI,
              config.MAX_CANDIDATES_FOR_AI,
              len(config.AI_PROVIDERS),
              ai_decision.describe_providers(),

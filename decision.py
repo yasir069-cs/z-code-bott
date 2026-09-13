@@ -221,9 +221,8 @@ def post_llm_validate(d: dict, direction: str, cfg=config) -> dict:
       * data validity (indicator snapshots present, entry computable)
       * mathematically invalid levels / stop width / minimum R:R
         (risk_gate, run for the CHOSEN direction)
-      * the setup-quality threshold (the existing computation, run for the
-        chosen direction — disagreement with the measured evidence shows up
-        as a low score, never as an opinionated veto)
+      * the computed quality is retained as evidence and telemetry, but it is
+        not a veto: the Ollama decision is primary after the basic prefilter
 
     Duplicate protection and the Telegram alert floor live in the scan
     pipeline (funnel + emission rule), unchanged.
@@ -268,10 +267,9 @@ def post_llm_validate(d: dict, direction: str, cfg=config) -> dict:
 
     if not risk["ok"]:
         reasons.extend(risk["reasons"])
-    if not quality["primary_floor_ok"]:
-        reasons.append("insufficient_primary_evidence")
-    elif not quality["passes"]:
-        reasons.append("low_setup_quality")
+    # Do not turn deterministic scoring into a second opinion. The model has
+    # received the full indicator/structure/SR/liquidity/MTF bundle and owns
+    # the trading opinion. Python only blocks malformed data and unsafe risk.
 
     out = dict(d)
     out.update({

@@ -8,7 +8,7 @@
 - `ccxt` → exchange data only (Binance USDT-M futures, public mode)
 - `pandas-ta` → ALL indicator calculations (never manual math)
 - `requests` → the AI provider's HTTP endpoint (`AI_BASE_URL`, AgentRouter by
-  default) for the AI explanation, the opinion audit and the chat assistant
+  default) for the primary per-coin decision and chat assistant
 - `python-telegram-bot` → alerts + chat listener
 - `APScheduler` → timer (never `sleep()` loops)
 - `python-dotenv` → load `.env` secrets
@@ -21,9 +21,10 @@
 - No hardcoded secrets — always `.env`.
 - No bare `except` — catch specific exceptions.
 - No manual indicator math — pandas-ta only.
-- The deterministic core (`decision.decide`) owns every LONG/SHORT/NO_TRADE
-  decision. The LLM only explains a finished decision — never call it to *decide*.
-- Indicators are **secondary**: they can never trigger or veto a trade on their own.
+- Python collects and calculates the full evidence; Ollama independently owns
+  the primary LONG/SHORT/NO_TRADE opinion for each basic-filter survivor.
+- Python may veto only malformed data, invalid SL/TP or risk geometry, and
+  duplicate delivery. Deterministic setup quality is evidence, not an AI gate.
 - Never send a duplicate Telegram alert within `DUPLICATE_COOLDOWN_MIN` (20 min) for the same coin; this includes AI review summaries.
 - A scan must never bleed past `SCAN_DEADLINE_SECONDS` (240) into the next slot.
 
