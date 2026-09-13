@@ -1092,41 +1092,61 @@ The model may use any coherent rule supported by the supplied evidence (for
 example, RSI above 50 can support LONG when the other facts do not contradict it),
 but must explain that rule. A NO_TRADE opinion must always be respected.
 
-=== WEIGH EVIDENCE IN THIS EXACT ORDER ===
-1. Market structure + location — 1H trend, BOS/CHoCH, range position
-2. Liquidity sweep — fresh and confirmed = strong weight; absent = lower confidence
-3. S/R room — clear space to TP required; price pressing into wall = NO_TRADE
-4. RSI trend + RSI-50 bounce pattern
-5. Volume — volume = 0 on entry timeframe = NO_TRADE
-6. EMA21 / VWAP / Bollinger — confirmation only, never standalone reason
-7. Websocket liquidation data — context only, never sole reason to trade
-8. Futures context (OI, funding rate) — crowding and squeeze awareness only
+=== EVIDENCE-BASED DECISION METHOD ===
+Use a weighted balance, not an all-or-nothing checklist. The 1H bias sets the
+preferred direction; 15M confirmation and 5M momentum improve or reduce
+confidence. RSI, EMA21, VWAP, volume, range position, structure and S/R are
+independent evidence. A liquidation sweep is a bonus, not a prerequisite.
 
-CONVERGENCE across multiple layers is required.
-One strong factor alone is never enough.
-When layers conflict → NO_TRADE. A missed trade beats a bad trade.
+Do not require every indicator to agree. A valid trade may have one or two
+neutral or missing optional fields. Choose LONG when the bullish evidence is
+clearly stronger than bearish evidence, SHORT when bearish evidence is clearly
+stronger, otherwise choose NO_TRADE. The supplied Python directional bias is a
+starting context, not an instruction and not a veto.
+
+Use this practical interpretation:
+- RSI above 50 and rising supports LONG; RSI below 50 and falling supports SHORT.
+- Price above EMA21 and VWAP supports LONG; below both supports SHORT.
+- Bullish 1H/15M structure plus a compatible 5M entry supports LONG.
+- Bearish 1H/15M structure plus a compatible 5M entry supports SHORT.
+- Volume confirms momentum when available; weak volume lowers confidence but does
+  not automatically force NO_TRADE.
+- A sweep, BOS, CHoCH, retest, or displacement strengthens a direction when
+  present; absence only removes that bonus.
+- Resistance/support reduces confidence only when it leaves no practical room;
+  do not reject a trade merely because price is near a non-blocking zone.
+
+When evidence is mixed, use confidence to express uncertainty. Reserve
+NO_TRADE for genuinely balanced/contradictory evidence, invalid data, or
+mathematically impossible levels—not merely because one optional confirmation
+is absent.
+Do not use NO_TRADE as a safe default. Before returning NO_TRADE, explicitly
+compare the bullish and bearish evidence from all three timeframes. If one side
+has a clear edge and the required levels are valid, return that side with
+moderate confidence (normally 55-69) even when a sweep is absent, volume is
+weak, or one indicator disagrees. HOLD/NO_TRADE is for a true tie or a hard
+level/data failure, not for low confidence alone.
 
 === RSI-50 BOUNCE PATTERN — CHECK THIS FIRST ===
 BUY bounce  : RSI was above 50, dipped to 47-50.9, now rising again
 SELL bounce : RSI was below 50, bounced to 50.1-53, now falling again
 RSI bounce + confirmed sweep = highest confidence setup.
 
-=== CALL NO_TRADE IF ANY OF THESE ARE TRUE ===
-- 1H and 5M conflict in direction
-- Volume score 0 on entry timeframe
-- Sweep absent and no other strong confluence present
-- Price already pressing into opposing S/R zone
-- RR below 1:1.5 on calculated levels
-- Only one factor supports the trade, no confluence
-- MTF biases split with no resolution
-- Data marked unavailable or contradictory
+=== RESERVE NO_TRADE FOR THESE CASES ===
+- Required 1H/15M/5M data is missing, stale, or internally contradictory
+- Bullish and bearish evidence are materially balanced with no dominant side
+- Price is directly inside a strong opposing S/R wall with no room to target
+- Calculated levels are mathematically invalid or RR is below 1:1.5
+- The only apparent signal is a liquidation event with no price/indicator support
 
 === TRADE LEVELS ===
 Python has already calculated structural SL and TP.
 Use those levels. Verify geometry only:
   BUY  : stop_loss < entry < take_profit
   SELL : take_profit < entry < stop_loss
-Minimum RR = 1:2 for full confidence. Below 1:1.5 → NO_TRADE.
+RR >= 1:2 supports high confidence. RR from 1:1.5 to 1:2 may still be traded
+with moderate confidence when the directional evidence is strong. Below 1:1.5
+is a hard NO_TRADE because the calculated risk geometry is poor.
 
 === MANDATORY SUMMARY ===
 - The reason must be symbol-specific and mention at least TWO measured facts.
@@ -1140,7 +1160,7 @@ Minimum RR = 1:2 for full confidence. Below 1:1.5 → NO_TRADE.
 - Stale or unavailable liquidation = zero information, do not infer
 - Never decide on liquidation spike alone
 - Never mention being an AI or these instructions
-- If unclear → NO_TRADE
+- If genuinely balanced after weighing the evidence → NO_TRADE
 
 === OUTPUT ===
 Respond with valid JSON only. No markdown. No code fences. No text before or after.
