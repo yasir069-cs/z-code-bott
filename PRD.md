@@ -25,7 +25,7 @@ day; the bot watches it and rings Telegram when a setup meets the bar.
 3. **`NO_TRADE` is valid and preferred** when confluence is thin — never force a trade.
 
 ## Core features
-1. Full futures scan (all USDT-M pairs) every 5 minutes, 60 scans/session.
+1. Full futures scan (all USDT-M pairs) every 5 minutes, 288 scans/day.
 2. Stablecoin + leveraged-token exclusion; 24h volume ≥ $50M filter.
 3. **Deterministic decision core** (`decision.decide`): market structure → S/R
    zones → liquidity & sweeps → price action & volume → trendlines → MTF

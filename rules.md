@@ -26,14 +26,15 @@
 - Python may veto only malformed data, invalid SL/TP or risk geometry, and
   duplicate delivery. Deterministic setup quality is evidence, not an AI gate.
 - Never send a duplicate Telegram alert within `DUPLICATE_COOLDOWN_MIN` (20 min) for the same coin; this includes AI review summaries.
-- A scan must never bleed past `SCAN_DEADLINE_SECONDS` (240) into the next slot.
+- A scan must never bleed past `SCAN_DEADLINE_SECONDS` (285) into the next slot.
 
 ## Scheduler rules
 - Timezone: Asia/Kolkata (IST = UTC+5:30, no DST).
-- Active: 18:00 – 23:00 IST only, every 5 minutes.
+- Active: 24 hours a day, every 5 minutes.
 - **One** cron job with `second=15` offset; `max_instances=1`, `misfire_grace_time=120`,
   `coalesce=True`. No overlapping jobs.
-- Outside hours: zero market/AI calls.
+- There are no inactive hours; market and AI calls run continuously under the
+  single-scan coordinator.
 
 ## Scanner rules
 - Always fetch ALL USDT-M futures pairs (never hardcode a list).

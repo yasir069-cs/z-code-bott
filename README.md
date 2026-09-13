@@ -1,7 +1,7 @@
 # Crypto Signal Bot
 
 Signals-only crypto market-intelligence bot. Scans the full Binance **USDT-M
-futures** market every 5 minutes during the evening session (**18:00 – 23:00
+futures** market every 5 minutes, 24 hours a day (**18:00 – 23:00
 IST**). A **deterministic price-action & market-context core** decides
 **LONG / SHORT / NO_TRADE** (1H bias → 15M setup → 5M entry): market structure,
 support/resistance zones, liquidity sweeps and a risk/reward gate decide —
@@ -28,7 +28,7 @@ pip install -r requirements.txt
 copy .env.example .env            # fill in TELEGRAM_TOKEN / TELEGRAM_CHAT_ID /
                                   # OPENROUTER_API_KEY (all optional for testing)
 
-python main.py                    # production: APScheduler, 18:00–23:00 IST
+python main.py                    # production: APScheduler, 24/7 (IST)
 python main.py --once             # DEMO/TEST: one full scan cycle right now
 ```
 
@@ -97,7 +97,7 @@ explanation transport below is retained for a later phase.
 | `python scripts/funnel_check.py` | Live funnel stats: coins → sweeps → 1H → 15M → 5M |
 | `python scripts/why_no_signals.py [--all] [--fix target]` | Offline: turns `signals_log.csv`'s `no_trade_reason` rows into a per-scan blocker histogram and shows how many alerts each layer would free |
 | `python scripts/target_fix_compare.py [--max N] [--log PATH]` | Read-only: runs the real decision core twice on identical candles with the target scan off then on, and counts what the fix actually buys |
-| `python scripts/schedule_check.py` | Prints all scheduler fire times for the next 24h (expects 60 scans, 18:00:15…22:55:15) |
+| `python scripts/schedule_check.py` | Prints all scheduler fire times for the next 24h (expects 288 scans/day, every 5 minutes at :15 seconds) |
 | `python backtest.py --horizon-hours 24` | Backtests `signals_log.csv` against real Binance history → `backtest_report.txt` |
 | `python backtest.py --strategy BTC/USDT:USDT` | Replays the **live decision core** over recent 1H/15M/5M history (look-ahead-safe) → `backtest_strategy_report.txt` |
 | `python -m pytest tests/ -q` | Full unit test suite (no network needed) |
@@ -135,7 +135,7 @@ RISK_PER_TRADE_PCT=2.0                  # optional; max % risk per trade
 LOG_LEVEL=INFO                          # optional
 ```
 
-## Pipeline (every 5 minutes, 60 scans/session)
+## Pipeline (every 5 minutes, 288 scans/day)
 
 ```
 ALL USDT-M FUTURES PAIRS (fetch_tickers, dynamic)
@@ -173,15 +173,15 @@ ALL USDT-M FUTURES PAIRS (fetch_tickers, dynamic)
 
 ## Timeliness (never late)
 
-- **One** cron job, `hour=18-22, minute=*/5, second=15` — the `:15` offset guarantees
+- **One** cron job, `hour=*, minute=*/5, second=15` — the `:15` offset guarantees
   the just-closed 5M candle is published before the scan reads it, and a single
   job means no hour-boundary overlap. `max_instances=1`, `misfire_grace_time=120`,
   `coalesce=True` are set explicitly.
 - **OHLCV TTL cache** keyed `(symbol, timeframe)` — 1H refetches hourly, 15M every
   15 min, 5M every scan — plus **concurrent fetching** (8 workers, shared token
   bucket under Binance's rate limit).
-- **Hard per-scan deadline** (`SCAN_DEADLINE_SECONDS = 240`): past it the scan stops
-  AI work, Python-fallbacks the rest, and Telegram-notifies — so a scan can never
+- **Hard per-scan deadline** (`SCAN_DEADLINE_SECONDS = 285`): past it the scan stops
+  AI work and suppresses undecided trade opinions — so a scan can never
   bleed into the next 5-minute slot.
 
 ## Example Telegram alert
@@ -215,7 +215,7 @@ ALL USDT-M FUTURES PAIRS (fetch_tickers, dynamic)
 🎯 Confluence: 78/100  (1H 82 · 15M 74 · 5M 76)
 📝 Sell-side sweep below 62946 reclaimed; HTF bullish BOS; volume rising
 ━━━━━━━━━━━━━━━━━━
-⏰ 18:00–23:00 IST  |  1H → 15M → 5M
+⏰ 24/7 (IST)  |  1H → 15M → 5M
 🧠 Decision by deterministic core · explanation generated locally
 ```
 

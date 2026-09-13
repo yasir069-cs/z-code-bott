@@ -21,7 +21,7 @@ _ondemand_guard = None
 
 def start_ondemand_scan(run_scan_fn, make_exchange_fn, fetch_funding_fn,
                         guard_fn=None) -> dict:
-    """Start on-demand 5-minute scans anytime outside 18:00-23:00 IST.
+    """Start on-demand 5-minute scans anytime outside 24/7 (IST).
 
     Parameters are injected from main.py to avoid circular imports.
     *guard_fn* supplies the SHARED DuplicateGuard so on-demand and scheduled
@@ -44,7 +44,7 @@ def start_ondemand_scan(run_scan_fn, make_exchange_fn, fetch_funding_fn,
         try:
             tickers = _ondemand_exchange.fetch_tickers()
             funding_rates = fetch_funding_fn(_ondemand_exchange)
-            # force=True — bypasses 18:00-23:00 session window check
+            # force=True — bypasses 24/7 session window check
             run_scan_fn(_ondemand_exchange, _ondemand_guard, tickers, funding_rates, force=True)
         except Exception as exc:
             log.error("On-demand scan job failed: %s", exc)

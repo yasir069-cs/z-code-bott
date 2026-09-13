@@ -12,7 +12,7 @@ verdict in the background — it never decides. **533 unit tests pass.**
 ## All decisions finalized
 - **Exchange:** Binance USDT-M **futures** (CCXT public, no keys, signals-only)
 - **Universe:** all USDT-M pairs, minus stablecoin/leveraged bases, 24h volume ≥ **$50M**
-- **Session:** 18:00 – 23:00 IST, every 5 min at `:15s` → **60 scans/session**
+- **Session:** 18:00 – 23:00 IST, every 5 min at `:15s` → **288 scans/day**
 - **Timeframes:** 1H (HTF bias) → 15M (setup) → 5M (entry), roles configurable
 - **Decision core:** `decision.decide` — structure → S/R → liquidity → price action
   → trendlines → **MTF (mandatory)** → futures context → **risk gate (mandatory)**

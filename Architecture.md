@@ -28,7 +28,7 @@
 ## Schedule
 
 - **Window:** 18:00 – 23:00 IST, every 5 minutes.
-- **One** `CronTrigger(hour="18-22", minute="*/5", second=15)` → **60 scans/session**.
+- **One** `CronTrigger(hour="*", minute="*/5", second=15)` → **288 scans/day**.
   The `second=15` offset publishes the just-closed 5M candle; a single job means no
   hour-boundary overlap. `max_instances=1`, `misfire_grace_time=120`, `coalesce=True`.
 - **Outside the window:** zero market/AI calls. A session-start and session-end

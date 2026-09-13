@@ -24,6 +24,7 @@ import logging
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -273,6 +274,8 @@ class _DailyBudget:
     def consume(self, tokens: int = 1) -> bool:
         with self._lock:
             self._roll_locked()
+            if config.AI_DAILY_BUDGET <= 0:
+                return True
             if self._used + tokens > config.AI_DAILY_BUDGET:
                 return False
             self._used += tokens
@@ -1388,16 +1391,27 @@ def llm_verdicts(bundles: list, deadline: Optional[float] = None) -> dict:
     out: dict[str, dict] = {}
 
     if not config.AI_BATCH_ENABLED or len(ordered) == 1:
-        for bundle in ordered:
-            def _parse(content: str, bundle=bundle) -> dict:
+        def _one(bundle: dict) -> tuple[str, dict]:
+            def _parse(content: str) -> dict:
                 log.info("LLM verdict for %s: %.200s", bundle["symbol"], content)
                 return {bundle["symbol"]: parse_verdict(content)}
-            try:
-                out.update(_complete(_messages(build_decision_prompt(bundle)),
-                                     parse=_parse, deadline=deadline, json_mode=True))
-            except AIDecisionError as exc:
-                log.warning("LLM verdict unavailable for %s (%s) — deterministic path",
-                            bundle["symbol"], exc)
+            result = _complete(_messages(build_decision_prompt(bundle)),
+                               parse=_parse, deadline=deadline, json_mode=True)
+            return bundle["symbol"], result[bundle["symbol"]]
+
+        # These remain independent one-coin prompts; bounded concurrency only
+        # prevents 30+ sequential local-model calls from overrunning a slot.
+        workers = max(1, min(int(getattr(config, "AI_WORKERS", 3)), len(ordered)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ollama") as pool:
+            futures = {pool.submit(_one, bundle): bundle for bundle in ordered}
+            for future in as_completed(futures):
+                bundle = futures[future]
+                try:
+                    symbol, verdict = future.result()
+                    out[symbol] = verdict
+                except AIDecisionError as exc:
+                    log.warning("LLM verdict unavailable for %s (%s) — suppressing trade",
+                                bundle["symbol"], exc)
         return out
 
     for chunk in _chunks(ordered, config.AI_BATCH_MAX):

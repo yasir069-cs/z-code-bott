@@ -174,7 +174,7 @@ AI_BASE_URL = os.getenv("AI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/
 AI_MODEL = os.getenv("AI_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free").strip()
 AI_MODEL_FALLBACK = os.getenv("AI_MODEL_FALLBACK", "").strip()
 
-AI_MAX_TOKENS = int(_env_number("AI_MAX_TOKENS", 2000))
+AI_MAX_TOKENS = int(_env_number("AI_MAX_TOKENS", 8000))
 # Per-request timeout. 90s suits cloud providers; a self-hosted Ollama model
 # (e.g. qwen3:8b on CPU) needs more, so it is .env-overridable.
 AI_TIMEOUT_SECONDS = _env_number("AI_TIMEOUT_SECONDS", 90.0)
@@ -190,17 +190,18 @@ AI_REASONING_EFFORT = os.getenv("AI_REASONING_EFFORT", "").strip().lower()
 
 AI_BATCH_ENABLED = False       # user strategy: one coin, full data, one decision
 AI_BATCH_MAX = int(_env_number("AI_BATCH_MAX", 8))
+AI_WORKERS = int(_env_number("AI_WORKERS", 3))  # separate one-coin calls, not a batch
 AI_JSON_MODE = _env_flag("AI_JSON_MODE", True)
 AI_RETRY_MAX = int(_env_number("AI_RETRY_MAX", 2))     # attempts PER PROVIDER before
                                 # the ladder moves to the next one
-AI_MAX_TOKENS_RETRY_CAP = int(os.getenv("AI_MAX_TOKENS_RETRY_CAP", "4000"))
+AI_MAX_TOKENS_RETRY_CAP = int(os.getenv("AI_MAX_TOKENS_RETRY_CAP", "12000"))
 AI_RETRY_BACKOFF_BASE = 1.0     # 1s, 2s, 4s
 
 # Per-provider advisory daily cap. Each entry in AI_PROVIDERS gets its OWN
 # independent counter of this size — this is NOT a global total. Six
 # providers at 45/day = up to 270 requests/day across the whole pool, but any
 # single provider stops itself at 45 regardless of the others' state.
-AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "45"))
+AI_DAILY_BUDGET = int(os.getenv("AI_DAILY_BUDGET", "0"))  # 0 = unlimited (self-hosted)
 
 
 def _build_provider_pool() -> list[dict]:
@@ -264,8 +265,8 @@ GUARD_RESET_TIME = "23:00"      # tracker resets at 11:00 PM IST
 HOLD_LOG_COOLDOWN_MIN = 30
 
 # ------------------------------------------------------------------ scheduler
-SESSION_START = "18:00"         # 6:00 PM IST
-SESSION_END = "23:00"           # 11:00 PM IST
+SESSION_START = "00:00"         # retained for backwards-compatible config output
+SESSION_END = "24:00"           # continuous 24-hour operation
 SCAN_INTERVAL_MIN = 5           # every 5 minutes
 SCHEDULER_TZ = "Asia/Kolkata"
 SCAN_SECOND_OFFSET = 15
@@ -274,7 +275,7 @@ SCAN_MISFIRE_GRACE_SEC = 120
 # slot on a cloud AI provider; a self-hosted local model (Ollama on CPU) can
 # need far longer per request, so the budget is .env-overridable without a code
 # edit. Overlapping slots are refused by the scan coordinator either way.
-SCAN_DEADLINE_SECONDS = _env_number("SCAN_DEADLINE_SECONDS", 210.0)
+SCAN_DEADLINE_SECONDS = _env_number("SCAN_DEADLINE_SECONDS", 285.0)
 
 # ---- hardening: bounded services, watchdogs, isolation
 LIQ_STALE_SECONDS = 1800

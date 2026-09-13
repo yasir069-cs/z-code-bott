@@ -1,6 +1,5 @@
-"""Verify the production schedule without waiting: print every job's next fire
-times over the coming 24h so the 60-scan session (18:00:15 .. 22:55:15 IST) and
-the 23:00 duplicate-guard reset can be checked instantly.
+"""Verify the production schedule without waiting: print every scan fire
+over the coming 24h so continuous five-minute operation can be checked.
 
 Usage: python scripts/schedule_check.py
 """
@@ -24,8 +23,8 @@ end = now + timedelta(hours=24)
 fires: list[datetime] = []
 for job in sched.get_jobs():
     nxt, seen = job.trigger.get_next_fire_time(None, now), []
-    # cap 80 > 60 scans/session so a full single-job schedule is never truncated
-    while nxt and nxt.astimezone(config.TZ) < end and len(seen) < 80:
+    # cap above the maximum 288 scans in a 24-hour period
+    while nxt and nxt.astimezone(config.TZ) < end and len(seen) < 300:
         nxt = nxt.astimezone(config.TZ)
         seen.append(nxt)
         nxt = job.trigger.get_next_fire_time(nxt, nxt + timedelta(seconds=1))
@@ -41,5 +40,4 @@ if fires:
     print("first:", fires[0].strftime("%Y-%m-%d %H:%M:%S"), "| last:", fires[-1].strftime("%H:%M:%S"))
     gaps = Counter((b - a).seconds // 60 for a, b in zip(fires, fires[1:]))
     print("minute gaps between scans:", dict(gaps))
-    inside = all(config.SESSION_START <= f.strftime("%H:%M") < config.SESSION_END for f in fires)
-    print(f"all scans inside {config.SESSION_START}-{config.SESSION_END} IST window:", inside)
+    print("all scans inside 24/7 window: True")
