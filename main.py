@@ -371,41 +371,15 @@ def _build_decision_bundle(cand: dict, d: dict, snap5: dict | None,
 
 def _apply_llm_verdict(d: dict, verdict: dict | None,
                        symbol: str = "") -> tuple[dict, str, bool, str | None]:
-    """Apply the LLM's independent decision to one candidate's evidence.
+    """Attach an LLM explanation without allowing it to change the decision.
 
-    Returns (decision, signal, ai_used, ai_reason). The model chose
-    LONG/SHORT/NO_TRADE from factual evidence (it never saw a Python
-    verdict). Its choice then faces the hard safety gates via
-    decision.post_llm_validate — data validity, invalid levels, stop width,
-    minimum R:R, quality threshold. An absent verdict (AI unavailable /
-    budget out) leaves the deterministic result untouched."""
+    The deterministic core owns LONG/SHORT/NO_TRADE and all safety gates.
+    Ollama is advisory/audit-only: a timeout, malformed answer, disagreement,
+    or NO_TRADE opinion must never suppress a valid Python BUY/SELL signal.
+    """
     if not verdict:
         return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), False, None
-
-    verdict_signal = verdict.get("signal")
-    if verdict_signal == "NO_TRADE":
-        out = dict(d)
-        out["decision"] = "NO_TRADE"
-        reasons = list(out.get("no_trade_reasons") or [])
-        if "llm_no_trade" not in reasons:
-            reasons.append("llm_no_trade")
-        out["no_trade_reasons"] = reasons
-        return out, "HOLD", True, verdict.get("reason")
-
-    want = "LONG" if verdict_signal == "LONG" else \
-           "SHORT" if verdict_signal == "SHORT" else None
-    if want is None:                      # unusable verdict -> deterministic
-        return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), False, None
-
-    # The LLM confirmed a direction the deterministic core already approved:
-    # nothing new to validate, the core's own gates passed for it.
-    if want == d.get("direction") and d.get("decision") == want:
-        return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), True, verdict.get("reason")
-
-    # The LLM chose a direction Python did not approve (a flip, or the same
-    # direction the core rejected): the hard safety gates decide, not opinions.
-    out = decision_core.post_llm_validate(d, want)
-    return out, _SIGNAL_MAP.get(out.get("decision"), "HOLD"), True, verdict.get("reason")
+    return d, _SIGNAL_MAP.get(d.get("decision"), "HOLD"), True, verdict.get("reason")
 
 
 def _hold_reason_key(sig: dict) -> str:
@@ -725,7 +699,7 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         _coordinator.end(summary)
         return summary
 
-    # --- STEP 6: LLM primary decision (critical path, budget/quality-gated) ---
+    # --- STEP 6: LLM explanation/audit (optional, budget/quality-gated) ---
     # Only candidates that already look tradeable on the deterministic score
     # are worth an AI request (see config.MIN_QUALITY_FOR_AI /
     # MAX_CANDIDATES_FOR_AI and _select_ai_eligible's docstring for why —
@@ -1043,7 +1017,7 @@ def main() -> None:
     # people keep getting wrong — that the answer is AUDITED, never applied. When
     # `ai_used=False` shows up on every row, this line is the first thing to read:
     # it is the expected value for a scheduled scan, not a failure.
-    log.info("AI CONTRACT: primary decision-maker (Python is fallback only) | "
+    log.info("AI CONTRACT: explanation/audit only (Python is authoritative) | "
              "eligibility: quality>=%.0f, max %d candidates/scan | "
              "provider ladder (%d): %s | "
              "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "

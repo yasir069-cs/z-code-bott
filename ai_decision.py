@@ -1039,7 +1039,7 @@ _VERDICT_MAP = {"LONG": "LONG", "SHORT": "SHORT", "NO_TRADE": "NO_TRADE",
 _VERDICT_JSON_SHAPE = ('{"symbol": "...", "signal": "LONG|SHORT|NO_TRADE", '
                        '"confidence": 0, "reason": "short explanation"}')
 
-_DECISION_INSTRUCTIONS = """You are the FINAL decision-maker of this crypto futures signal bot.
+_DECISION_INSTRUCTIONS = """You are an explanation and audit assistant for this crypto futures signal bot.
 
 Python has already done all the work:
 - Collected OHLCV data across 1H, 15M, and 5M timeframes
@@ -1050,9 +1050,11 @@ Python has already done all the work:
 - Calculated structural SL and TP from swing levels and ATR
 - Measured Risk/Reward ratio
 
-Your only job: read all that data and decide LONG, SHORT, or NO_TRADE.
-Your verdict is applied directly to the signal pipeline.
-This signal goes to the owner's phone. You are the last filter.
+Your only job: independently assess the evidence and report LONG, SHORT, or NO_TRADE
+as an advisory opinion with a short reason. The deterministic Python core is the
+authoritative decision-maker and has already applied the hard safety gates. Your
+opinion is recorded for audit and explanation only; it cannot create, change, or
+veto a Telegram signal.
 
 === WEIGH EVIDENCE IN THIS EXACT ORDER ===
 1. Market structure + location — 1H trend, BOS/CHoCH, range position

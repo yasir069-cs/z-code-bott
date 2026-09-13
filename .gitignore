@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 bot.log*
+.telegram_listener.lock
 # The signal log and every rotation of it. `.v1.bak` files were once committed on
 # main and they carry live rows; a history dump is not a repo object. (gitignore
 # takes no trailing comments, so these notes stay on their own lines.)

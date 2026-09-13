@@ -193,12 +193,27 @@ async def _send(text: str) -> None:
     """
     bot = telegram.Bot(token=config.TELEGRAM_TOKEN)
     async with bot:
-        await bot.send_message(
-            chat_id=config.TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        recipients = telegram_chat_ids()
+        failures = []
+        for chat_id in recipients:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception as exc:
+                failures.append((chat_id, exc))
+                log.error("Telegram send failed for chat %s: %s", chat_id, exc)
+        if failures and len(failures) == len(recipients):
+            raise failures[0][1]
+
+
+def telegram_chat_ids() -> list[str]:
+    """Return configured recipients as individual Telegram chat IDs."""
+    return [value.strip() for value in (config.TELEGRAM_CHAT_ID or "").split(",")
+            if value.strip()]
 
 
 def _send_via_listener(text: str) -> bool:
@@ -219,23 +234,35 @@ def _send_via_listener(text: str) -> bool:
     loop = getattr(telegram_bot, "_bot_loop", None)
     if app is None or loop is None or not loop.is_running() or not getattr(app, "running", False):
         return False
-    try:
-        coro = app.bot.send_message(
-            chat_id=config.TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-        asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=20)
+    sent = 0
+    failures = 0
+    for chat_id in telegram_chat_ids():
+        try:
+            coro = app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=20)
+            sent += 1
+        except Exception as exc:
+            failures += 1
+            log.error("Listener Telegram send failed for chat %s: %s", chat_id, exc)
+    if sent:
+        if failures:
+            log.warning("Telegram delivered to %d/%d configured chats",
+                        sent, sent + failures)
         return True
-    except Exception as exc:  # any failure -> caller uses the one-shot fallback
-        log.warning("listener-loop send failed (%s); falling back to one-shot", exc)
-        return False
+    if failures:
+        log.warning("Listener-loop send failed for every configured chat; "
+                    "falling back to one-shot")
+    return False
 
 
 def send_telegram_text(text: str) -> bool:
     """Send a custom text message to Telegram; never raises (failure is logged)."""
-    if not config.TELEGRAM_TOKEN or not config.TELEGRAM_CHAT_ID:
+    if not config.TELEGRAM_TOKEN or not telegram_chat_ids():
         log.warning("Telegram not configured - message logged only:\n%s", text)
         return False
     # Preferred: reuse the listener's long-lived Bot + loop (warm pool).
@@ -260,7 +287,7 @@ def send_alert(sig: dict) -> bool:
     """Send one alert; never raises (failure is logged, bot continues)."""
     if sig["signal"] not in ("BUY", "SELL"):
         return False  # HOLD stays silent by design
-    if not config.TELEGRAM_TOKEN or not config.TELEGRAM_CHAT_ID:
+    if not config.TELEGRAM_TOKEN or not telegram_chat_ids():
         log.warning("Telegram not configured - alert logged only:\n%s", format_alert(sig))
         return False
     text = format_alert(sig)

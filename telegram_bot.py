@@ -6,6 +6,7 @@ and answers any general crypto or bot queries using the LLM engine.
 """
 import asyncio
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -39,6 +40,48 @@ _bot_app: Optional[Application] = None
 # The listener's event loop, published so alerts.send_telegram_text can reuse
 # the long-lived Bot running on it instead of building a new Bot per message.
 _bot_loop: Optional[asyncio.AbstractEventLoop] = None
+_listener_lock_file = None
+
+
+def _acquire_listener_lock() -> bool:
+    """Allow only one polling listener per bot installation/host."""
+    global _listener_lock_file
+    path = config.BASE_DIR / ".telegram_listener.lock"
+    handle = None
+    try:
+        handle = open(path, "a+b")
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _listener_lock_file = handle
+        return True
+    except (OSError, IOError):
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        log.error("Telegram listener not started: another local bot instance "
+                  "already owns %s", path)
+        return False
+
+
+def _release_listener_lock() -> None:
+    global _listener_lock_file
+    handle, _listener_lock_file = _listener_lock_file, None
+    if handle is None:
+        return
+    try:
+        if os.name != "nt":
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    except Exception:
+        pass
 
 
 def _listener_running() -> bool:
@@ -306,6 +349,9 @@ def _run_listener_loop(app: Application) -> None:
     global _bot_loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    if not _acquire_listener_lock():
+        loop.close()
+        return
     _bot_loop = loop  # publish for alerts.send_telegram_text to reuse
     try:
         log.info("Telegram Chat Assistant listener started (polling live)")
@@ -326,6 +372,7 @@ def _run_listener_loop(app: Application) -> None:
             pass
         _bot_loop = None  # stop alerts from submitting onto a closed loop
         loop.close()
+        _release_listener_lock()
 
 
 def start_bot_listener() -> bool:
