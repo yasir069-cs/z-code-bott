@@ -396,7 +396,8 @@ LLM_DECISION_ENABLED = True      # False -> no AI call at all; Python decides ev
 # opinion. MAX_CANDIDATES_FOR_AI additionally caps the batch size per scan so
 # one unusually strong scan cannot alone exhaust several days of every
 # provider's budget.
-MIN_QUALITY_FOR_AI = _env_number("MIN_QUALITY_FOR_AI", 35.0)
+MIN_QUALITY_FOR_AI = _env_number("MIN_QUALITY_FOR_AI", 60.0)
+MIN_CONFLUENCE_FOR_AI = _env_number("MIN_CONFLUENCE_FOR_AI", 60.0)
 MAX_CANDIDATES_FOR_AI = int(_env_number("MAX_CANDIDATES_FOR_AI", 8))
 
 # ---- alert tier system (owner's rule, 2026-09-01) ----

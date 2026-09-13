@@ -436,9 +436,12 @@ def _select_ai_eligible(analysed: list) -> list:
     """
     eligible = [
         t for t in analysed
-        if float(t[0].get("setup_quality") or 0.0) >= config.MIN_QUALITY_FOR_AI
+        if float(t[0].get("confluence", t[0].get("setup_quality") or 0.0) or 0.0)
+        >= config.MIN_CONFLUENCE_FOR_AI
     ]
-    eligible.sort(key=lambda t: float(t[0].get("setup_quality") or 0.0), reverse=True)
+    eligible.sort(key=lambda t: float(
+        t[0].get("confluence", t[0].get("setup_quality") or 0.0) or 0.0
+    ), reverse=True)
     return eligible[:config.MAX_CANDIDATES_FOR_AI]
 
 
@@ -723,16 +726,16 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
     summary["ai_sent"] = len(bundles_for_ai)
 
     if ai_eligible:
-        log.info("AI eligibility: %d/%d decided candidates cleared quality>=%.0f "
+        log.info("AI eligibility: %d/%d decided candidates cleared confluence>=%.0f "
                  "(cap %d) -> sending %d: %s",
-                 len(ai_eligible), len(analysed), config.MIN_QUALITY_FOR_AI,
+                 len(ai_eligible), len(analysed), config.MIN_CONFLUENCE_FOR_AI,
                  config.MAX_CANDIDATES_FOR_AI, len(bundles_for_ai),
                  ", ".join(f"{d.get('symbol', c['symbol'])}(q={d.get('setup_quality', 0):.0f})"
                           for d, c, *_ in ai_eligible) if ai_eligible else "none")
     else:
-        log.info("AI eligibility: 0/%d decided candidates cleared quality>=%.0f — "
+        log.info("AI eligibility: 0/%d decided candidates cleared confluence>=%.0f — "
                  "skipping AI call this scan, Python fallback for all",
-                 len(analysed), config.MIN_QUALITY_FOR_AI)
+                 len(analysed), config.MIN_CONFLUENCE_FOR_AI)
 
     # Call AI for eligible candidates only, in one batch
     ai_verdicts = {}
@@ -769,15 +772,12 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         sig = _build_sig(symbol, d_out, signal, snap5, rsi_bounce, fr, last_price)
         sig["ai_used"] = ai_used
         sig["ai_reason"] = ai_reason or ""
-        # Always expose an AI BUY/SELL opinion to Telegram as a clearly
-        # labelled review, even when Python quality is below the executable
-        # alert threshold. This is separate from send_alert(): review output
-        # must never be mistaken for a validated trade signal.
+        # Always expose every answered LLM opinion to Telegram as a clearly
+        # labelled summary, including HOLD. This is separate from send_alert():
+        # review output must never be mistaken for a validated trade signal.
         if ai_used and verdict:
-            review_signal = str(verdict.get("signal") or "").upper()
-            if review_signal in ("BUY", "SELL"):
-                if not alerts.send_ai_review(sig, verdict):
-                    summary["telegram_failed"] += 1
+            if not alerts.send_ai_review(sig, verdict):
+                summary["telegram_failed"] += 1
         base = symbol.split("/")[0].split(":")[0]
         sig["signal_id"] = f"{scan_id}-{base}-{signal}"
         decided.append((quality, signal, sig, symbol))

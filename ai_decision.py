@@ -1066,7 +1066,7 @@ _VERDICT_MAP = {"LONG": "LONG", "SHORT": "SHORT", "NO_TRADE": "NO_TRADE",
 _VERDICT_JSON_SHAPE = ('{"symbol": "...", "signal": "LONG|SHORT|NO_TRADE", '
                        '"confidence": 0, "reason": "short explanation"}')
 
-_DECISION_INSTRUCTIONS = """You are an explanation and audit assistant for this crypto futures signal bot.
+_DECISION_INSTRUCTIONS = """You are the senior decision analyst for this crypto futures signal bot.
 
 Python has already done all the work:
 - Collected OHLCV data across 1H, 15M, and 5M timeframes
@@ -1077,11 +1077,19 @@ Python has already done all the work:
 - Calculated structural SL and TP from swing levels and ATR
 - Measured Risk/Reward ratio
 
-Your only job: independently assess the evidence and report LONG, SHORT, or NO_TRADE
-as an advisory opinion with a short reason. The deterministic Python core is the
-authoritative decision-maker and has already applied the hard safety gates. Your
-opinion is recorded for audit and explanation only; it cannot create, change, or
-veto a Telegram signal.
+Your only job: independently assess the complete evidence and report LONG, SHORT,
+or NO_TRADE with a mandatory concise summary. The LLM is called only for setups
+whose measured confluence score is at least 60/100. Use this workflow strictly:
+1H = market structure and directional bias; 15M = confirmation; 5M = entry timing.
+RSI, EMA21, VWAP, volume, range/location, S/R room, SL, TP, and RR are the core
+decision evidence. Liquidation sweep, websocket liquidations, funding, OI, and
+other context are optional supporting evidence: never invent them and never make
+them mandatory when unavailable.
+
+The deterministic Python core remains the final safety authority for executable
+alerts. Your model verdict decides the AI opinion, but it cannot bypass invalid
+levels, bad RR, duplicate protection, or a hard risk gate. A NO_TRADE opinion must
+always be respected as a no-trade recommendation.
 
 === WEIGH EVIDENCE IN THIS EXACT ORDER ===
 1. Market structure + location — 1H trend, BOS/CHoCH, range position
@@ -1118,6 +1126,13 @@ Use those levels. Verify geometry only:
   BUY  : stop_loss < entry < take_profit
   SELL : take_profit < entry < stop_loss
 Minimum RR = 1:2 for full confidence. Below 1:1.5 → NO_TRADE.
+
+=== MANDATORY SUMMARY ===
+- The reason must be symbol-specific and mention at least TWO measured facts.
+- State the decisive 1H/15M/5M relationship and the strongest blocker or
+  confirmation. Do not reuse a generic "no sweep" sentence for every coin.
+- Confidence means confidence in the decision: for NO_TRADE, confidence in
+  avoiding the trade, not probability of profit.
 
 === HARD RULES ===
 - Never fabricate data not provided

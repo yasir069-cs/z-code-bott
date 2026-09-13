@@ -304,7 +304,10 @@ def format_ai_review(sig: dict, verdict: dict) -> str:
     the executable-alert threshold, but they are labelled non-actionable so a
     low-quality model opinion cannot be mistaken for a validated signal.
     """
-    signal = html.escape(str(verdict.get("signal") or "HOLD").upper())
+    signal = str(verdict.get("signal") or "HOLD").upper()
+    signal = {"LONG": "BUY", "SHORT": "SELL", "NO_TRADE": "HOLD",
+              "NO-TRADE": "HOLD", "NO TRADE": "HOLD"}.get(signal, signal)
+    signal = html.escape(signal)
     confidence = verdict.get("confidence", 0)
     reason = html.escape(str(verdict.get("reason") or "No AI reason provided"))
     quality = float(sig.get("setup_quality") or 0.0)
@@ -321,8 +324,5 @@ def format_ai_review(sig: dict, verdict: dict) -> str:
 
 
 def send_ai_review(sig: dict, verdict: dict) -> bool:
-    """Send every actionable AI BUY/SELL opinion as a non-actionable review."""
-    signal = str(verdict.get("signal") or "").upper()
-    if signal not in ("BUY", "SELL"):
-        return False
+    """Send every answered AI opinion as a mandatory, non-actionable summary."""
     return send_telegram_text(format_ai_review(sig, verdict))

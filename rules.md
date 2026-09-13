@@ -92,10 +92,15 @@
 - `stream: False` is explicit — some gateways default to SSE and the reply then
   fails JSON parsing.
 
-## AI rules (ai_decision.py — explanation + background audit)
-- The LLM **never decides** what is emitted. It turns a finished decision into
-  prose and, in the background, records an independent opinion; a slow, failed, or
-  missing LLM is cosmetic.
+## AI rules (ai_decision.py — confluence-gated decision review)
+- The LLM is called only for candidates with measured confluence >= 60/100.
+  Its decision workflow is 1H structure/bias -> 15M confirmation -> 5M entry,
+  using RSI, EMA21, VWAP, volume, location, S/R, SL, TP, and RR as core data.
+  Liquidation sweep, websocket liquidations, funding, OI, and other context are
+  optional supporting evidence and must never be fabricated.
+- Every answered LLM verdict produces a mandatory Telegram AI summary. The
+  summary is explicitly review-only; Python risk gates still control whether a
+  normal executable-style alert is emitted.
 - The audit answer is graded against the emitted verdict in `ai_opinions.csv`
   (`AGREE` / `DISAGREE` / `VETO_PROPOSED` / `SIGNAL_PROPOSED` / `NO_ANSWER`) and
   `final_decision` always names what actually shipped. An opinion can earn trust
