@@ -398,7 +398,10 @@ LLM_DECISION_ENABLED = True      # False -> no AI call at all; Python decides ev
 # provider's budget.
 MIN_QUALITY_FOR_AI = _env_number("MIN_QUALITY_FOR_AI", 0.0)
 MIN_CONFLUENCE_FOR_AI = _env_number("MIN_CONFLUENCE_FOR_AI", 60.0)
-MAX_CANDIDATES_FOR_AI = int(_env_number("MAX_CANDIDATES_FOR_AI", 0))  # 0 = all survivors
+# AI-primary mode: every basic-filter survivor is sent to Ollama. Deliberately
+# not environment-overridable because a stale MAX_CANDIDATES_FOR_AI=3 on the
+# server silently suppressed the model decision for the remaining coins.
+MAX_CANDIDATES_FOR_AI = 0
 
 # ---- alert tier system (owner's rule, 2026-09-01) ----
 ALERT_QUALITY_MIN = _env_number("ALERT_QUALITY_MIN", 50.0)
