@@ -819,7 +819,7 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                          sig["leverage"], sig["position_size"])
                 guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
 
-    summary["ai_status"] = "PRIMARY" if config.LLM_DECISION_ENABLED else "OFF"
+    summary["ai_status"] = "AUDIT" if config.LLM_DECISION_ENABLED else "OFF"
     _log_funnel_summary(scan_id, summary)
     _coordinator.end(summary)
     return summary
