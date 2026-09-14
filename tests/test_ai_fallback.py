@@ -691,6 +691,12 @@ def test_exhausted_notice_is_sent_once(monkeypatch):
     assert ai_decision.budget_exhausted_notice() is None   # never repeated
 
 
+def test_unlimited_budget_never_reports_zero_over_zero_exhaustion(monkeypatch):
+    """Zero is the documented unlimited setting, not a zero-request cap."""
+    monkeypatch.setattr(config, "AI_DAILY_BUDGET", 0)
+    assert ai_decision.budget_exhausted_notice() is None
+
+
 def test_budget_rolls_over_at_ist_midnight(monkeypatch):
     from datetime import date
     monkeypatch.setattr(config, "AI_DAILY_BUDGET", 1)

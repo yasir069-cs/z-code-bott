@@ -345,12 +345,15 @@ def budget_exhausted_notice() -> Optional[str]:
         if _notice_sent:
             return None
         status = budget_status()
-        if status["remaining"] > 0 or not status["providers"]:
+        # A zero budget means unlimited (used by self-hosted Ollama and the
+        # 24/7 audit worker), not "zero requests allowed".  Treating it as
+        # exhausted produced the misleading Telegram message "0/0".
+        if config.AI_DAILY_BUDGET <= 0 or status["remaining"] > 0 or not status["providers"]:
             return None
         _notice_sent = True
     lines = "; ".join(f"{name}: {s['used']}/{s['limit']}" for name, s in status["providers"].items())
     return (f"AI budget exhausted on ALL {len(status['providers'])} configured provider(s) "
-            f"today ({lines}). Signals continue on indicator-only logic until reset.")
+            f"today ({lines}). Deterministic signals continue; AI audit resumes after reset.")
 
 
 def reset_budget() -> None:
