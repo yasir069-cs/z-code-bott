@@ -415,16 +415,17 @@ def _emission_kind(signal: str, quality: float) -> str:
 
 
 def _select_ai_eligible(analysed: list) -> list:
-    """Return all survivors with complete timeframe data for Ollama.
+    """Return complete setups whose deterministic confluence is at least 50.
 
     Python has already done the cheap prefilter (universe, 1H direction,
-    funding, duplicate guard, and 1H/15M/5M fetches). Its deterministic quality
-    score is evidence for the model, not a veto. Ollama independently decides
-    each coin from the complete bundle, one coin per request.
+    funding, duplicate guard, and 1H/15M/5M fetches). The deterministic
+    setup_quality is the alert's confluence score; below the configured AI
+    floor there is no reason to spend an audit request. AI confidence is a
+    separate model-review value and must never be confused with confluence.
     """
     eligible = [t for t in analysed if all(
         t[0].get("snaps", {}).get(tf) for tf in ("1h", "15m", "5m")
-    )]
+    ) and float(t[0].get("setup_quality") or 0.0) >= config.MIN_CONFLUENCE_FOR_AI]
     eligible.sort(key=lambda t: float(t[0].get("setup_quality") or 0.0), reverse=True)
     if config.MAX_CANDIDATES_FOR_AI > 0:
         eligible = eligible[:config.MAX_CANDIDATES_FOR_AI]
@@ -579,7 +580,8 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                "funding_rejected": 0, "duplicates": 0, "gate_rejected": 0,
                "signals": 0, "log_only": 0, "holds": 0, "hold_deduped": 0,
                "telegram_failed": 0, "log_failed": 0, "ai_status": "QUEUED",
-               "ai_eligible": 0, "ai_sent": 0, "ai_answered": 0}
+               "ai_eligible": 0, "ai_sent": 0, "ai_answered": 0,
+               "ai_below_confluence": 0}
 
     # --- STEP 1+2: batch-fetch 1H for every symbol; structure funnel ---
     with _coordinator.stage("ohlcv_1h"):
@@ -693,6 +695,10 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
 
     ai_eligible = _select_ai_eligible(analysed)
     summary["ai_eligible"] = len(ai_eligible)
+    summary["ai_below_confluence"] = sum(
+        1 for d, *_ in analysed
+        if float(d.get("setup_quality") or 0.0) < config.MIN_CONFLUENCE_FOR_AI
+    )
 
     bundles_for_ai = []
     for d, c, snap5, rsi_bounce, last_price in ai_eligible:
@@ -704,10 +710,13 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
     ai_symbols = {bundle["symbol"] for bundle in bundles_for_ai}
 
     if ai_eligible:
-        log.info("AI eligibility: %d/%d basic-filter survivors -> one-by-one "
-                 "full-data Ollama calls (cap %d, sending %d): %s",
+        log.info("AI eligibility: %d/%d survivors with confluence >= %.0f -> "
+                 "one-by-one full-data audit calls (cap %d, sending %d); "
+                 "%d below floor: %s",
                  len(ai_eligible), len(analysed),
+                 config.MIN_CONFLUENCE_FOR_AI,
                  config.MAX_CANDIDATES_FOR_AI, len(bundles_for_ai),
+                 summary["ai_below_confluence"],
                  ", ".join(f"{d.get('symbol', c['symbol'])}(q={d.get('setup_quality', 0):.0f})"
                           for d, c, *_ in ai_eligible) if ai_eligible else "none")
     else:

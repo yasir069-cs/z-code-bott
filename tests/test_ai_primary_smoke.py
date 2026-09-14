@@ -14,11 +14,12 @@ def _d():
     }
 
 
-def test_all_survivors_are_eligible_even_low_quality(monkeypatch):
+def test_only_confluence_50_plus_survivors_are_ai_eligible(monkeypatch):
     monkeypatch.setattr(config, "MAX_CANDIDATES_FOR_AI", 0)
     rows = [(dict(_d(), setup_quality=1), {"symbol": "A"}),
             (dict(_d(), setup_quality=99), {"symbol": "B"})]
-    assert len(main._select_ai_eligible(rows)) == 2
+    eligible = main._select_ai_eligible(rows)
+    assert [row[1]["symbol"] for row in eligible] == ["B"]
 
 
 def test_llm_buy_is_primary_but_invalid_risk_is_still_blocked():

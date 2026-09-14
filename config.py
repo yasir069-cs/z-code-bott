@@ -400,7 +400,7 @@ LLM_DECISION_ENABLED = True      # False -> no AI call at all; Python decides ev
 # one unusually strong scan cannot alone exhaust several days of every
 # provider's budget.
 MIN_QUALITY_FOR_AI = _env_number("MIN_QUALITY_FOR_AI", 0.0)
-MIN_CONFLUENCE_FOR_AI = _env_number("MIN_CONFLUENCE_FOR_AI", 60.0)
+MIN_CONFLUENCE_FOR_AI = _env_number("MIN_CONFLUENCE_FOR_AI", 50.0)
 # Audit mode: every complete basic-filter survivor may be reviewed by Ollama
 # after the deterministic signal has already been emitted. Deliberately not
 # environment-overridable so a stale server cap cannot suppress live alerts.
