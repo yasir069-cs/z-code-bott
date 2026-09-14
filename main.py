@@ -962,10 +962,11 @@ def main() -> None:
          "configured" if config.TELEGRAM_TOKEN else "NOT configured")
 
     log.info("AI CONTRACT: deterministic signal primary, Ollama background audit | "
-             "one-by-one full-data audit calls, all basic-filter survivors, cap %d | "
+             "one-by-one full-data audit calls, confluence >= %.0f only, cap %d | "
              "provider ladder (%d): %s | "
              "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
              "batch=%d retries=%d budget=%d/day/provider | LLM_DECISION_ENABLED=%s",
+             config.MIN_CONFLUENCE_FOR_AI,
              config.MAX_CANDIDATES_FOR_AI,
              len(config.AI_PROVIDERS),
              ai_decision.describe_providers(),
