@@ -8,22 +8,14 @@ Every 5 minutes, 24 hours a day (288 scans/day):
     STEP 4 duplicate guard (15 min per coin) — checked BEFORE 15M/5M fetches
     STEP 5 15M confirmation + 5M entry; deterministic decision core over
            1H/15M/5M (structure, S/R, liquidity, price action, MTF, risk)
-    STEP 6 LLM PRIMARY DECISION (critical path, one coin at a time) — every
-           basic-filter survivor goes to the model with its FULL factual data
-           (indicators, location, sweep,
-           liquidation, measured structure/S/R/MTF/futures facts, calculated
-           SL/TP/RR, warnings) and NO Python verdict, NO_TRADE reasons or
-           quality scores, so the answer is independent. The model's
-           LONG/SHORT/NO_TRADE verdict ships as the signal, subject to the
-           post-LLM hard safety gates (decision.post_llm_validate). A coin
-           that does not clear the eligibility gate, or that the AI could not
-           answer (unavailable/timeout/budget exhausted), falls back to the
-           Python deterministic decision — that fallback is expected and
-           logged, not a failure.
-    STEP 7 (historical name) — every eligible coin's AI call happens inside
-           STEP 6 above; there is no separate background audit pass in the
-           scheduled path. `ai_decision.llm_verdicts` and the AIOpinionWorker
-           remain available for a future background-audit mode.
+    STEP 6 deterministic decision — the structure/risk core immediately owns
+           the signal and alert levels. Eligible setups are also queued with
+           their FULL factual data for an independent AI audit, but a slow or
+           unavailable model can never delay or suppress a valid alert.
+    STEP 7 background AI audit — `AIOpinionWorker` records model agreement or
+           disagreement in `ai_opinions.csv`; it never changes the emitted
+           signal. This keeps alert latency bounded by market-data processing,
+           not model latency.
     STEP 8-9 rank by setup_quality, PERSIST to signals_log.csv FIRST, then the
            Telegram alert (BUY/SELL at quality >= ALERT_QUALITY_MIN only,
            everything else log-only; a blocked setup logs a silent HOLD row at
@@ -36,7 +28,7 @@ Every 5 minutes, 24 hours a day (288 scans/day):
 
 Fetching is concurrent and batched per timeframe; a hard per-scan deadline
 (config.SCAN_DEADLINE_SECONDS) guarantees a scan can never bleed into the next
-5-minute slot: past it the AI stage is skipped and the Python fallback is used.
+5-minute slot. The AI audit is queued only after the scan's alerts are done.
 
 The scheduler, Telegram chat assistant, liquidation websocket and news engine
 stay live 24/7.
@@ -411,10 +403,15 @@ def _persist(sig: dict, summary: dict) -> bool:
 
 
 def _emission_kind(signal: str, quality: float) -> str:
-    """LLM-primary emission: HOLD is silent; validated BUY/SELL can alert."""
+    """Classify one result for persistence and delivery.
+
+    HOLD is always log-only.  A directional result is a Telegram alert only
+    when it clears the configured quality floor; weaker directional setups are
+    retained in the CSV for diagnosis but must never be delivered as alerts.
+    """
     if signal == "HOLD":
         return "hold"
-    return "alert"
+    return "alert" if quality >= config.ALERT_QUALITY_MIN else "log_only"
 
 
 def _select_ai_eligible(analysed: list) -> list:
@@ -686,9 +683,11 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         _coordinator.end(summary)
         return summary
 
-    # --- STEP 6: one-by-one primary Ollama decisions over full data ---
-    # The Python decision object is evidence and risk geometry. It is not used
-    # as a quality veto before the model sees a basic-filter survivor.
+    # --- STEP 6: queue the independent AI audit without blocking alerts ---
+    # The deterministic decision core owns eligibility, direction, levels and
+    # risk.  A slow model must not turn a valid setup into a missed/tardy alert.
+    # The worker runs the same full-data prompts after this scan has emitted its
+    # deterministic results and records agreement/disagreement in ai_opinions.csv.
     decided = []
     ai_records = []
 
@@ -702,6 +701,7 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         if bundle:
             bundles_for_ai.append(bundle)
     summary["ai_sent"] = len(bundles_for_ai)
+    ai_symbols = {bundle["symbol"] for bundle in bundles_for_ai}
 
     if ai_eligible:
         log.info("AI eligibility: %d/%d basic-filter survivors -> one-by-one "
@@ -714,32 +714,15 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         log.info("AI eligibility: 0/%d basic-filter survivors — no Ollama calls",
                  len(analysed))
 
-    # Call AI for eligible candidates only, in one batch
-    ai_verdicts = {}
-    if config.LLM_DECISION_ENABLED and bundles_for_ai:
-        try:
-            raw_verdicts = ai_decision.llm_verdicts(bundles_for_ai, deadline=deadline)
-            for symbol, verdict in (raw_verdicts or {}).items():
-                ai_verdicts[symbol] = verdict
-            summary["ai_answered"] = len(ai_verdicts)
-        except Exception as exc:
-            log.warning("AI batch call failed — falling back to Python for all: %s", exc)
-
     for d, c, snap5, rsi_bounce, last_price in analysed:
         symbol, fr = c["symbol"], c["fr"]
 
-        verdict = ai_verdicts.get(symbol)
-        d_out, signal, ai_used, ai_reason = _apply_llm_verdict(d, verdict, symbol)
-
-        if not ai_used:
-            # AI-primary mode: no model verdict means no trade opinion. Python
-            # must never silently promote its own deterministic opinion to an
-            # alert when the requested independent model step failed.
-            signal = "HOLD"
-            d_out = dict(d)
-            d_out["decision"] = "NO_TRADE"
-            d_out["no_trade_reasons"] = ["llm_unavailable"]
-            log.warning("[AI PRIMARY] %s — no Ollama verdict; suppressing alert", symbol)
+        # Emit the authoritative deterministic result now.  AI is explanatory
+        # audit only; it can never veto or delay this scan's signal.
+        d_out = d
+        signal = _SIGNAL_MAP.get(d.get("decision"), "HOLD")
+        ai_used = False
+        ai_reason = None
 
         quality = float(d_out.get("setup_quality") or 0.0)
         if signal == "HOLD":
@@ -757,11 +740,12 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
         base = symbol.split("/")[0].split(":")[0]
         sig["signal_id"] = f"{scan_id}-{base}-{signal}"
         decided.append((quality, signal, sig, symbol))
-        ai_records.append({
-            "symbol": symbol,
-            "signal_id": sig["signal_id"],
-            "deterministic_decision": d.get("decision") or "NO_TRADE",
-        })
+        if symbol in ai_symbols:
+            ai_records.append({
+                "symbol": symbol,
+                "signal_id": sig["signal_id"],
+                "deterministic_decision": d.get("decision") or "NO_TRADE",
+            })
     # --- STEP 8-9: rank by setup-quality; PERSIST FIRST, then alert ---
     # Strongest setups first. Emission rule (owner's tier system): HOLD
     # log-only; BUY/SELL below ALERT_QUALITY_MIN (50) log-only; at/above it
@@ -804,7 +788,18 @@ def _run_scan_locked(exchange, guard, tickers, funding_rates,
                          sig["leverage"], sig["position_size"])
                 guard.record(symbol, now_ist)   # cooldown only for alerted BUY/SELL
 
-    summary["ai_status"] = "PRIMARY" if config.LLM_DECISION_ENABLED else "OFF"
+    # Start the slow/optional AI audit only after persistence and Telegram
+    # delivery.  A full provider timeout therefore cannot delay the next scan
+    # or suppress a deterministic signal.  The worker has a bounded queue.
+    if config.LLM_DECISION_ENABLED and bundles_for_ai and ai_records:
+        submitted = _ai_worker.submit(scan_id, ai_records, bundles_for_ai)
+        summary["ai_status"] = "QUEUED" if submitted else "UNAVAILABLE"
+        if not submitted:
+            log.warning("AI audit queue unavailable for scan %s; deterministic signals unaffected",
+                        scan_id)
+
+    if not config.LLM_DECISION_ENABLED:
+        summary["ai_status"] = "OFF"
     _log_funnel_summary(scan_id, summary)
     _coordinator.end(summary)
     return summary
@@ -957,8 +952,8 @@ def main() -> None:
          len(config.AI_PROVIDERS), ai_decision.describe_providers(),
          "configured" if config.TELEGRAM_TOKEN else "NOT configured")
 
-    log.info("AI CONTRACT: Ollama primary, Python data+hard-safety veto | "
-             "one-by-one full-data calls, all basic-filter survivors, cap %d | "
+    log.info("AI CONTRACT: deterministic signal primary, Ollama background audit | "
+             "one-by-one full-data audit calls, all basic-filter survivors, cap %d | "
              "provider ladder (%d): %s | "
              "json_mode=%s reasoning=%s | max_tokens=%d retry_cap=%d timeout=%.0fs | "
              "batch=%d retries=%d budget=%d/day/provider | LLM_DECISION_ENABLED=%s",

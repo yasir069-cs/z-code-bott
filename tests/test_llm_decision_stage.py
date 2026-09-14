@@ -154,14 +154,13 @@ def test_flip_rejection_reasons_are_deterministic_not_llm_opinion():
 # ------------------------------------------------------- emission rule (tiers)
 
 def test_emission_rule():
-    """Owner's tier system: below 50 ignored (log-only), 50+ alerts."""
+    """Owner's tier system: below 50 is persisted but never alerted."""
     assert _emission_kind("HOLD", 90.0) == "hold"
     assert _emission_kind("BUY", 29.9) == "log_only"
     assert _emission_kind("SELL", 29.99) == "log_only"
-    assert _emission_kind("BUY", 30.0) == "alert"
-    assert _emission_kind("SELL", 35.0) == "alert"
-    assert _emission_kind("BUY", 45.0) == "alert"
-    assert _emission_kind("SELL", 80.0) == "alert"
+    assert _emission_kind("BUY", 49.99) == "log_only"
+    assert _emission_kind("SELL", 50.0) == "alert"
+    assert _emission_kind("BUY", 80.0) == "alert"
 
 
 def test_alert_quality_tiers_from_config():
